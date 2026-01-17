@@ -15,8 +15,6 @@ static auto lastTime = std::chrono::high_resolution_clock::now();
 static int frameCount = 0;
 static double fps = 0.0;
 
-extern double tps;
-
 static const std::string render_char = "\u2580";
 
 static int stdout_flags = -1;
@@ -145,8 +143,15 @@ void render_print()
 
     frame_buffer += "\033[H\033[7m";
     char info[256];
-    const int len = snprintf(info, sizeof(info), " RenderTM v0.0.1 Terminal:%lux%lu | Pixel:%lux%lu | FPS:%.2f TPS:%.2f",
-                             width, static_cast<size_t>(term_height), width, height, fps, tps);
+    const Vec3 cam_pos = render_get_camera_position();
+    const Vec2 cam_rot = render_get_camera_rotation();
+    const double rad_to_deg = 180.0 / 3.14159265358979323846;
+    const double yaw_deg = cam_rot.x * rad_to_deg;
+    const double pitch_deg = cam_rot.y * rad_to_deg;
+    const int len = snprintf(info, sizeof(info),
+                             " RenderTM v0.0.1 Terminal:%lux%lu | Pixel:%lux%lu | FPS:%.2f | Cam(%.2f,%.2f,%.2f) Rot(%.1f,%.1f)",
+                             width, static_cast<size_t>(term_height), width, height, fps,
+                             cam_pos.x, cam_pos.y, cam_pos.z, yaw_deg, pitch_deg);
     frame_buffer += info;
     if (len < static_cast<int>(width)) frame_buffer.append(width - len, ' ');
     frame_buffer += "\033[0m";

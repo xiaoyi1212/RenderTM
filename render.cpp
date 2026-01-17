@@ -23,6 +23,43 @@ const int cubeTriangles[12][3] = {
     {0,1,5}, {0,5,4}  // bottom (-y)
 };
 
+enum FaceIndex
+{
+    FaceTop = 0,    // normal -Y
+    FaceBottom = 1, // normal +Y
+    FaceLeft = 2,   // normal -X
+    FaceRight = 3,  // normal +X
+    FaceBack = 4,   // normal -Z
+    FaceFront = 5   // normal +Z
+};
+
+const int cubeFaceVertices[6][4] = {
+    {0, 1, 5, 4}, // top (-y)
+    {3, 2, 6, 7}, // bottom (+y)
+    {0, 3, 7, 4}, // left (-x)
+    {1, 2, 6, 5}, // right (+x)
+    {0, 1, 2, 3}, // back (-z)
+    {4, 5, 6, 7}  // front (+z)
+};
+
+const int cubeFaceAxis1[6] = {
+    0, // top: X
+    0, // bottom: X
+    2, // left: Z
+    2, // right: Z
+    0, // back: X
+    0  // front: X
+};
+
+const int cubeFaceAxis2[6] = {
+    2, // top: Z
+    2, // bottom: Z
+    1, // left: Y
+    1, // right: Y
+    1, // back: Y
+    1  // front: Y
+};
+
 static float rotationAngle = 0.0f;
 static std::atomic<bool> rotationPaused{false};
 static RenderScene activeScene = RenderScene::CubeOnly;
@@ -32,22 +69,30 @@ static std::atomic<bool> sunOrbitEnabled{true};
 static std::atomic<double> sunOrbitAngle{1.5707963267948966};
 static std::atomic<double> sunOrbitSpeed{0.0015};
 static Vec3 moonDirection{0.0, 1.0, 0.0};
-static double moonIntensity = 0.0;
+static double moonIntensity = 0.2;
 static uint32_t skyTopColor = 0xFF78C2FF;
 static uint32_t skyBottomColor = 0xFF172433;
-static double skyLightIntensity = 0.35;
-static double ambientLight = 0.15;
-static std::atomic<double> camera_x{0.0};
-static std::atomic<double> camera_y{-10.0};
-static std::atomic<double> camera_z{-12.0};
-static std::atomic<double> camera_yaw{0.0};
-static std::atomic<double> camera_pitch{-0.6};
+static double skyLightIntensity = 0.25;
+static double ambientLight = 0.1;
+static std::atomic<double> camera_x{21.89};
+static std::atomic<double> camera_y{-20.78};
+static std::atomic<double> camera_z{3.71};
+static std::atomic<double> camera_yaw{-0.9005898940290741};
+static std::atomic<double> camera_pitch{-0.5707226654021458};
 static std::atomic<bool> ambientOcclusionEnabled{true};
 static std::atomic<bool> shadowEnabled{true};
 
 struct ScreenVertex
 {
     float x, y, z;
+};
+
+struct ViewRotation
+{
+    double cy;
+    double sy;
+    double cp;
+    double sp;
 };
 
 struct Mesh
@@ -99,6 +144,14 @@ struct ShadowMap
     bool valid = false;
 };
 
+struct ShadowCacheState
+{
+    Vec3 dir{0.0, 0.0, 0.0};
+    double c = 0.0;
+    double s = 0.0;
+    bool valid = false;
+};
+
 struct ShadingContext
 {
     ColorRGB albedo;
@@ -107,6 +160,7 @@ struct ShadingContext
     float albedo_b;
     ColorRGB sky_top;
     ColorRGB sky_bottom;
+    ColorRGB hemi_ground;
     float sky_scale;
     Vec3 camera_pos;
     double ambient_light;
@@ -124,10 +178,18 @@ struct ShadingContext
 };
 
 constexpr int kMsaaSamples = 2;
-constexpr size_t kShadowMapResolution = 256;
+constexpr size_t kShadowMapResolution = 128;
+constexpr int kShadowPcfRadius = 2;
+constexpr int kShadowPcfKernel = kShadowPcfRadius * 2 + 1;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kSunLatitudeDeg = 30.0;
 constexpr double kSunLatitudeRad = kPi * kSunLatitudeDeg / 180.0;
+constexpr uint32_t kSkySunriseTopColor = 0xFFB55A1A;
+constexpr uint32_t kSkySunriseBottomColor = 0xFF4A200A;
+constexpr double kHemisphereBounceStrength = 0.35;
+constexpr ColorRGB kHemisphereBounceColorLinear{1.0f, 0.9046612f, 0.7758222f};
+constexpr double kSkyLightHeightPower = 0.5;
+constexpr double kMoonSkyLightFloor = 0.22;
 
 static Vec3 normalize_vec(const Vec3& v);
 static float compute_shadow_factor(const ShadowMap* shadow, const Vec3& light_dir,
@@ -214,6 +276,7 @@ struct VoxelBlock
     uint32_t color;
     bool isTop;
     TopFaceLighting topFace;
+    std::array<std::array<float, 4>, 6> face_ao;
 };
 
 static std::vector<VoxelBlock> terrainBlocks;
@@ -267,6 +330,61 @@ static void generate_terrain_chunk()
             return 0;
         }
         return terrainHeights[index(x, z)];
+    };
+
+    auto has_block = [&](int gx, int gy, int gz) {
+        if (gx < 0 || gx >= chunk_size || gz < 0 || gz >= chunk_size)
+        {
+            return false;
+        }
+        if (gy < 0)
+        {
+            return false;
+        }
+        return gy < terrainHeights[index(gx, gz)];
+    };
+
+    auto compute_face_ao = [&](int gx, int gy, int gz, std::array<std::array<float, 4>, 6>& out) {
+        constexpr float ao_strength = 0.35f;
+        for (int face = 0; face < 6; ++face)
+        {
+            const int axis1 = cubeFaceAxis1[face];
+            const int axis2 = cubeFaceAxis2[face];
+            for (int corner = 0; corner < 4; ++corner)
+            {
+                const int vi = cubeFaceVertices[face][corner];
+                const Vec3& v = cubeVertices[vi];
+                const int sx = v.x >= 0.0 ? 1 : -1;
+                const int sy_world = v.y >= 0.0 ? 1 : -1;
+                const int sz = v.z >= 0.0 ? 1 : -1;
+                const int sy = -sy_world;
+
+                const int sign1 = (axis1 == 0) ? sx : (axis1 == 1 ? sy : sz);
+                const int sign2 = (axis2 == 0) ? sx : (axis2 == 1 ? sy : sz);
+
+                int d1x = 0, d1y = 0, d1z = 0;
+                int d2x = 0, d2y = 0, d2z = 0;
+                if (axis1 == 0) d1x = sign1;
+                else if (axis1 == 1) d1y = sign1;
+                else d1z = sign1;
+
+                if (axis2 == 0) d2x = sign2;
+                else if (axis2 == 1) d2y = sign2;
+                else d2z = sign2;
+
+                const int side1 = has_block(gx + d1x, gy + d1y, gz + d1z) ? 1 : 0;
+                const int side2 = has_block(gx + d2x, gy + d2y, gz + d2z) ? 1 : 0;
+                const int corner_block = has_block(gx + d1x + d2x, gy + d1y + d2y, gz + d1z + d2z) ? 1 : 0;
+
+                int occlusion = side1 + side2 + corner_block;
+                if (side1 && side2)
+                {
+                    occlusion = 3;
+                }
+                float ao = 1.0f - ao_strength * (static_cast<float>(occlusion) / 3.0f);
+                out[face][corner] = std::clamp(ao, 0.0f, 1.0f);
+            }
+        }
     };
 
     terrainBlocks.reserve(static_cast<size_t>(chunk_size * chunk_size * (base_height + height_variation + 3)));
@@ -404,11 +522,18 @@ static void generate_terrain_chunk()
                 }
 
                 const bool is_top = (y == height - 1);
+                std::array<std::array<float, 4>, 6> face_ao{};
+                for (auto& face : face_ao)
+                {
+                    face.fill(1.0f);
+                }
+                compute_face_ao(x, y, z, face_ao);
                 terrainBlocks.push_back({
                     {start_x + x * block_size, base_y - y * block_size, start_z + z * block_size},
                     color,
                     is_top,
-                    is_top ? top_face : empty_top
+                    is_top ? top_face : empty_top,
+                    face_ao
                 });
             }
         }
@@ -424,11 +549,48 @@ static ColorRGB lerp_color(const ColorRGB& a, const ColorRGB& b, float t)
     };
 }
 
+static ColorRGB compute_hemisphere_ground(const ColorRGB& base_ground,
+                                          const std::array<ShadingContext::DirectionalLightInfo, 2>& lights)
+{
+    double bounce_energy = 0.0;
+    for (const auto& light : lights)
+    {
+        if (light.intensity <= 0.0)
+        {
+            continue;
+        }
+        const double height = std::clamp(-light.dir.y, 0.0, 1.0);
+        bounce_energy += light.intensity * height;
+    }
+    const double bounce = std::clamp(bounce_energy * kHemisphereBounceStrength, 0.0, 1.0);
+    if (bounce <= 0.0)
+    {
+        return base_ground;
+    }
+    return lerp_color(base_ground, kHemisphereBounceColorLinear, static_cast<float>(bounce));
+}
+
 static Vec3 normalize_vec(const Vec3& v)
 {
     const double len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
     if (len == 0.0) return {0.0, 0.0, 0.0};
     return {v.x / len, v.y / len, v.z / len};
+}
+
+static bool shadow_cache_matches(const ShadowCacheState& cache, const Vec3& dir, const double c, const double s)
+{
+    if (!cache.valid)
+    {
+        return false;
+    }
+    const double dx = cache.dir.x - dir.x;
+    const double dy = cache.dir.y - dir.y;
+    const double dz = cache.dir.z - dir.z;
+    if ((dx * dx + dy * dy + dz * dz) > 1e-10)
+    {
+        return false;
+    }
+    return (std::abs(cache.c - c) <= 1e-10) && (std::abs(cache.s - s) <= 1e-10);
 }
 
 static Vec3 add_vec(const Vec3& a, const Vec3& b)
@@ -484,12 +646,61 @@ static Vec3 compute_sun_orbit_direction(double angle)
     return normalize_vec({x, y, z});
 }
 
+static double compute_sun_height(const Vec3& sun_dir)
+{
+    const double max_y = std::cos(kSunLatitudeRad);
+    if (max_y <= 0.0)
+    {
+        return 0.0;
+    }
+    const double height = sun_dir.y < 0.0 ? (-sun_dir.y) / max_y : 0.0;
+    return std::clamp(height, 0.0, 1.0);
+}
+
 static ColorRGB unpack_color(uint32_t color)
 {
     return {
         static_cast<float>((color >> 16) & 0xFF),
         static_cast<float>((color >> 8) & 0xFF),
         static_cast<float>(color & 0xFF)
+    };
+}
+
+static float srgb_channel_to_linear(const float channel)
+{
+    const float c = channel / 255.0f;
+    if (c <= 0.04045f)
+    {
+        return c / 12.92f;
+    }
+    return std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
+static float linear_channel_to_srgb(float channel)
+{
+    channel = std::clamp(channel, 0.0f, 1.0f);
+    if (channel <= 0.0031308f)
+    {
+        return channel * 12.92f;
+    }
+    return 1.055f * std::pow(channel, 1.0f / 2.4f) - 0.055f;
+}
+
+static ColorRGB srgb_to_linear(const ColorRGB& color)
+{
+    return {
+        srgb_channel_to_linear(color.r),
+        srgb_channel_to_linear(color.g),
+        srgb_channel_to_linear(color.b)
+    };
+}
+
+static ColorRGB linear_to_srgb(const ColorRGB& color)
+{
+    return {
+        linear_channel_to_srgb(color.r) * 255.0f,
+        linear_channel_to_srgb(color.g) * 255.0f,
+        linear_channel_to_srgb(color.b) * 255.0f
     };
 }
 
@@ -531,13 +742,9 @@ static Vec3 rotate_vertex(const Vec3& v, const double c, const double s)
     };
 }
 
-static Vec3 rotate_yaw_pitch(const Vec3& v, const double yaw, const double pitch)
+static Vec3 rotate_yaw_pitch_cached(const Vec3& v, const double cy, const double sy,
+                                    const double cp, const double sp)
 {
-    const double cy = std::cos(yaw);
-    const double sy = std::sin(yaw);
-    const double cp = std::cos(pitch);
-    const double sp = std::sin(pitch);
-
     const double x1 = v.x * cy + v.z * sy;
     const double z1 = -v.x * sy + v.z * cy;
     const double y1 = v.y;
@@ -546,6 +753,20 @@ static Vec3 rotate_yaw_pitch(const Vec3& v, const double yaw, const double pitch
     const double z2 = y1 * sp + z1 * cp;
 
     return {x1, y2, z2};
+}
+
+static Vec3 rotate_yaw_pitch(const Vec3& v, const double yaw, const double pitch)
+{
+    const double cy = std::cos(yaw);
+    const double sy = std::sin(yaw);
+    const double cp = std::cos(pitch);
+    const double sp = std::sin(pitch);
+    return rotate_yaw_pitch_cached(v, cy, sy, cp, sp);
+}
+
+static ViewRotation make_view_rotation(const double yaw, const double pitch)
+{
+    return {std::cos(yaw), std::sin(yaw), std::cos(pitch), std::sin(pitch)};
 }
 
 static double clamp_pitch(const double pitch)
@@ -559,6 +780,12 @@ static double clamp_pitch(const double pitch)
 static inline float edge_function(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c)
 {
     return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
+}
+
+static inline float smoothstep(const float edge0, const float edge1, const float x)
+{
+    const float t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
 }
 
 static void draw_filled_triangle(uint32_t* framebuffer, float* zbuffer, size_t width, size_t height,
@@ -691,7 +918,7 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient, Color
                         {
                             float sky_t = static_cast<float>((-normal.y) * 0.5 + 0.5);
                             sky_t = std::clamp(sky_t, 0.0f, 1.0f);
-                            const ColorRGB sky = lerp_color(ctx.sky_bottom, ctx.sky_top, sky_t);
+                            const ColorRGB sky = lerp_color(ctx.hemi_ground, ctx.sky_top, sky_t);
                             ambient_color.r = sky.r * ctx.sky_scale * ctx.albedo_r;
                             ambient_color.g = sky.g * ctx.sky_scale * ctx.albedo_g;
                             ambient_color.b = sky.b * ctx.sky_scale * ctx.albedo_b;
@@ -738,8 +965,10 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient, Color
                                     const double spec_dot = std::max(0.0, dot_vec(normal, half_vec));
                                     double spec = std::pow(spec_dot, ctx.material.shininess) * ctx.material.specular;
                                     spec *= light.intensity * shadow_factor;
-                                    const uint32_t packed = apply_specular(pack_color(light_color), spec);
-                                    light_color = unpack_color(packed);
+                                    spec = std::clamp(spec, 0.0, 1.0);
+                                    light_color.r += static_cast<float>((1.0f - light_color.r) * spec);
+                                    light_color.g += static_cast<float>((1.0f - light_color.g) * spec);
+                                    light_color.b += static_cast<float>((1.0f - light_color.b) * spec);
                                 }
                                 direct_color.r += light_color.r;
                                 direct_color.g += light_color.g;
@@ -847,12 +1076,13 @@ static float compute_shadow_factor(const ShadowMap* shadow, const Vec3& light_di
     const int res = static_cast<int>(shadow->resolution);
     const int cx = std::clamp(static_cast<int>(std::lround(u)), 0, res - 1);
     const int cy = std::clamp(static_cast<int>(std::lround(v)), 0, res - 1);
-    int lit = 0;
+    float lit = 0.0f;
     int samples = 0;
-    for (int dy = -1; dy <= 1; ++dy)
+    const float softness = static_cast<float>(0.05 + 0.08 * slope);
+    for (int dy = -kShadowPcfRadius; dy <= kShadowPcfRadius; ++dy)
     {
         const int sy = std::clamp(cy + dy, 0, res - 1);
-        for (int dx = -1; dx <= 1; ++dx)
+        for (int dx = -kShadowPcfRadius; dx <= kShadowPcfRadius; ++dx)
         {
             const int sx = std::clamp(cx + dx, 0, res - 1);
             const float depth = shadow->depth[static_cast<size_t>(sy) * shadow->resolution + static_cast<size_t>(sx)];
@@ -861,17 +1091,15 @@ static float compute_shadow_factor(const ShadowMap* shadow, const Vec3& light_di
                 continue;
             }
             samples++;
-            if (lz + bias >= depth)
-            {
-                lit++;
-            }
+            const float delta = static_cast<float>((lz + bias) - depth);
+            lit += smoothstep(-softness, softness, delta);
         }
     }
     if (samples <= 0)
     {
         return 1.0f;
     }
-    return static_cast<float>(lit) / static_cast<float>(samples);
+    return lit / static_cast<float>(samples);
 }
 
 static bool build_shadow_map(ShadowMap& shadow, const Vec3& light_dir,
@@ -897,10 +1125,19 @@ static bool build_shadow_map(ShadowMap& shadow, const Vec3& light_dir,
     float max_y = std::numeric_limits<float>::lowest();
     bool has_bounds = false;
 
-    std::vector<Vec3> world_vertices(base_mesh.vertexCount);
-    for (const auto& block : blocks)
+    const size_t block_count = blocks.size();
+    const size_t vertex_count = base_mesh.vertexCount;
+    thread_local std::vector<ScreenVertex> light_vertices;
+    if (light_vertices.size() != block_count * vertex_count)
     {
-        for (size_t i = 0; i < base_mesh.vertexCount; ++i)
+        light_vertices.resize(block_count * vertex_count);
+    }
+
+    for (size_t b = 0; b < block_count; ++b)
+    {
+        const auto& block = blocks[b];
+        const size_t base = b * vertex_count;
+        for (size_t i = 0; i < vertex_count; ++i)
         {
             Vec3 v = base_mesh.vertices[i];
             if (base_mesh.rotate)
@@ -910,9 +1147,10 @@ static bool build_shadow_map(ShadowMap& shadow, const Vec3& light_dir,
             v.x += block.position.x;
             v.y += block.position.y;
             v.z += block.position.z;
-            world_vertices[i] = v;
             const float lx = static_cast<float>(dot_vec(v, right));
             const float ly = static_cast<float>(dot_vec(v, up));
+            const float lz = static_cast<float>(dot_vec(v, forward));
+            light_vertices[base + i] = {lx, ly, lz};
             min_x = std::min(min_x, lx);
             max_x = std::max(max_x, lx);
             min_y = std::min(min_y, ly);
@@ -963,45 +1201,34 @@ static bool build_shadow_map(ShadowMap& shadow, const Vec3& light_dir,
         std::fill(shadow.depth.begin(), shadow.depth.end(), shadow.depth_min);
     }
 
-    for (const auto& block : blocks)
+    for (size_t b = 0; b < block_count; ++b)
     {
-        for (size_t i = 0; i < base_mesh.vertexCount; ++i)
-        {
-            Vec3 v = base_mesh.vertices[i];
-            if (base_mesh.rotate)
-            {
-                v = rotate_vertex(v, c, s);
-            }
-            v.x += block.position.x;
-            v.y += block.position.y;
-            v.z += block.position.z;
-            world_vertices[i] = v;
-        }
-
+        const size_t base = b * vertex_count;
         for (size_t t = 0; t < base_mesh.triangleCount; ++t)
         {
             const int i0 = base_mesh.triangles[t][0];
             const int i1 = base_mesh.triangles[t][1];
             const int i2 = base_mesh.triangles[t][2];
 
-            const Vec3& a = world_vertices[static_cast<size_t>(i0)];
-            const Vec3& b = world_vertices[static_cast<size_t>(i1)];
-            const Vec3& cpos = world_vertices[static_cast<size_t>(i2)];
+            const ScreenVertex& a = light_vertices[base + static_cast<size_t>(i0)];
+            const ScreenVertex& bvert = light_vertices[base + static_cast<size_t>(i1)];
+            const ScreenVertex& cpos = light_vertices[base + static_cast<size_t>(i2)];
 
-            const auto to_shadow = [&](const Vec3& v) {
-                const float lx = static_cast<float>(dot_vec(v, right));
-                const float ly = static_cast<float>(dot_vec(v, up));
-                const float lz = static_cast<float>(dot_vec(v, forward));
-                return ScreenVertex{
-                    (lx - min_x) * shadow.scale_x,
-                    (ly - min_y) * shadow.scale_y,
-                    lz
-                };
+            const ScreenVertex sv0{
+                (a.x - min_x) * shadow.scale_x,
+                (a.y - min_y) * shadow.scale_y,
+                a.z
             };
-
-            const ScreenVertex sv0 = to_shadow(a);
-            const ScreenVertex sv1 = to_shadow(b);
-            const ScreenVertex sv2 = to_shadow(cpos);
+            const ScreenVertex sv1{
+                (bvert.x - min_x) * shadow.scale_x,
+                (bvert.y - min_y) * shadow.scale_y,
+                bvert.z
+            };
+            const ScreenVertex sv2{
+                (cpos.x - min_x) * shadow.scale_x,
+                (cpos.y - min_y) * shadow.scale_y,
+                cpos.z
+            };
 
             rasterize_shadow_triangle(shadow.depth, shadow.resolution, sv0, sv1, sv2);
         }
@@ -1014,15 +1241,24 @@ static void render_mesh(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* samp
                         size_t width, size_t height,
                         const Mesh& mesh, const double c, const double s,
                         const double fov, const Vec3& camera_pos,
-                        const double yaw, const double pitch, const Material& material,
+                        const ViewRotation& view_rot, const Material& material,
                         const ColorRGB& sky_top, const ColorRGB& sky_bottom,
                         const double sky_light_intensity,
                         const std::array<ShadingContext::DirectionalLightInfo, 2>& lights,
                         bool shadows_enabled,
-                        const TopFaceLighting* top_face)
+                        const TopFaceLighting* top_face,
+                        const std::array<std::array<float, 4>, 6>* face_ao)
 {
-    std::vector<Vec3> world(mesh.vertexCount);
-    std::vector<ScreenVertex> projected(mesh.vertexCount);
+    thread_local std::vector<Vec3> world;
+    thread_local std::vector<ScreenVertex> projected;
+    if (world.size() != mesh.vertexCount)
+    {
+        world.resize(mesh.vertexCount);
+    }
+    if (projected.size() != mesh.vertexCount)
+    {
+        projected.resize(mesh.vertexCount);
+    }
 
     for (size_t i = 0; i < mesh.vertexCount; ++i)
     {
@@ -1038,7 +1274,7 @@ static void render_mesh(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* samp
         world[i] = v;
 
         Vec3 view = {v.x - camera_pos.x, v.y - camera_pos.y, v.z - camera_pos.z};
-        view = rotate_yaw_pitch(view, -yaw, -pitch);
+        view = rotate_yaw_pitch_cached(view, view_rot.cy, view_rot.sy, view_rot.cp, view_rot.sp);
 
         const double z = view.z <= 0.01 ? 0.01 : view.z;
         const double invZ = 1.0 / z;
@@ -1049,11 +1285,13 @@ static void render_mesh(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* samp
         projected[i].z = static_cast<float>(z);
     }
 
-    const ColorRGB albedo = unpack_color(material.color);
-    const float albedo_r = albedo.r / 255.0f;
-    const float albedo_g = albedo.g / 255.0f;
-    const float albedo_b = albedo.b / 255.0f;
+    const ColorRGB albedo_srgb = unpack_color(material.color);
+    const ColorRGB albedo = srgb_to_linear(albedo_srgb);
+    const float albedo_r = albedo.r;
+    const float albedo_g = albedo.g;
+    const float albedo_b = albedo.b;
     const float sky_scale = static_cast<float>(std::clamp(sky_light_intensity, 0.0, 1.0));
+    const ColorRGB hemi_ground = compute_hemisphere_ground(sky_bottom, lights);
     const bool direct_lighting_enabled = (lights[0].intensity > 0.0) || (lights[1].intensity > 0.0);
     const bool ao_enabled = ambientOcclusionEnabled.load(std::memory_order_relaxed);
     const ShadingContext ctx{
@@ -1063,6 +1301,7 @@ static void render_mesh(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* samp
         albedo_b,
         sky_top,
         sky_bottom,
+        hemi_ground,
         sky_scale,
         camera_pos,
         ambientLight,
@@ -1082,6 +1321,33 @@ static void render_mesh(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* samp
             case 4: return 3;
             default: return -1;
         }
+    };
+
+    auto face_corner_index = [](int face, int vertex_index) -> int {
+        for (int i = 0; i < 4; ++i)
+        {
+            if (cubeFaceVertices[face][i] == vertex_index)
+            {
+                return i;
+            }
+        }
+        return -1;
+    };
+
+    auto face_from_normal = [](const Vec3& normal) -> int {
+        if (std::abs(normal.x) > 0.5)
+        {
+            return normal.x > 0.0 ? FaceRight : FaceLeft;
+        }
+        if (std::abs(normal.y) > 0.5)
+        {
+            return normal.y > 0.0 ? FaceBottom : FaceTop;
+        }
+        if (std::abs(normal.z) > 0.5)
+        {
+            return normal.z > 0.0 ? FaceFront : FaceBack;
+        }
+        return -1;
     };
 
     for (size_t t = 0; t < mesh.triangleCount; ++t)
@@ -1142,6 +1408,29 @@ static void render_mesh(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* samp
             {
                 n2 = top_face->normals[static_cast<size_t>(c2)];
                 ao2 = top_face->ao[static_cast<size_t>(c2)];
+            }
+        }
+        else if (face_ao)
+        {
+            const int face_index = face_from_normal(face_normal);
+            if (face_index >= 0)
+            {
+                const auto& face_values = (*face_ao)[static_cast<size_t>(face_index)];
+                const int c0 = face_corner_index(face_index, i0);
+                const int c1 = face_corner_index(face_index, i1);
+                const int c2 = face_corner_index(face_index, i2);
+                if (c0 >= 0)
+                {
+                    ao0 = face_values[static_cast<size_t>(c0)];
+                }
+                if (c1 >= 0)
+                {
+                    ao1 = face_values[static_cast<size_t>(c1)];
+                }
+                if (c2 >= 0)
+                {
+                    ao2 = face_values[static_cast<size_t>(c2)];
+                }
             }
         }
 
@@ -1219,9 +1508,20 @@ static void render_shadow_on_plane(ColorRGB* sample_ambient, size_t width, size_
     const Vec3 ray_dir{-light_dir.x, -light_dir.y, -light_dir.z};
     if (std::abs(ray_dir.z) < 1e-6) return;
 
-    std::vector<Vec3> world(mesh.vertexCount);
-    std::vector<ScreenVertex> projected(mesh.vertexCount);
-    std::vector<bool> valid(mesh.vertexCount, false);
+    thread_local std::vector<Vec3> world;
+    thread_local std::vector<ScreenVertex> projected;
+    thread_local std::vector<bool> valid;
+    if (world.size() != mesh.vertexCount)
+    {
+        world.resize(mesh.vertexCount);
+    }
+    if (projected.size() != mesh.vertexCount)
+    {
+        projected.resize(mesh.vertexCount);
+    }
+    valid.assign(mesh.vertexCount, false);
+
+    const ViewRotation view_rot = make_view_rotation(-yaw, -pitch);
 
     for (size_t i = 0; i < mesh.vertexCount; ++i)
     {
@@ -1245,7 +1545,7 @@ static void render_shadow_on_plane(ColorRGB* sample_ambient, size_t width, size_
         };
 
         Vec3 view = {shadow_v.x - camera_pos.x, shadow_v.y - camera_pos.y, shadow_v.z - camera_pos.z};
-        view = rotate_yaw_pitch(view, -yaw, -pitch);
+        view = rotate_yaw_pitch_cached(view, view_rot.cy, view_rot.sy, view_rot.cp, view_rot.sp);
 
         const double z = view.z <= 0.01 ? 0.01 : view.z;
         const double inv_z = 1.0 / z;
@@ -1342,8 +1642,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     };
     const double yaw = camera_yaw.load(std::memory_order_relaxed);
     const double pitch = camera_pitch.load(std::memory_order_relaxed);
-    const ColorRGB sky_top = unpack_color(skyTopColor);
-    const ColorRGB sky_bottom = unpack_color(skyBottomColor);
+    const ViewRotation view_rot = make_view_rotation(-yaw, -pitch);
 
     const double mat_ambient = 0.25;
     const double mat_diffuse = 1.0;
@@ -1373,14 +1672,77 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         sun_intensity = lightIntensity * visibility;
     }
 
+    ColorRGB sky_top = unpack_color(skyTopColor);
+    ColorRGB sky_bottom = unpack_color(skyBottomColor);
+    double sun_height = 1.0;
+    if (sun_orbit)
+    {
+        sun_height = compute_sun_height(sun_dir);
+        const float t = static_cast<float>(sun_height);
+        const ColorRGB sunrise_top = unpack_color(kSkySunriseTopColor);
+        const ColorRGB sunrise_bottom = unpack_color(kSkySunriseBottomColor);
+        sky_top = lerp_color(sunrise_top, sky_top, t);
+        sky_bottom = lerp_color(sunrise_bottom, sky_bottom, t);
+    }
+
+    const ColorRGB sky_top_linear = srgb_to_linear(sky_top);
+    const ColorRGB sky_bottom_linear = srgb_to_linear(sky_bottom);
+    double effective_sky_intensity = skyLightIntensity;
+    if (sun_orbit)
+    {
+        const double sun_factor = std::pow(std::clamp(sun_height, 0.0, 1.0), kSkyLightHeightPower);
+        effective_sky_intensity *= sun_factor;
+
+        const double moon_factor = std::clamp(moonIntensity, 0.0, 1.0) * kMoonSkyLightFloor * (1.0 - sun_factor);
+        effective_sky_intensity = std::min(1.0, effective_sky_intensity + moon_factor);
+    }
+
     const Vec3 moon_dir = normalize_vec(moonDirection);
     const bool shadows_on = shadowEnabled.load(std::memory_order_relaxed);
     static ShadowMap sun_shadow;
     static ShadowMap moon_shadow;
-    const bool sun_shadow_valid = shadows_on && sun_intensity > 0.0 &&
-                                  build_shadow_map(sun_shadow, sun_dir, terrainBlocks, cubeMesh, c, s);
-    const bool moon_shadow_valid = shadows_on && moonIntensity > 0.0 &&
-                                   build_shadow_map(moon_shadow, moon_dir, terrainBlocks, cubeMesh, c, s);
+    static ShadowCacheState sun_shadow_cache;
+    static ShadowCacheState moon_shadow_cache;
+    bool sun_shadow_valid = false;
+    bool moon_shadow_valid = false;
+    if (shadows_on && sun_intensity > 0.0)
+    {
+        const bool needs_rebuild = !sun_shadow.valid || !shadow_cache_matches(sun_shadow_cache, sun_dir, c, s);
+        if (needs_rebuild)
+        {
+            sun_shadow_valid = build_shadow_map(sun_shadow, sun_dir, terrainBlocks, cubeMesh, c, s);
+            sun_shadow_cache.valid = sun_shadow_valid;
+            if (sun_shadow_valid)
+            {
+                sun_shadow_cache.dir = sun_dir;
+                sun_shadow_cache.c = c;
+                sun_shadow_cache.s = s;
+            }
+        }
+        else
+        {
+            sun_shadow_valid = sun_shadow.valid;
+        }
+    }
+    if (shadows_on && moonIntensity > 0.0)
+    {
+        const bool needs_rebuild = !moon_shadow.valid || !shadow_cache_matches(moon_shadow_cache, moon_dir, c, s);
+        if (needs_rebuild)
+        {
+            moon_shadow_valid = build_shadow_map(moon_shadow, moon_dir, terrainBlocks, cubeMesh, c, s);
+            moon_shadow_cache.valid = moon_shadow_valid;
+            if (moon_shadow_valid)
+            {
+                moon_shadow_cache.dir = moon_dir;
+                moon_shadow_cache.c = c;
+                moon_shadow_cache.s = s;
+            }
+        }
+        else
+        {
+            moon_shadow_valid = moon_shadow.valid;
+        }
+    }
 
     const std::array<ShadingContext::DirectionalLightInfo, 2> lights = {
         ShadingContext::DirectionalLightInfo{sun_dir, sun_intensity, sun_shadow_valid ? &sun_shadow : nullptr},
@@ -1394,8 +1756,9 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         Mesh mesh = cubeMesh;
         mesh.position = block.position;
         const TopFaceLighting* top_face = block.isTop ? &block.topFace : nullptr;
+        const auto* face_ao = &block.face_ao;
         render_mesh(zbuffer.data(), sample_colors.data(), sample_direct.data(), nullptr, width, height, mesh, c, s, fov, camera_pos,
-                    yaw, pitch, material, sky_top, sky_bottom, skyLightIntensity, lights, shadows_on, top_face);
+                    view_rot, material, sky_top_linear, sky_bottom_linear, effective_sky_intensity, lights, shadows_on, top_face, face_ao);
     }
 
     for (size_t i = 0; i < sample_count; ++i)
@@ -1420,8 +1783,9 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     for (size_t y = 0; y < height; ++y)
     {
         const float sky_t = height > 1 ? static_cast<float>(y) / static_cast<float>(height - 1) : 0.0f;
-        const ColorRGB sky_row_color = lerp_color(sky_top, sky_bottom, sky_t);
-        const uint32_t sky_row = pack_color(sky_row_color);
+        const ColorRGB sky_row_srgb = lerp_color(sky_top, sky_bottom, sky_t);
+        const ColorRGB sky_row_linear = srgb_to_linear(sky_row_srgb);
+        const uint32_t sky_row = pack_color(sky_row_srgb);
         for (size_t x = 0; x < width; ++x)
         {
             const size_t pixel = y * width + x;
@@ -1441,9 +1805,9 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                 const float depth = zbuffer[base + static_cast<size_t>(s)];
                 if (depth >= depth_max)
                 {
-                    accum.r += sky_row_color.r;
-                    accum.g += sky_row_color.g;
-                    accum.b += sky_row_color.b;
+                    accum.r += sky_row_linear.r;
+                    accum.g += sky_row_linear.g;
+                    accum.b += sky_row_linear.b;
                     weight_sum += 1.0f;
                     continue;
                 }
@@ -1471,12 +1835,13 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
             accum.g *= inv_weight;
             accum.b *= inv_weight;
 
+            ColorRGB srgb = linear_to_srgb(accum);
             const float dither = (static_cast<float>(bayer4[y & 3][x & 3]) - 7.5f) * dither_scale;
-            accum.r += dither;
-            accum.g += dither;
-            accum.b += dither;
+            srgb.r += dither;
+            srgb.g += dither;
+            srgb.b += dither;
 
-            framebuffer[y * width + x] = pack_color(accum);
+            framebuffer[y * width + x] = pack_color(srgb);
         }
     }
 }
@@ -1626,6 +1991,16 @@ bool render_get_shadow_enabled()
     return shadowEnabled.load(std::memory_order_relaxed);
 }
 
+size_t render_get_shadow_map_resolution()
+{
+    return kShadowMapResolution;
+}
+
+int render_get_shadow_pcf_kernel()
+{
+    return kShadowPcfKernel;
+}
+
 bool render_get_terrain_top_ao(const int x, const int z, float out_ao[4])
 {
     if (!out_ao)
@@ -1669,6 +2044,7 @@ bool render_get_shadow_factor_at_point(const Vec3 world, const Vec3 normal, floa
     }
 
     static ShadowMap shadow;
+    static ShadowCacheState shadow_cache;
     const Mesh cubeMesh{
         cubeVertices,
         8,
@@ -1679,10 +2055,19 @@ bool render_get_shadow_factor_at_point(const Vec3 world, const Vec3 normal, floa
     };
     const double c = std::cos(rotationAngle);
     const double s = std::sin(rotationAngle);
-    if (!build_shadow_map(shadow, light_dir, terrainBlocks, cubeMesh, c, s))
+    const bool needs_rebuild = !shadow.valid || !shadow_cache_matches(shadow_cache, light_dir, c, s);
+    if (needs_rebuild)
     {
-        *out_factor = 1.0f;
-        return false;
+        if (!build_shadow_map(shadow, light_dir, terrainBlocks, cubeMesh, c, s))
+        {
+            shadow_cache.valid = false;
+            *out_factor = 1.0f;
+            return false;
+        }
+        shadow_cache.valid = true;
+        shadow_cache.dir = light_dir;
+        shadow_cache.c = c;
+        shadow_cache.s = s;
     }
     *out_factor = compute_shadow_factor(&shadow, light_dir, world, normalize_vec(normal));
     return true;

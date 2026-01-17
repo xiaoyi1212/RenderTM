@@ -66,6 +66,8 @@ void render_set_ambient_occlusion_enabled(bool enabled);
 bool render_get_ambient_occlusion_enabled();
 void render_set_shadow_enabled(bool enabled);
 bool render_get_shadow_enabled();
+size_t render_get_shadow_map_resolution();
+int render_get_shadow_pcf_kernel();
 bool render_get_terrain_top_ao(int x, int z, float out_ao[4]);
 bool render_get_shadow_factor_at_point(Vec3 world, Vec3 normal, float* out_factor);
 void render_set_camera_position(Vec3 pos);

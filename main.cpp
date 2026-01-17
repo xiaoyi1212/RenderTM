@@ -1,4 +1,3 @@
-#include <chrono>
 #include <csignal>
 
 #include "terminal_render.h"
@@ -10,29 +9,12 @@
 #include <pthread.h>
 #include <unistd.h>
 
-static auto tpsLastTime = std::chrono::high_resolution_clock::now();
-static int handleCount = 0;
-double tps = 0.0;
 static std::atomic<bool> running{true};
 static volatile std::sig_atomic_t shutdownRequested = 0;
 
 static void handle_signal(int)
 {
     shutdownRequested = 1;
-}
-
-void game_loop_handle()
-{
-    handleCount++;
-    auto currentTime = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = currentTime - tpsLastTime;
-    if (elapsed.count() >= 1.0)
-    {
-        tps = handleCount / elapsed.count();
-        handleCount = 0;
-        tpsLastTime = currentTime;
-    }
-
 }
 
 void* render_thread(void*)
@@ -103,7 +85,6 @@ int main()
             case InputAction::None:
                 break;
         }
-        game_loop_handle();
     }
     pthread_join(rthread, nullptr);
     render_shutdown();
