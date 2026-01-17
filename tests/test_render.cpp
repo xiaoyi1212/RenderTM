@@ -161,7 +161,7 @@ static void build_heightmap(std::vector<int>& heights, std::vector<uint32_t>& to
     const double height_freq = 0.12;
     const double surface_freq = 0.4;
     const uint32_t dirt_color = 0xFF8A4F22;
-    const uint32_t grass_color = 0xFF2E7A2A;
+    const uint32_t grass_color = 0xFF3B8A38;
     const uint32_t water_color = 0xFF2B5FA8;
 
     heights.assign(static_cast<size_t>(chunk_size * chunk_size), 0);
@@ -202,7 +202,7 @@ static void build_heightmap(std::vector<int>& heights, std::vector<uint32_t>& to
 static bool find_sloped_grass_cell(int& out_x, int& out_z, int& out_height)
 {
     const int chunk_size = 16;
-    const uint32_t grass_color = 0xFF2E7A2A;
+    const uint32_t grass_color = 0xFF3B8A38;
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -1234,7 +1234,7 @@ TEST_CASE("gamma correction applies to midtone ambient")
     double avg_lum = 0.0;
     REQUIRE(sample_average_luminance(framebuffer, width, height, px, py, sky_color, sky_color, avg_lum));
 
-    const uint32_t expected = expected_gamma_luminance(0xFF2E7A2A, 0.5f);
+    const uint32_t expected = expected_gamma_luminance(0xFF3B8A38, 0.5f);
     REQUIRE(avg_lum == Catch::Approx(static_cast<double>(expected)).margin(12.0));
 }
 
@@ -1732,27 +1732,110 @@ TEST_CASE("camera state setters and getters")
 TEST_CASE("camera movement in world and local space")
 {
     reset_camera();
-    render_set_camera_position({0.0, 0.0, 0.0});
+    render_set_camera_position({0.0, -20.0, -20.0});
     render_set_camera_rotation({0.0, 0.0});
     render_move_camera({1.0, -2.0, 3.0});
     Vec3 pos = render_get_camera_position();
     REQUIRE(pos.x == Catch::Approx(1.0));
-    REQUIRE(pos.y == Catch::Approx(-2.0));
-    REQUIRE(pos.z == Catch::Approx(3.0));
+    REQUIRE(pos.y == Catch::Approx(-22.0));
+    REQUIRE(pos.z == Catch::Approx(-17.0));
 
     render_move_camera_local({0.0, 0.0, 1.0});
     pos = render_get_camera_position();
     REQUIRE(pos.x == Catch::Approx(1.0));
-    REQUIRE(pos.y == Catch::Approx(-2.0));
-    REQUIRE(pos.z == Catch::Approx(4.0));
+    REQUIRE(pos.y == Catch::Approx(-22.0));
+    REQUIRE(pos.z == Catch::Approx(-16.0));
 
     constexpr double half_pi = 1.5707963267948966;
-    render_set_camera_position({0.0, 0.0, 0.0});
+    render_set_camera_position({0.0, -20.0, -20.0});
     render_set_camera_rotation({half_pi, 0.0});
     render_move_camera_local({0.0, 0.0, 1.0});
     pos = render_get_camera_position();
     REQUIRE(pos.x == Catch::Approx(1.0));
-    REQUIRE(pos.z == Catch::Approx(0.0).margin(1e-6));
+    REQUIRE(pos.z == Catch::Approx(-20.0).margin(1e-6));
+}
+
+TEST_CASE("camera movement blocks entry into terrain")
+{
+    reset_camera();
+    render_set_scene(RenderScene::CubeOnly);
+    render_set_paused(true);
+
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+    const int cell_x = 0;
+    const int cell_z = 0;
+    const int cell_height = heights[static_cast<size_t>(cell_z * 16 + cell_x)];
+    REQUIRE(cell_height > 0);
+
+    const double block_size = 2.0;
+    const double half = block_size * 0.5;
+    const double start_x = -(16 - 1) * block_size * 0.5;
+    const double start_z = 4.0;
+    const double base_y = 2.0;
+
+    const double block_x = start_x + cell_x * block_size;
+    const double block_z = start_z + cell_z * block_size;
+    const double block_y = base_y - (cell_height - 1) * block_size;
+
+    const Vec3 start{block_x - half - 0.2, block_y, block_z};
+    render_set_camera_position(start);
+    render_move_camera({0.3, 0.0, 0.0});
+    Vec3 pos = render_get_camera_position();
+
+    const bool inside = std::abs(pos.x - block_x) < half &&
+                        std::abs(pos.y - block_y) < half &&
+                        std::abs(pos.z - block_z) < half;
+    REQUIRE_FALSE(inside);
+
+    render_set_camera_position(start);
+    render_move_camera({-0.3, 0.0, 0.0});
+    pos = render_get_camera_position();
+    REQUIRE(pos.x == Catch::Approx(start.x - 0.3));
+    render_set_paused(false);
+}
+
+TEST_CASE("camera forward movement does not climb when blocked by top face")
+{
+    reset_camera();
+    render_set_scene(RenderScene::CubeOnly);
+    render_set_paused(true);
+
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+
+    const int cell_x = 0;
+    const int cell_z = 0;
+    const int cell_height = heights[static_cast<size_t>(cell_z * 16 + cell_x)];
+    REQUIRE(cell_height > 0);
+
+    const double block_size = 2.0;
+    const double half = block_size * 0.5;
+    const double start_x = -(16 - 1) * block_size * 0.5;
+    const double start_z = 4.0;
+    const double base_y = 2.0;
+
+    const double block_x = start_x + cell_x * block_size;
+    const double block_z = start_z + cell_z * block_size;
+    const double block_y = base_y - (cell_height - 1) * block_size;
+    const double top_face = block_y - half;
+
+    render_set_camera_position({block_x, top_face - 0.2, block_z - 1.5});
+    render_set_camera_rotation({0.0, -1.2});
+
+    Vec3 pos = render_get_camera_position();
+    double last_y = pos.y;
+    for (int i = 0; i < 20; ++i)
+    {
+        render_move_camera_local({0.0, 0.0, 0.3});
+        pos = render_get_camera_position();
+        REQUIRE(pos.y + 1e-6 >= last_y);
+        last_y = pos.y;
+    }
+
+    render_set_paused(false);
 }
 
 TEST_CASE("render_project_point centers consistently")
@@ -1770,6 +1853,37 @@ TEST_CASE("render_project_point centers consistently")
     const double square_offset = square.x - 40.0;
     const double wide_offset = wide.x - 100.0;
     REQUIRE(wide_offset == Catch::Approx(square_offset));
+}
+
+TEST_CASE("render_should_rasterize_triangle allows near-plane clipping")
+{
+    const Vec3 in_front{0.0, 0.0, 0.2};
+    const Vec3 behind{0.0, 0.0, 0.01};
+
+    REQUIRE(render_should_rasterize_triangle(in_front, in_front, in_front));
+    REQUIRE(render_should_rasterize_triangle(behind, in_front, in_front));
+    REQUIRE_FALSE(render_should_rasterize_triangle(behind, behind, behind));
+}
+
+TEST_CASE("render_clip_triangle_to_near_plane clips partially occluded triangles")
+{
+    const double near_plane = render_get_near_plane();
+    const Vec3 in_front{0.0, 0.0, near_plane + 0.1};
+    const Vec3 behind{0.0, 0.0, near_plane * 0.5};
+
+    Vec3 clipped[4]{};
+    const size_t count = render_clip_triangle_to_near_plane(behind, in_front, in_front, clipped, 4);
+    REQUIRE(count == 4);
+    for (size_t i = 0; i < count; ++i)
+    {
+        REQUIRE(clipped[i].z >= Catch::Approx(near_plane).margin(1e-6));
+    }
+
+    const size_t count_inside = render_clip_triangle_to_near_plane(in_front, in_front, in_front, clipped, 4);
+    REQUIRE(count_inside == 3);
+
+    const size_t count_outside = render_clip_triangle_to_near_plane(behind, behind, behind, clipped, 4);
+    REQUIRE(count_outside == 0);
 }
 
 TEST_CASE("render_project_point responds to yaw rotation")

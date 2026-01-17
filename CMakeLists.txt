@@ -14,6 +14,8 @@ add_executable(untitled main.cpp
         render.h
         input.cpp
         input.h
+        controls.cpp
+        controls.h
         vector.cpp
         vector.h
         keyboard.h
@@ -29,10 +31,12 @@ add_executable(untitled main.cpp
 FetchContent_MakeAvailable(Catch2)
 
 add_executable(untitled_tests
+        tests/test_controls.cpp
         tests/test_input.cpp
         tests/test_vector.cpp
         tests/test_render.cpp
         input.cpp
+        controls.cpp
         vector.cpp
         render.cpp)
 target_link_libraries(untitled_tests PRIVATE Catch2::Catch2WithMain)

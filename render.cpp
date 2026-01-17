@@ -203,10 +203,16 @@ constexpr ColorRGB kSunLightColorLinear{1.0f, 0.94f, 0.88f};
 constexpr ColorRGB kMoonLightColorLinear{1.0f, 1.0f, 1.0f};
 constexpr double kSunIntensityBoost = 1.2;
 constexpr double kMoonSkyLightFloor = 0.22;
+constexpr double kNearPlane = 0.05;
+constexpr int kTerrainChunkSize = 16;
+constexpr double kTerrainBlockSize = 2.0;
+constexpr double kTerrainStartZ = 4.0;
+constexpr double kTerrainBaseY = 2.0;
 
 static Vec3 normalize_vec(const Vec3& v);
 static float compute_shadow_factor(const ShadowMap* shadow, const Vec3& light_dir,
                                    const Vec3& world, const Vec3& normal);
+static bool triangle_in_front_of_near_plane(double z0, double z1, double z2);
 
 static std::array<int, 512> make_permutation(const int seed)
 {
@@ -374,21 +380,21 @@ static void generate_terrain_chunk()
     }
     terrainReady = true;
 
-    const int chunk_size = 16;
+    const int chunk_size = kTerrainChunkSize;
     const int base_height = 4;
     const int dirt_thickness = 2;
     const int height_variation = 6;
     const double height_freq = 0.12;
     const double surface_freq = 0.4;
 
-    const double block_size = 2.0;
+    const double block_size = kTerrainBlockSize;
     const double start_x = -(chunk_size - 1) * block_size * 0.5;
-    const double start_z = 4.0;
-    const double base_y = 2.0;
+    const double start_z = kTerrainStartZ;
+    const double base_y = kTerrainBaseY;
 
     const uint32_t stone_color = 0xFF7A7A7A;
-    const uint32_t dirt_color = 0xFF8A4F22;
-    const uint32_t grass_color = 0xFF2E7A2A;
+    const uint32_t dirt_color = 0xFF7D4714;
+    const uint32_t grass_color = 0xFF3B8A38;
     const uint32_t water_color = 0xFF2B5FA8;
 
     terrainSize = chunk_size;
@@ -600,6 +606,142 @@ static Vec3 normalize_vec(const Vec3& v)
     const double len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
     if (len == 0.0) return {0.0, 0.0, 0.0};
     return {v.x / len, v.y / len, v.z / len};
+}
+
+static bool triangle_in_front_of_near_plane(const double z0, const double z1, const double z2)
+{
+    return z0 >= kNearPlane || z1 >= kNearPlane || z2 >= kNearPlane;
+}
+
+struct ClipVertex
+{
+    Vec3 view;
+    Vec3 world;
+    Vec3 normal;
+    float ao;
+};
+
+static ClipVertex clip_lerp(const ClipVertex& a, const ClipVertex& b, const double t)
+{
+    const Vec3 view{
+        a.view.x + (b.view.x - a.view.x) * t,
+        a.view.y + (b.view.y - a.view.y) * t,
+        a.view.z + (b.view.z - a.view.z) * t
+    };
+    const Vec3 world{
+        a.world.x + (b.world.x - a.world.x) * t,
+        a.world.y + (b.world.y - a.world.y) * t,
+        a.world.z + (b.world.z - a.world.z) * t
+    };
+    Vec3 normal{
+        a.normal.x + (b.normal.x - a.normal.x) * t,
+        a.normal.y + (b.normal.y - a.normal.y) * t,
+        a.normal.z + (b.normal.z - a.normal.z) * t
+    };
+    normal = normalize_vec(normal);
+    const float ao = a.ao + (b.ao - a.ao) * static_cast<float>(t);
+    return {view, world, normal, ao};
+}
+
+static size_t clip_triangle_to_near_plane(const ClipVertex* input, const size_t input_count,
+                                          ClipVertex* output, const size_t max_output)
+{
+    if (!input || !output || input_count == 0 || max_output == 0)
+    {
+        return 0;
+    }
+    size_t out_count = 0;
+    ClipVertex prev = input[input_count - 1];
+    bool prev_inside = prev.view.z >= kNearPlane;
+
+    for (size_t i = 0; i < input_count; ++i)
+    {
+        const ClipVertex cur = input[i];
+        const bool cur_inside = cur.view.z >= kNearPlane;
+
+        if (cur_inside)
+        {
+            if (!prev_inside)
+            {
+                const double t = (kNearPlane - prev.view.z) / (cur.view.z - prev.view.z);
+                if (out_count < max_output)
+                {
+                    output[out_count++] = clip_lerp(prev, cur, t);
+                }
+            }
+            if (out_count < max_output)
+            {
+                output[out_count++] = cur;
+            }
+        }
+        else if (prev_inside)
+        {
+            const double t = (kNearPlane - prev.view.z) / (cur.view.z - prev.view.z);
+            if (out_count < max_output)
+            {
+                output[out_count++] = clip_lerp(prev, cur, t);
+            }
+        }
+
+        prev = cur;
+        prev_inside = cur_inside;
+    }
+
+    return out_count;
+}
+
+static size_t clip_triangle_positions(const Vec3* input, const size_t input_count,
+                                      Vec3* output, const size_t max_output)
+{
+    if (!input || !output || input_count == 0 || max_output == 0)
+    {
+        return 0;
+    }
+    size_t out_count = 0;
+    Vec3 prev = input[input_count - 1];
+    bool prev_inside = prev.z >= kNearPlane;
+
+    for (size_t i = 0; i < input_count; ++i)
+    {
+        const Vec3 cur = input[i];
+        const bool cur_inside = cur.z >= kNearPlane;
+
+        auto intersect = [&](const Vec3& a, const Vec3& b) {
+            const double t = (kNearPlane - a.z) / (b.z - a.z);
+            return Vec3{
+                a.x + (b.x - a.x) * t,
+                a.y + (b.y - a.y) * t,
+                a.z + (b.z - a.z) * t
+            };
+        };
+
+        if (cur_inside)
+        {
+            if (!prev_inside)
+            {
+                if (out_count < max_output)
+                {
+                    output[out_count++] = intersect(prev, cur);
+                }
+            }
+            if (out_count < max_output)
+            {
+                output[out_count++] = cur;
+            }
+        }
+        else if (prev_inside)
+        {
+            if (out_count < max_output)
+            {
+                output[out_count++] = intersect(prev, cur);
+            }
+        }
+
+        prev = cur;
+        prev_inside = cur_inside;
+    }
+
+    return out_count;
 }
 
 static bool shadow_cache_matches(const ShadowCacheState& cache, const Vec3& dir, const double c, const double s)
@@ -1278,14 +1420,14 @@ static void render_mesh(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* samp
                         const std::array<std::array<float, 4>, 6>* face_ao)
 {
     thread_local std::vector<Vec3> world;
-    thread_local std::vector<ScreenVertex> projected;
+    thread_local std::vector<Vec3> view_space;
     if (world.size() != mesh.vertexCount)
     {
         world.resize(mesh.vertexCount);
     }
-    if (projected.size() != mesh.vertexCount)
+    if (view_space.size() != mesh.vertexCount)
     {
-        projected.resize(mesh.vertexCount);
+        view_space.resize(mesh.vertexCount);
     }
 
     for (size_t i = 0; i < mesh.vertexCount; ++i)
@@ -1303,14 +1445,7 @@ static void render_mesh(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* samp
 
         Vec3 view = {v.x - camera_pos.x, v.y - camera_pos.y, v.z - camera_pos.z};
         view = rotate_yaw_pitch_cached(view, view_rot.cy, view_rot.sy, view_rot.cp, view_rot.sp);
-
-        const double z = view.z <= 0.01 ? 0.01 : view.z;
-        const double invZ = 1.0 / z;
-        const double projX = view.x * invZ * fov;
-        const double projY = view.y * invZ * fov;
-        projected[i].x = static_cast<float>(projX + width / 2.0);
-        projected[i].y = static_cast<float>(projY + height / 2.0);
-        projected[i].z = static_cast<float>(z);
+        view_space[i] = view;
     }
 
     const ColorRGB albedo_srgb = unpack_color(material.color);
@@ -1462,12 +1597,48 @@ static void render_mesh(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* samp
             }
         }
 
-        draw_shaded_triangle(zbuffer, sample_ambient, sample_direct, sample_mask, width, height,
-                             projected[i0], projected[i1], projected[i2],
-                             world[i0], world[i1], world[i2],
-                             n0, n1, n2,
-                             ao0, ao1, ao2,
-                             ctx);
+        ClipVertex input[3]{
+            {view_space[i0], world[i0], n0, ao0},
+            {view_space[i1], world[i1], n1, ao1},
+            {view_space[i2], world[i2], n2, ao2}
+        };
+        ClipVertex clipped[4]{};
+        const size_t clipped_count = clip_triangle_to_near_plane(input, 3, clipped, 4);
+        if (clipped_count < 3)
+        {
+            continue;
+        }
+
+        auto project_vertex = [&](const Vec3& view) {
+            const double invZ = 1.0 / view.z;
+            return ScreenVertex{
+                static_cast<float>(view.x * invZ * fov + width / 2.0),
+                static_cast<float>(view.y * invZ * fov + height / 2.0),
+                static_cast<float>(view.z)
+            };
+        };
+
+        auto draw_triangle = [&](const ClipVertex& a, const ClipVertex& b, const ClipVertex& c) {
+            const ScreenVertex sv0 = project_vertex(a.view);
+            const ScreenVertex sv1 = project_vertex(b.view);
+            const ScreenVertex sv2 = project_vertex(c.view);
+            draw_shaded_triangle(zbuffer, sample_ambient, sample_direct, sample_mask, width, height,
+                                 sv0, sv1, sv2,
+                                 a.world, b.world, c.world,
+                                 a.normal, b.normal, c.normal,
+                                 a.ao, b.ao, c.ao,
+                                 ctx);
+        };
+
+        if (clipped_count == 3)
+        {
+            draw_triangle(clipped[0], clipped[1], clipped[2]);
+        }
+        else if (clipped_count == 4)
+        {
+            draw_triangle(clipped[0], clipped[1], clipped[2]);
+            draw_triangle(clipped[0], clipped[2], clipped[3]);
+        }
     }
 }
 
@@ -2140,6 +2311,22 @@ bool render_get_shadow_factor_at_point(const Vec3 world, const Vec3 normal, floa
     return true;
 }
 
+static bool camera_intersects_block(const Vec3& pos)
+{
+    generate_terrain_chunk();
+    const double half = kTerrainBlockSize * 0.5;
+    for (const auto& block : terrainBlocks)
+    {
+        if (std::abs(pos.x - block.position.x) < half &&
+            std::abs(pos.y - block.position.y) < half &&
+            std::abs(pos.z - block.position.z) < half)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 void render_set_camera_position(const Vec3 pos)
 {
     camera_x.store(pos.x, std::memory_order_relaxed);
@@ -2158,16 +2345,59 @@ Vec3 render_get_camera_position()
 
 void render_move_camera(const Vec3 delta)
 {
-    camera_x.store(camera_x.load(std::memory_order_relaxed) + delta.x, std::memory_order_relaxed);
-    camera_y.store(camera_y.load(std::memory_order_relaxed) + delta.y, std::memory_order_relaxed);
-    camera_z.store(camera_z.load(std::memory_order_relaxed) + delta.z, std::memory_order_relaxed);
+    Vec3 pos = render_get_camera_position();
+    if (delta.x != 0.0)
+    {
+        const Vec3 candidate{pos.x + delta.x, pos.y, pos.z};
+        if (!camera_intersects_block(candidate))
+        {
+            pos.x = candidate.x;
+        }
+    }
+    if (delta.y != 0.0)
+    {
+        const Vec3 candidate{pos.x, pos.y + delta.y, pos.z};
+        if (!camera_intersects_block(candidate))
+        {
+            pos.y = candidate.y;
+        }
+    }
+    if (delta.z != 0.0)
+    {
+        const Vec3 candidate{pos.x, pos.y, pos.z + delta.z};
+        if (!camera_intersects_block(candidate))
+        {
+            pos.z = candidate.z;
+        }
+    }
+    render_set_camera_position(pos);
 }
 
 void render_move_camera_local(const Vec3 delta)
 {
     const double yaw = camera_yaw.load(std::memory_order_relaxed);
     const double pitch = camera_pitch.load(std::memory_order_relaxed);
-    const Vec3 rotated = rotate_yaw_pitch(delta, yaw, pitch);
+    Vec3 rotated = rotate_yaw_pitch(delta, yaw, pitch);
+    if (delta.z > 0.0)
+    {
+        if (pitch < 0.0 && rotated.y < 0.0)
+        {
+            rotated.y = 0.0;
+        }
+        else if (pitch > 0.0 && rotated.y > 0.0)
+        {
+            rotated.y = 0.0;
+        }
+    }
+    if (rotated.y > 0.0)
+    {
+        const Vec3 pos = render_get_camera_position();
+        const Vec3 candidate{pos.x + rotated.x, pos.y + rotated.y, pos.z + rotated.z};
+        if (camera_intersects_block(candidate))
+        {
+            rotated.y = 0.0;
+        }
+    }
     render_move_camera(rotated);
 }
 
@@ -2193,6 +2423,23 @@ void render_rotate_camera(const Vec2 delta)
     camera_pitch.store(pitch, std::memory_order_relaxed);
 }
 
+bool render_should_rasterize_triangle(const Vec3 v0, const Vec3 v1, const Vec3 v2)
+{
+    return triangle_in_front_of_near_plane(v0.z, v1.z, v2.z);
+}
+
+double render_get_near_plane()
+{
+    return kNearPlane;
+}
+
+size_t render_clip_triangle_to_near_plane(const Vec3 v0, const Vec3 v1, const Vec3 v2,
+                                          Vec3* out_vertices, const size_t max_vertices)
+{
+    const Vec3 input[3]{v0, v1, v2};
+    return clip_triangle_positions(input, 3, out_vertices, max_vertices);
+}
+
 Vec2 render_project_point(const Vec3 world, const size_t width, const size_t height)
 {
     if (width == 0 || height == 0)
@@ -2215,7 +2462,7 @@ Vec2 render_project_point(const Vec3 world, const size_t width, const size_t hei
     };
     view = rotate_yaw_pitch(view, -yaw, -pitch);
 
-    const double z = view.z <= 0.01 ? 0.01 : view.z;
+    const double z = view.z <= kNearPlane ? kNearPlane : view.z;
     const double inv_z = 1.0 / z;
     const double fov = static_cast<double>(height) * 0.8;
     const double proj_x = view.x * inv_z * fov;

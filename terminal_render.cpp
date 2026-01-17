@@ -2,12 +2,15 @@
 #include "render.h"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <mutex>
 #include <ostream>
-#include <cstring>
-#include <unistd.h>
+#include <string>
 #include <sys/ioctl.h>
+#include <unistd.h>
 
 static char buffer[65536];
 std::atomic<size_t> raw_width, raw_height;
@@ -21,6 +24,11 @@ static int stdout_flags = -1;
 static bool stdout_nonblock = true;
 static std::string pending_output;
 static size_t pending_offset = 0;
+static std::mutex frame_mutex;
+static std::condition_variable frame_cv;
+static std::string queued_frame;
+static bool frame_ready = false;
+static bool output_shutdown = false;
 
 static void stdout_init()
 {
@@ -42,7 +50,7 @@ static void stdout_restore()
     }
 }
 
-static void stdout_write_best_effort(const char* data, size_t len)
+static void stdout_write(const char* data, size_t len)
 {
     if (!stdout_nonblock)
     {
@@ -89,6 +97,29 @@ static bool stdout_flush_pending()
     return false;
 }
 
+static void render_submit_frame(std::string frame)
+{
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex);
+        queued_frame = std::move(frame);
+        frame_ready = true;
+    }
+    frame_cv.notify_one();
+}
+
+static bool render_wait_for_frame(std::string& out)
+{
+    std::unique_lock<std::mutex> lock(frame_mutex);
+    frame_cv.wait(lock, [] { return frame_ready || output_shutdown; });
+    if (output_shutdown)
+    {
+        return false;
+    }
+    out = std::move(queued_frame);
+    frame_ready = false;
+    return true;
+}
+
 void render_update_size(int sig)
 {
     winsize w{};
@@ -110,8 +141,8 @@ void render_init()
     setvbuf(stdout, buffer, _IOFBF, sizeof(buffer));
     render_update_size(0);
     stdout_init();
-    const char* enter_alt = "\033[?1049h\033[?25l\033[0m\033[2J\033[H";
-    stdout_write_best_effort(enter_alt, std::strlen(enter_alt));
+    const char* enter_alt = "\033[?1049h\033[?25l\033[?1003h\033[?1006h\033[0m\033[2J\033[H";
+    stdout_write(enter_alt, std::strlen(enter_alt));
 }
 
 void render_print()
@@ -192,28 +223,60 @@ void render_print()
         last_fg = 0xFFFFFFFF;
         last_bg = 0xFFFFFFFF;
     }
-    if (stdout_nonblock)
-    {
-        if (!stdout_flush_pending())
-        {
-            return;
-        }
-        pending_output = std::move(frame_buffer);
-        pending_offset = 0;
-        if (!stdout_flush_pending())
-        {
-            return;
-        }
-    }
-    else
-    {
-        stdout_write_best_effort(frame_buffer.data(), frame_buffer.size());
-    }
+    render_submit_frame(std::move(frame_buffer));
 }
 
 void render_shutdown()
 {
-    const char* leave_alt = "\033[?25h\033[0m\033[?1049l";
-    stdout_write_best_effort(leave_alt, std::strlen(leave_alt));
+    const char* leave_alt = "\033[?1003l\033[?1006l\033[?25h\033[0m\033[?1049l";
+    stdout_write(leave_alt, std::strlen(leave_alt));
     stdout_restore();
+}
+
+void render_output_run()
+{
+    std::string frame;
+    while (true)
+    {
+        if (stdout_nonblock)
+        {
+            if (!stdout_flush_pending())
+            {
+                usleep(1000);
+                continue;
+            }
+        }
+        if (!render_wait_for_frame(frame))
+        {
+            break;
+        }
+        if (stdout_nonblock)
+        {
+            pending_output = std::move(frame);
+            pending_offset = 0;
+        }
+        else
+        {
+            stdout_write(frame.data(), frame.size());
+        }
+    }
+}
+
+void render_output_request_stop()
+{
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex);
+        output_shutdown = true;
+    }
+    frame_cv.notify_all();
+}
+
+size_t render_get_terminal_width()
+{
+    return raw_width.load(std::memory_order_relaxed);
+}
+
+size_t render_get_terminal_height()
+{
+    return raw_height.load(std::memory_order_relaxed);
 }

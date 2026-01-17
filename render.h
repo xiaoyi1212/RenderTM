@@ -79,3 +79,6 @@ void render_set_camera_rotation(Vec2 rot);
 Vec2 render_get_camera_rotation();
 void render_rotate_camera(Vec2 delta);
 Vec2 render_project_point(Vec3 world, size_t width, size_t height);
+bool render_should_rasterize_triangle(Vec3 v0, Vec3 v1, Vec3 v2);
+double render_get_near_plane();
+size_t render_clip_triangle_to_near_plane(Vec3 v0, Vec3 v1, Vec3 v2, Vec3* out_vertices, size_t max_vertices);

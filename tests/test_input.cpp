@@ -1,4 +1,8 @@
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+
+#include <cmath>
+#include <string_view>
 
 #include "input.h"
 
@@ -26,10 +30,76 @@ TEST_CASE("input_map_key maps camera movement keys")
     REQUIRE(input_map_key('f') == InputAction::MoveDown);
 }
 
-TEST_CASE("input_map_key maps camera rotation keys")
+TEST_CASE("input_parse_sgr_mouse parses motion event")
 {
-    REQUIRE(input_map_key('j') == InputAction::YawLeft);
-    REQUIRE(input_map_key('l') == InputAction::YawRight);
-    REQUIRE(input_map_key('i') == InputAction::PitchUp);
-    REQUIRE(input_map_key('k') == InputAction::PitchDown);
+    MouseEvent event{};
+    size_t consumed = 0;
+    const auto result = input_parse_sgr_mouse(std::string_view("\x1b[<35;12;8M"), &consumed, &event);
+    REQUIRE(result == MouseParseResult::Parsed);
+    REQUIRE(consumed == 11);
+    REQUIRE(event.x == 12);
+    REQUIRE(event.y == 8);
+    REQUIRE(event.motion);
+}
+
+TEST_CASE("input_parse_sgr_mouse detects incomplete sequence")
+{
+    MouseEvent event{};
+    size_t consumed = 0;
+    const auto result = input_parse_sgr_mouse(std::string_view("\x1b[<35;12;"), &consumed, &event);
+    REQUIRE(result == MouseParseResult::NeedMore);
+}
+
+TEST_CASE("input_parse_sgr_mouse rejects non-mouse input")
+{
+    MouseEvent event{};
+    size_t consumed = 0;
+    const auto result = input_parse_sgr_mouse(std::string_view("abc"), &consumed, &event);
+    REQUIRE(result == MouseParseResult::Invalid);
+}
+
+TEST_CASE("input_parse_csi_key parses arrow keys")
+{
+    InputAction action = InputAction::None;
+    size_t consumed = 0;
+    REQUIRE(input_parse_csi_key(std::string_view("\x1b[A"), &consumed, &action) == InputParseResult::Parsed);
+    REQUIRE(consumed == 3);
+    REQUIRE(action == InputAction::MoveForward);
+
+    REQUIRE(input_parse_csi_key(std::string_view("\x1b[B"), &consumed, &action) == InputParseResult::Parsed);
+    REQUIRE(action == InputAction::MoveBackward);
+
+    REQUIRE(input_parse_csi_key(std::string_view("\x1b[C"), &consumed, &action) == InputParseResult::Parsed);
+    REQUIRE(action == InputAction::MoveRight);
+
+    REQUIRE(input_parse_csi_key(std::string_view("\x1b[D"), &consumed, &action) == InputParseResult::Parsed);
+    REQUIRE(action == InputAction::MoveLeft);
+}
+
+TEST_CASE("input_parse_csi_key handles incomplete sequence")
+{
+    InputAction action = InputAction::None;
+    size_t consumed = 0;
+    REQUIRE(input_parse_csi_key(std::string_view("\x1b["), &consumed, &action) == InputParseResult::NeedMore);
+}
+
+TEST_CASE("input_mouse_look_velocity respects deadzone")
+{
+    const auto delta = input_mouse_look_velocity(40, 12, 80, 24, 2, 1.0);
+    REQUIRE(delta.yaw == Catch::Approx(0.0));
+    REQUIRE(delta.pitch == Catch::Approx(0.0));
+}
+
+TEST_CASE("input_mouse_look_velocity scales with distance and direction")
+{
+    const auto near = input_mouse_look_velocity(38, 8, 80, 24, 2, 1.0);
+    const auto far = input_mouse_look_velocity(1, 1, 80, 24, 2, 1.0);
+
+    REQUIRE(near.yaw < 0.0);
+    REQUIRE(near.pitch > 0.0);
+    REQUIRE(far.yaw < 0.0);
+    REQUIRE(far.pitch > 0.0);
+
+    REQUIRE(std::abs(far.yaw) > std::abs(near.yaw));
+    REQUIRE(std::abs(far.pitch) > std::abs(near.pitch));
 }
