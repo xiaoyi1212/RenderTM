@@ -60,25 +60,34 @@ const int cubeFaceAxis2[6] = {
     1  // front: Y
 };
 
+const int cubeFaceNormal[6][3] = {
+    {0, 1, 0},   // top (-y world, +y grid)
+    {0, -1, 0},  // bottom (+y world, -y grid)
+    {-1, 0, 0},  // left (-x)
+    {1, 0, 0},   // right (+x)
+    {0, 0, -1},  // back (-z)
+    {0, 0, 1}    // front (+z)
+};
+
 static float rotationAngle = 0.0f;
 static std::atomic<bool> rotationPaused{false};
 static RenderScene activeScene = RenderScene::CubeOnly;
 static Vec3 lightDirection{0.0, 0.0, -1.0};
-static double lightIntensity = 1.0;
+static double lightIntensity = 1.1;
 static std::atomic<bool> sunOrbitEnabled{true};
 static std::atomic<double> sunOrbitAngle{1.5707963267948966};
-static std::atomic<double> sunOrbitSpeed{0.0015};
+static std::atomic<double> sunOrbitSpeed{0.00075};
 static Vec3 moonDirection{0.0, 1.0, 0.0};
 static double moonIntensity = 0.2;
 static uint32_t skyTopColor = 0xFF78C2FF;
 static uint32_t skyBottomColor = 0xFF172433;
-static double skyLightIntensity = 0.25;
-static double ambientLight = 0.1;
-static std::atomic<double> camera_x{21.89};
-static std::atomic<double> camera_y{-20.78};
-static std::atomic<double> camera_z{3.71};
-static std::atomic<double> camera_yaw{-0.9005898940290741};
-static std::atomic<double> camera_pitch{-0.5707226654021458};
+static double skyLightIntensity = 0.32;
+static double ambientLight = 0.13;
+static std::atomic<double> camera_x{16.0};
+static std::atomic<double> camera_y{-19.72};
+static std::atomic<double> camera_z{-1.93};
+static std::atomic<double> camera_yaw{-0.6911503837897546};
+static std::atomic<double> camera_pitch{-0.6003932626860493};
 static std::atomic<bool> ambientOcclusionEnabled{true};
 static std::atomic<bool> shadowEnabled{true};
 
@@ -172,13 +181,14 @@ struct ShadingContext
     {
         Vec3 dir;
         double intensity;
+        ColorRGB color;
         const struct ShadowMap* shadow;
     };
     std::array<DirectionalLightInfo, 2> lights;
 };
 
 constexpr int kMsaaSamples = 2;
-constexpr size_t kShadowMapResolution = 128;
+constexpr size_t kShadowMapResolution = 96;
 constexpr int kShadowPcfRadius = 2;
 constexpr int kShadowPcfKernel = kShadowPcfRadius * 2 + 1;
 constexpr double kPi = 3.14159265358979323846;
@@ -189,6 +199,9 @@ constexpr uint32_t kSkySunriseBottomColor = 0xFF4A200A;
 constexpr double kHemisphereBounceStrength = 0.35;
 constexpr ColorRGB kHemisphereBounceColorLinear{1.0f, 0.9046612f, 0.7758222f};
 constexpr double kSkyLightHeightPower = 0.5;
+constexpr ColorRGB kSunLightColorLinear{1.0f, 0.94f, 0.88f};
+constexpr ColorRGB kMoonLightColorLinear{1.0f, 1.0f, 1.0f};
+constexpr double kSunIntensityBoost = 1.2;
 constexpr double kMoonSkyLightFloor = 0.22;
 
 static Vec3 normalize_vec(const Vec3& v);
@@ -286,6 +299,73 @@ static std::vector<int> terrainHeights;
 static std::vector<uint32_t> terrainTopColors;
 static std::vector<TopFaceLighting> terrainTopFaces;
 
+static bool terrain_has_block(const int gx, const int gy, const int gz)
+{
+    if (gx < 0 || gx >= terrainSize || gz < 0 || gz >= terrainSize)
+    {
+        return false;
+    }
+    if (gy < 0)
+    {
+        return false;
+    }
+    const size_t idx = static_cast<size_t>(gz * terrainSize + gx);
+    return gy < terrainHeights[idx];
+}
+
+static void compute_face_ao_for_block(const int gx, const int gy, const int gz,
+                                      std::array<std::array<float, 4>, 6>& out)
+{
+    constexpr float ao_strength = 0.35f;
+    for (int face = 0; face < 6; ++face)
+    {
+        const int axis1 = cubeFaceAxis1[face];
+        const int axis2 = cubeFaceAxis2[face];
+        const int nx = cubeFaceNormal[face][0];
+        const int ny = cubeFaceNormal[face][1];
+        const int nz = cubeFaceNormal[face][2];
+
+        for (int corner = 0; corner < 4; ++corner)
+        {
+            const int vi = cubeFaceVertices[face][corner];
+            const Vec3& v = cubeVertices[vi];
+            const int sx = v.x >= 0.0 ? 1 : -1;
+            const int sy_world = v.y >= 0.0 ? 1 : -1;
+            const int sz = v.z >= 0.0 ? 1 : -1;
+            const int sy = -sy_world;
+
+            const int sign1 = (axis1 == 0) ? sx : (axis1 == 1 ? sy : sz);
+            const int sign2 = (axis2 == 0) ? sx : (axis2 == 1 ? sy : sz);
+
+            int d1x = 0, d1y = 0, d1z = 0;
+            int d2x = 0, d2y = 0, d2z = 0;
+            if (axis1 == 0) d1x = sign1;
+            else if (axis1 == 1) d1y = sign1;
+            else d1z = sign1;
+
+            if (axis2 == 0) d2x = sign2;
+            else if (axis2 == 1) d2y = sign2;
+            else d2z = sign2;
+
+            const int base_x = gx + nx;
+            const int base_y = gy + ny;
+            const int base_z = gz + nz;
+
+            const int side1 = terrain_has_block(base_x + d1x, base_y + d1y, base_z + d1z) ? 1 : 0;
+            const int side2 = terrain_has_block(base_x + d2x, base_y + d2y, base_z + d2z) ? 1 : 0;
+            const int corner_block = terrain_has_block(base_x + d1x + d2x, base_y + d1y + d2y, base_z + d1z + d2z) ? 1 : 0;
+
+            int occlusion = side1 + side2 + corner_block;
+            if (side1 && side2)
+            {
+                occlusion = 3;
+            }
+            float ao = 1.0f - ao_strength * (static_cast<float>(occlusion) / 3.0f);
+            out[face][corner] = std::clamp(ao, 0.0f, 1.0f);
+        }
+    }
+}
+
 static void generate_terrain_chunk()
 {
     if (terrainReady)
@@ -307,9 +387,9 @@ static void generate_terrain_chunk()
     const double base_y = 2.0;
 
     const uint32_t stone_color = 0xFF7A7A7A;
-    const uint32_t dirt_color = 0xFFB36A2E;
-    const uint32_t grass_color = 0xFF3AAA35;
-    const uint32_t water_color = 0xFF3B7BFF;
+    const uint32_t dirt_color = 0xFF8A4F22;
+    const uint32_t grass_color = 0xFF2E7A2A;
+    const uint32_t water_color = 0xFF2B5FA8;
 
     terrainSize = chunk_size;
     terrainHeights.assign(static_cast<size_t>(chunk_size * chunk_size), 0);
@@ -330,61 +410,6 @@ static void generate_terrain_chunk()
             return 0;
         }
         return terrainHeights[index(x, z)];
-    };
-
-    auto has_block = [&](int gx, int gy, int gz) {
-        if (gx < 0 || gx >= chunk_size || gz < 0 || gz >= chunk_size)
-        {
-            return false;
-        }
-        if (gy < 0)
-        {
-            return false;
-        }
-        return gy < terrainHeights[index(gx, gz)];
-    };
-
-    auto compute_face_ao = [&](int gx, int gy, int gz, std::array<std::array<float, 4>, 6>& out) {
-        constexpr float ao_strength = 0.35f;
-        for (int face = 0; face < 6; ++face)
-        {
-            const int axis1 = cubeFaceAxis1[face];
-            const int axis2 = cubeFaceAxis2[face];
-            for (int corner = 0; corner < 4; ++corner)
-            {
-                const int vi = cubeFaceVertices[face][corner];
-                const Vec3& v = cubeVertices[vi];
-                const int sx = v.x >= 0.0 ? 1 : -1;
-                const int sy_world = v.y >= 0.0 ? 1 : -1;
-                const int sz = v.z >= 0.0 ? 1 : -1;
-                const int sy = -sy_world;
-
-                const int sign1 = (axis1 == 0) ? sx : (axis1 == 1 ? sy : sz);
-                const int sign2 = (axis2 == 0) ? sx : (axis2 == 1 ? sy : sz);
-
-                int d1x = 0, d1y = 0, d1z = 0;
-                int d2x = 0, d2y = 0, d2z = 0;
-                if (axis1 == 0) d1x = sign1;
-                else if (axis1 == 1) d1y = sign1;
-                else d1z = sign1;
-
-                if (axis2 == 0) d2x = sign2;
-                else if (axis2 == 1) d2y = sign2;
-                else d2z = sign2;
-
-                const int side1 = has_block(gx + d1x, gy + d1y, gz + d1z) ? 1 : 0;
-                const int side2 = has_block(gx + d2x, gy + d2y, gz + d2z) ? 1 : 0;
-                const int corner_block = has_block(gx + d1x + d2x, gy + d1y + d2y, gz + d1z + d2z) ? 1 : 0;
-
-                int occlusion = side1 + side2 + corner_block;
-                if (side1 && side2)
-                {
-                    occlusion = 3;
-                }
-                float ao = 1.0f - ao_strength * (static_cast<float>(occlusion) / 3.0f);
-                out[face][corner] = std::clamp(ao, 0.0f, 1.0f);
-            }
-        }
     };
 
     terrainBlocks.reserve(static_cast<size_t>(chunk_size * chunk_size * (base_height + height_variation + 3)));
@@ -527,7 +552,7 @@ static void generate_terrain_chunk()
                 {
                     face.fill(1.0f);
                 }
-                compute_face_ao(x, y, z, face_ao);
+                compute_face_ao_for_block(x, y, z, face_ao);
                 terrainBlocks.push_back({
                     {start_x + x * block_size, base_y - y * block_size, start_z + z * block_size},
                     color,
@@ -959,6 +984,9 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient, Color
                                     static_cast<float>(ctx.albedo.g * diffuse),
                                     static_cast<float>(ctx.albedo.b * diffuse)
                                 };
+                                light_color.r *= light.color.r;
+                                light_color.g *= light.color.g;
+                                light_color.b *= light.color.b;
                                 if (ctx.material.specular > 0.0)
                                 {
                                     const Vec3 half_vec = normalize_vec(add_vec(light.dir, view_dir));
@@ -966,9 +994,9 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient, Color
                                     double spec = std::pow(spec_dot, ctx.material.shininess) * ctx.material.specular;
                                     spec *= light.intensity * shadow_factor;
                                     spec = std::clamp(spec, 0.0, 1.0);
-                                    light_color.r += static_cast<float>((1.0f - light_color.r) * spec);
-                                    light_color.g += static_cast<float>((1.0f - light_color.g) * spec);
-                                    light_color.b += static_cast<float>((1.0f - light_color.b) * spec);
+                                    light_color.r += light.color.r * static_cast<float>(spec);
+                                    light_color.g += light.color.g * static_cast<float>(spec);
+                                    light_color.b += light.color.b * static_cast<float>(spec);
                                 }
                                 direct_color.r += light_color.r;
                                 direct_color.g += light_color.g;
@@ -1671,6 +1699,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         visibility = std::clamp(visibility, 0.0, 1.0);
         sun_intensity = lightIntensity * visibility;
     }
+    sun_intensity *= kSunIntensityBoost;
 
     ColorRGB sky_top = unpack_color(skyTopColor);
     ColorRGB sky_bottom = unpack_color(skyBottomColor);
@@ -1745,8 +1774,8 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     }
 
     const std::array<ShadingContext::DirectionalLightInfo, 2> lights = {
-        ShadingContext::DirectionalLightInfo{sun_dir, sun_intensity, sun_shadow_valid ? &sun_shadow : nullptr},
-        ShadingContext::DirectionalLightInfo{moon_dir, moonIntensity, moon_shadow_valid ? &moon_shadow : nullptr}
+        ShadingContext::DirectionalLightInfo{sun_dir, sun_intensity, kSunLightColorLinear, sun_shadow_valid ? &sun_shadow : nullptr},
+        ShadingContext::DirectionalLightInfo{moon_dir, moonIntensity, kMoonLightColorLinear, moon_shadow_valid ? &moon_shadow : nullptr}
     };
 
     for (const auto& block : terrainBlocks)
@@ -2020,6 +2049,44 @@ bool render_get_terrain_top_ao(const int x, const int z, float out_ao[4])
     for (size_t i = 0; i < 4; ++i)
     {
         out_ao[i] = terrainTopFaces[idx].ao[i];
+    }
+    return true;
+}
+
+bool render_get_terrain_face_ao(const int x, const int y, const int z, const int face, float out_ao[4])
+{
+    if (!out_ao)
+    {
+        return false;
+    }
+    generate_terrain_chunk();
+    if (face < 0 || face >= 6)
+    {
+        return false;
+    }
+    if (x < 0 || z < 0 || x >= terrainSize || z >= terrainSize)
+    {
+        return false;
+    }
+    const size_t idx = static_cast<size_t>(z * terrainSize + x);
+    if (idx >= terrainHeights.size())
+    {
+        return false;
+    }
+    const int height = terrainHeights[idx];
+    if (y < 0 || y >= height)
+    {
+        return false;
+    }
+    std::array<std::array<float, 4>, 6> face_ao{};
+    for (auto& entry : face_ao)
+    {
+        entry.fill(1.0f);
+    }
+    compute_face_ao_for_block(x, y, z, face_ao);
+    for (size_t i = 0; i < 4; ++i)
+    {
+        out_ao[i] = face_ao[static_cast<size_t>(face)][i];
     }
     return true;
 }

@@ -5,3 +5,7 @@
 # Other files
 AGENTS.md
 /.idea
+
+# Perf related files
+perf.data
+report.txt

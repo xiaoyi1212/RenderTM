@@ -160,9 +160,9 @@ static void build_heightmap(std::vector<int>& heights, std::vector<uint32_t>& to
     const int height_variation = 6;
     const double height_freq = 0.12;
     const double surface_freq = 0.4;
-    const uint32_t dirt_color = 0xFFB36A2E;
-    const uint32_t grass_color = 0xFF3AAA35;
-    const uint32_t water_color = 0xFF3B7BFF;
+    const uint32_t dirt_color = 0xFF8A4F22;
+    const uint32_t grass_color = 0xFF2E7A2A;
+    const uint32_t water_color = 0xFF2B5FA8;
 
     heights.assign(static_cast<size_t>(chunk_size * chunk_size), 0);
     top_colors.assign(static_cast<size_t>(chunk_size * chunk_size), grass_color);
@@ -202,7 +202,7 @@ static void build_heightmap(std::vector<int>& heights, std::vector<uint32_t>& to
 static bool find_sloped_grass_cell(int& out_x, int& out_z, int& out_height)
 {
     const int chunk_size = 16;
-    const uint32_t grass_color = 0xFF3AAA35;
+    const uint32_t grass_color = 0xFF2E7A2A;
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -314,14 +314,14 @@ static bool find_flat_shared_corner(FlatCornerProbe& out_probe)
     return false;
 }
 
-struct SideAoProbe
+struct SideFaceAoProbe
 {
     int x;
     int z;
     int height;
 };
 
-static bool find_side_ao_corner(SideAoProbe& out_probe)
+static bool find_right_face_diagonal_occluder(SideFaceAoProbe& out_probe)
 {
     const int chunk_size = 16;
     std::vector<int> heights;
@@ -332,17 +332,31 @@ static bool find_side_ao_corner(SideAoProbe& out_probe)
         return static_cast<size_t>(z * chunk_size + x);
     };
 
-    const int z = 0;
-    for (int x = 0; x < chunk_size - 1; ++x)
+    for (int z = 0; z < chunk_size - 1; ++z)
     {
-        const int height = heights[index(x, z)];
-        if (height < 2)
+        for (int x = 0; x < chunk_size - 1; ++x)
         {
-            continue;
-        }
-        const int right_height = heights[index(x + 1, z)];
-        if (right_height >= height - 1)
-        {
+            const int height = heights[index(x, z)];
+            const int y = height - 1;
+            if (y < 0)
+            {
+                continue;
+            }
+            const int right_height = heights[index(x + 1, z)];
+            const int z_height = heights[index(x, z + 1)];
+            const int diag_height = heights[index(x + 1, z + 1)];
+            if (right_height != height - 1)
+            {
+                continue;
+            }
+            if (z_height > y)
+            {
+                continue;
+            }
+            if (diag_height <= y)
+            {
+                continue;
+            }
             out_probe = {x, z, height};
             return true;
         }
@@ -427,6 +441,44 @@ static bool sample_average_luminance(const std::vector<uint32_t>& frame, size_t 
         return false;
     }
     out_avg = sum / static_cast<double>(count);
+    return true;
+}
+
+static bool sample_average_color(const std::vector<uint32_t>& frame, size_t width, size_t height,
+                                 int px, int py, uint32_t sky_top, uint32_t sky_bottom,
+                                 double& out_r, double& out_g, double& out_b)
+{
+    const int radius = 4;
+    double sum_r = 0.0;
+    double sum_g = 0.0;
+    double sum_b = 0.0;
+    size_t count = 0;
+    for (int dy = -radius; dy <= radius; ++dy)
+    {
+        const int y = std::clamp(py + dy, 0, static_cast<int>(height) - 1);
+        const uint32_t sky = sky_color_for_row(static_cast<size_t>(y), height, sky_top, sky_bottom);
+        for (int dx = -radius; dx <= radius; ++dx)
+        {
+            const int x = std::clamp(px + dx, 0, static_cast<int>(width) - 1);
+            const uint32_t pixel = frame[static_cast<size_t>(y) * width + static_cast<size_t>(x)];
+            if (pixel == sky)
+            {
+                continue;
+            }
+            sum_r += static_cast<double>((pixel >> 16) & 0xFF);
+            sum_g += static_cast<double>((pixel >> 8) & 0xFF);
+            sum_b += static_cast<double>(pixel & 0xFF);
+            count++;
+        }
+    }
+
+    if (count == 0)
+    {
+        return false;
+    }
+    out_r = sum_r / static_cast<double>(count);
+    out_g = sum_g / static_cast<double>(count);
+    out_b = sum_b / static_cast<double>(count);
     return true;
 }
 
@@ -681,9 +733,9 @@ TEST_CASE("render state setters and getters")
     render_set_paused(false);
 }
 
-TEST_CASE("shadow map resolution defaults to 128")
+TEST_CASE("shadow map resolution defaults to 96")
 {
-    REQUIRE(render_get_shadow_map_resolution() == 128);
+    REQUIRE(render_get_shadow_map_resolution() == 96);
 }
 
 TEST_CASE("shadow PCF kernel defaults to 5")
@@ -904,7 +956,78 @@ TEST_CASE("low sun altitude keeps ambient above black")
 
     double avg_lum = 0.0;
     REQUIRE(sample_average_luminance(framebuffer, width, height, px, py, sky_color, sky_color, avg_lum));
-    REQUIRE(avg_lum > 45.0);
+    REQUIRE(avg_lum > 30.0);
+}
+
+TEST_CASE("sun light is warmer than moon light")
+{
+    reset_camera();
+    render_set_scene(RenderScene::CubeOnly);
+    render_set_rotation(0.0f);
+    render_set_paused(true);
+    render_set_sun_orbit_enabled(false);
+    render_set_shadow_enabled(false);
+    render_set_ambient_occlusion_enabled(false);
+    render_set_sky_light_intensity(0.0);
+
+    const uint32_t sky_color = 0xFF010203;
+    render_set_sky_top_color(sky_color);
+    render_set_sky_bottom_color(sky_color);
+
+    int cell_x = 0;
+    int cell_z = 0;
+    int cell_height = 0;
+    REQUIRE(find_sloped_grass_cell(cell_x, cell_z, cell_height));
+
+    const int chunk_size = 16;
+    const double block_size = 2.0;
+    const double start_x = -(chunk_size - 1) * block_size * 0.5;
+    const double start_z = 4.0;
+    const double base_y = 2.0;
+
+    const double center_x = start_x + cell_x * block_size;
+    const double center_z = start_z + cell_z * block_size;
+    const double center_y = base_y - (cell_height - 1) * block_size;
+
+    render_set_camera_position({center_x, center_y - 20.0, center_z - 12.0});
+    render_set_camera_rotation({0.0, -0.8});
+
+    const Vec3 sample_point{center_x, center_y - 1.0, center_z};
+
+    const size_t width = 200;
+    const size_t height = 160;
+    std::vector<uint32_t> sun_frame(width * height, 0u);
+    std::vector<uint32_t> moon_frame(width * height, 0u);
+
+    render_set_light_direction({0.0, -1.0, 0.0});
+    render_set_light_intensity(1.0);
+    render_set_moon_direction({0.0, -1.0, 0.0});
+    render_set_moon_intensity(0.0);
+    render_update_array(sun_frame.data(), width, height);
+
+    render_set_light_intensity(0.0);
+    render_set_moon_intensity(1.0);
+    render_update_array(moon_frame.data(), width, height);
+    render_set_paused(false);
+
+    const Vec2 projected = render_project_point(sample_point, width, height);
+    const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
+    const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
+
+    double r_sun = 0.0;
+    double g_sun = 0.0;
+    double b_sun = 0.0;
+    double r_moon = 0.0;
+    double g_moon = 0.0;
+    double b_moon = 0.0;
+    REQUIRE(sample_average_color(sun_frame, width, height, px, py, sky_color, sky_color, r_sun, g_sun, b_sun));
+    REQUIRE(sample_average_color(moon_frame, width, height, px, py, sky_color, sky_color, r_moon, g_moon, b_moon));
+
+    REQUIRE(b_sun > 1.0);
+    REQUIRE(b_moon > 1.0);
+    const double ratio_sun = r_sun / b_sun;
+    const double ratio_moon = r_moon / b_moon;
+    REQUIRE(ratio_sun > ratio_moon + 0.05);
 }
 
 TEST_CASE("moonlight adds ambient when sun is below horizon")
@@ -1111,7 +1234,7 @@ TEST_CASE("gamma correction applies to midtone ambient")
     double avg_lum = 0.0;
     REQUIRE(sample_average_luminance(framebuffer, width, height, px, py, sky_color, sky_color, avg_lum));
 
-    const uint32_t expected = expected_gamma_luminance(0xFF3AAA35, 0.5f);
+    const uint32_t expected = expected_gamma_luminance(0xFF2E7A2A, 0.5f);
     REQUIRE(avg_lum == Catch::Approx(static_cast<double>(expected)).margin(12.0));
 }
 
@@ -1555,72 +1678,22 @@ TEST_CASE("vertex ambient occlusion darkens terrain when enabled")
     REQUIRE(avg_no - avg_with > 0.3);
 }
 
-TEST_CASE("side vertex ambient occlusion darkens stacked corners")
+TEST_CASE("side face AO responds to diagonal neighbor blocks")
 {
     reset_camera();
     render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
-    render_set_light_intensity(0.0);
-    render_set_sky_light_intensity(1.0);
-    render_set_sun_orbit_enabled(false);
-    render_set_moon_intensity(0.0);
-    render_set_shadow_enabled(false);
 
-    const uint32_t sky_color = 0xFFFFFFFF;
-    render_set_sky_top_color(sky_color);
-    render_set_sky_bottom_color(sky_color);
+    SideFaceAoProbe probe{};
+    REQUIRE(find_right_face_diagonal_occluder(probe));
 
-    SideAoProbe probe{};
-    REQUIRE(find_side_ao_corner(probe));
+    constexpr int kFaceRight = 3;
+    float ao[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    REQUIRE(render_get_terrain_face_ao(probe.x, probe.height - 1, probe.z, kFaceRight, ao));
 
-    const int chunk_size = 16;
-    const double block_size = 2.0;
-    const double start_x = -(chunk_size - 1) * block_size * 0.5;
-    const double start_z = 4.0;
-    const double base_y = 2.0;
-
-    const int y_index = probe.height - 2;
-    const double center_x = start_x + probe.x * block_size;
-    const double center_z = start_z + probe.z * block_size;
-    const double center_y = base_y - y_index * block_size;
-
-    const Vec3 camera_pos{center_x, center_y - 3.0, center_z - 12.0};
-    const double dx = center_x - camera_pos.x;
-    const double dz = center_z - camera_pos.z;
-    const double dist = std::sqrt(dx * dx + dz * dz);
-    const double dy = center_y - camera_pos.y;
-    const double yaw = std::atan2(dx, dz);
-    const double pitch = -std::atan2(dy, dist);
-    render_set_camera_position(camera_pos);
-    render_set_camera_rotation({yaw, pitch});
-
-    const Vec3 sample_point{
-        center_x + 0.9,
-        center_y - 0.9,
-        center_z + 1.0
-    };
-
-    const size_t width = 200;
-    const size_t height = 160;
-    std::vector<uint32_t> no_ao(width * height, 0u);
-    std::vector<uint32_t> with_ao(width * height, 0u);
-
-    render_set_ambient_occlusion_enabled(false);
-    render_update_array(no_ao.data(), width, height);
-    render_set_ambient_occlusion_enabled(true);
-    render_update_array(with_ao.data(), width, height);
+    REQUIRE(ao[3] < 0.95f);
+    REQUIRE(ao[3] < ao[0]);
     render_set_paused(false);
-
-    const Vec2 projected = render_project_point(sample_point, width, height);
-    const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
-    const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
-
-    double avg_no = 0.0;
-    double avg_with = 0.0;
-    REQUIRE(sample_average_luminance(no_ao, width, height, px, py, sky_color, sky_color, avg_no));
-    REQUIRE(sample_average_luminance(with_ao, width, height, px, py, sky_color, sky_color, avg_with));
-    REQUIRE(avg_with < avg_no - 3.0);
 }
 
 TEST_CASE("flat terrain corners do not self-occlude with ambient occlusion")

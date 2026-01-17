@@ -70,6 +70,7 @@ size_t render_get_shadow_map_resolution();
 int render_get_shadow_pcf_kernel();
 bool render_get_terrain_top_ao(int x, int z, float out_ao[4]);
 bool render_get_shadow_factor_at_point(Vec3 world, Vec3 normal, float* out_factor);
+bool render_get_terrain_face_ao(int x, int y, int z, int face, float out_ao[4]);
 void render_set_camera_position(Vec3 pos);
 Vec3 render_get_camera_position();
 void render_move_camera(Vec3 delta);
