@@ -3,10 +3,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <numeric>
 #include <random>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -197,6 +199,56 @@ static void build_heightmap(std::vector<int>& heights, std::vector<uint32_t>& to
             top_colors[index(x, z)] = top_color;
         }
     }
+}
+
+static size_t count_blocks(const std::vector<int>& heights, const int chunk_size)
+{
+    size_t total = 0;
+    for (int z = 0; z < chunk_size; ++z)
+    {
+        for (int x = 0; x < chunk_size; ++x)
+        {
+            total += static_cast<size_t>(heights[static_cast<size_t>(z * chunk_size + x)]);
+        }
+    }
+    return total;
+}
+
+static bool terrain_has_block(const std::vector<int>& heights, const int chunk_size,
+                              const int gx, const int gy, const int gz)
+{
+    if (gx < 0 || gx >= chunk_size || gz < 0 || gz >= chunk_size)
+    {
+        return false;
+    }
+    if (gy < 0)
+    {
+        return false;
+    }
+    const size_t idx = static_cast<size_t>(gz * chunk_size + gx);
+    return gy < heights[idx];
+}
+
+static size_t count_visible_faces(const std::vector<int>& heights, const int chunk_size)
+{
+    size_t faces = 0;
+    for (int z = 0; z < chunk_size; ++z)
+    {
+        for (int x = 0; x < chunk_size; ++x)
+        {
+            const int height = heights[static_cast<size_t>(z * chunk_size + x)];
+            for (int y = 0; y < height; ++y)
+            {
+                if (!terrain_has_block(heights, chunk_size, x + 1, y, z)) faces++;
+                if (!terrain_has_block(heights, chunk_size, x - 1, y, z)) faces++;
+                if (!terrain_has_block(heights, chunk_size, x, y + 1, z)) faces++;
+                if (!terrain_has_block(heights, chunk_size, x, y - 1, z)) faces++;
+                if (!terrain_has_block(heights, chunk_size, x, y, z + 1)) faces++;
+                if (!terrain_has_block(heights, chunk_size, x, y, z - 1)) faces++;
+            }
+        }
+    }
+    return faces;
 }
 
 static bool find_sloped_grass_cell(int& out_x, int& out_z, int& out_height)
@@ -733,14 +785,30 @@ TEST_CASE("render state setters and getters")
     render_set_paused(false);
 }
 
-TEST_CASE("shadow map resolution defaults to 96")
+TEST_CASE("shadow map resolution defaults to 256")
 {
-    REQUIRE(render_get_shadow_map_resolution() == 96);
+    REQUIRE(render_get_shadow_map_resolution() == 256);
 }
 
 TEST_CASE("shadow PCF kernel defaults to 5")
 {
     REQUIRE(render_get_shadow_pcf_kernel() == 5);
+}
+
+TEST_CASE("terrain mesh culls internal faces")
+{
+    reset_camera();
+    const int chunk_size = 16;
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+
+    const size_t total_blocks = count_blocks(heights, chunk_size);
+    const size_t expected_faces = count_visible_faces(heights, chunk_size);
+
+    REQUIRE(render_debug_get_terrain_block_count() == total_blocks);
+    REQUIRE(render_debug_get_terrain_visible_face_count() == expected_faces);
+    REQUIRE(render_debug_get_terrain_triangle_count() < total_blocks * 12);
 }
 
 TEST_CASE("render_update_array renders sky gradient")
@@ -1327,9 +1395,11 @@ TEST_CASE("directional shadow mapping darkens terrain")
         for (int x = 0; x < chunk_size && !found_shadow; ++x)
         {
             const int height = heights[index(x, z)];
+            const double center_y = base_y - (height - 1) * block_size;
+            const double top_y = center_y - block_size * 0.5;
             const Vec3 world{
                 start_x + x * block_size,
-                base_y - (height - 1) * block_size,
+                top_y,
                 start_z + z * block_size
             };
             float factor = 1.0f;
@@ -1370,9 +1440,11 @@ TEST_CASE("shadow map responds to light direction changes")
 
     auto sample_factor = [&](int x, int z) {
         const int height = heights[index(x, z)];
+        const double center_y = base_y - (height - 1) * block_size;
+        const double top_y = center_y - block_size * 0.5;
         const Vec3 world{
             start_x + x * block_size,
-            base_y - (height - 1) * block_size,
+            top_y,
             start_z + z * block_size
         };
         float factor = 1.0f;
@@ -1390,9 +1462,11 @@ TEST_CASE("shadow map responds to light direction changes")
         }
     }
 
+    const float diff_eps = 2.0f / static_cast<float>(render_get_shadow_map_resolution());
     render_set_light_direction({-0.4, -0.8, 0.2});
     bool any_diff = false;
     bool saw_shadow = false;
+    float max_diff = 0.0f;
     size_t idx = 0;
     for (int z = 0; z < chunk_size; z += 3)
     {
@@ -1403,9 +1477,14 @@ TEST_CASE("shadow map responds to light direction changes")
             {
                 saw_shadow = true;
             }
-            if (idx < factors_a.size() && std::abs(factor - factors_a[idx]) > 0.02f)
+            if (idx < factors_a.size())
             {
-                any_diff = true;
+                const float diff = std::abs(factor - factors_a[idx]);
+                max_diff = std::max(max_diff, diff);
+                if (diff > diff_eps)
+                {
+                    any_diff = true;
+                }
             }
             idx++;
         }
@@ -1413,8 +1492,145 @@ TEST_CASE("shadow map responds to light direction changes")
 
     render_set_paused(false);
 
+    INFO("diff_eps=" << diff_eps << " max_diff=" << max_diff);
     REQUIRE(saw_shadow);
     REQUIRE(any_diff);
+}
+
+TEST_CASE("shadow factor responds to sun orbit changes")
+{
+    reset_camera();
+    render_set_scene(RenderScene::CubeOnly);
+    render_set_rotation(0.0f);
+    render_set_paused(true);
+    render_set_light_direction({0.3, -1.0, 0.2});
+    render_set_light_intensity(1.0);
+    render_set_shadow_enabled(true);
+    render_set_moon_intensity(0.0);
+    render_set_sun_orbit_enabled(true);
+
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+
+    const int chunk_size = 16;
+    const double block_size = 2.0;
+    const double start_x = -(chunk_size - 1) * block_size * 0.5;
+    const double start_z = 4.0;
+    const double base_y = 2.0;
+
+    auto index = [chunk_size](int x, int z) {
+        return static_cast<size_t>(z * chunk_size + x);
+    };
+
+    auto sample_factor = [&](int x, int z) {
+        const int height = heights[index(x, z)];
+        const double center_y = base_y - (height - 1) * block_size;
+        const double top_y = center_y - block_size * 0.5;
+        const Vec3 world{
+            start_x + x * block_size,
+            top_y,
+            start_z + z * block_size
+        };
+        float factor = 1.0f;
+        render_get_shadow_factor_at_point(world, {0.0, -1.0, 0.0}, &factor);
+        return factor;
+    };
+
+    render_set_sun_orbit_angle(0.6);
+    std::vector<float> factors_a;
+    for (int z = 0; z < chunk_size; z += 3)
+    {
+        for (int x = 0; x < chunk_size; x += 3)
+        {
+            factors_a.push_back(sample_factor(x, z));
+        }
+    }
+
+    const float diff_eps = 2.0f / static_cast<float>(render_get_shadow_map_resolution());
+    render_set_sun_orbit_angle(1.6);
+    bool any_diff = false;
+    bool saw_shadow = false;
+    float max_diff = 0.0f;
+    size_t idx = 0;
+    for (int z = 0; z < chunk_size; z += 3)
+    {
+        for (int x = 0; x < chunk_size; x += 3)
+        {
+            const float factor = sample_factor(x, z);
+            if (factor < 0.95f)
+            {
+                saw_shadow = true;
+            }
+            if (idx < factors_a.size())
+            {
+                const float diff = std::abs(factor - factors_a[idx]);
+                max_diff = std::max(max_diff, diff);
+                if (diff > diff_eps)
+                {
+                    any_diff = true;
+                }
+            }
+            idx++;
+        }
+    }
+
+    render_set_paused(false);
+
+    INFO("diff_eps=" << diff_eps << " max_diff=" << max_diff);
+    REQUIRE(saw_shadow);
+    REQUIRE(any_diff);
+}
+
+TEST_CASE("light direction reads stay coherent under concurrent updates")
+{
+    reset_camera();
+    render_set_sun_orbit_enabled(false);
+
+    const Vec3 a{1.0, 2.0, 3.0};
+    const Vec3 b{-4.0, -5.0, -6.0};
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> saw_mixed{false};
+    std::atomic<bool> ready{false};
+
+    render_set_light_direction(a);
+
+    std::thread writer([&] {
+        for (int i = 0; i < 2000000 && !saw_mixed.load(std::memory_order_relaxed); ++i)
+        {
+            render_set_light_direction(a);
+            render_set_light_direction(b);
+            if (i == 0)
+            {
+                ready.store(true, std::memory_order_release);
+            }
+        }
+        stop.store(true, std::memory_order_relaxed);
+    });
+
+    std::thread reader([&] {
+        while (!ready.load(std::memory_order_acquire))
+        {
+        }
+        while (!stop.load(std::memory_order_relaxed))
+        {
+            const Vec3 v = render_get_light_direction();
+            const bool is_a = (v.x == a.x && v.y == a.y && v.z == a.z);
+            const bool is_b = (v.x == b.x && v.y == b.y && v.z == b.z);
+            if (!is_a && !is_b)
+            {
+                saw_mixed.store(true, std::memory_order_relaxed);
+                break;
+            }
+        }
+    });
+
+    writer.join();
+    stop.store(true, std::memory_order_relaxed);
+    reader.join();
+
+    REQUIRE(!saw_mixed.load(std::memory_order_relaxed));
 }
 
 TEST_CASE("shadow factor is not quantized to PCF steps")
@@ -1453,7 +1669,8 @@ TEST_CASE("shadow factor is not quantized to PCF steps")
             const int height = heights[index(x, z)];
             const double base_x = start_x + x * block_size;
             const double base_z = start_z + z * block_size;
-            const double world_y = base_y - (height - 1) * block_size;
+            const double center_y = base_y - (height - 1) * block_size;
+            const double world_y = center_y - block_size * 0.5;
             for (double ox : offsets)
             {
                 for (double oz : offsets)
@@ -1628,6 +1845,73 @@ TEST_CASE("phong shading varies within a terrain top face")
     REQUIRE((*minmax.second - *minmax.first) >= 8);
 }
 
+TEST_CASE("sky lighting varies across a terrain side face")
+{
+    reset_camera();
+    render_set_scene(RenderScene::CubeOnly);
+    render_set_rotation(0.0f);
+    render_set_paused(true);
+    render_set_light_intensity(0.0);
+    render_set_shadow_enabled(false);
+    render_set_ambient_occlusion_enabled(false);
+    render_set_sky_light_intensity(1.0);
+
+    const uint32_t sky_top = 0xFFFFFFFF;
+    const uint32_t sky_bottom = 0xFF000000;
+    render_set_sky_top_color(sky_top);
+    render_set_sky_bottom_color(sky_bottom);
+
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+    constexpr int chunk_size = 16;
+    const int cell_x = 0;
+    const int cell_z = 0;
+    const int cell_height = heights[static_cast<size_t>(cell_z * chunk_size + cell_x)];
+    REQUIRE(cell_height > 0);
+
+    const double block_size = 2.0;
+    const double half = block_size * 0.5;
+    const double start_x = -(chunk_size - 1) * block_size * 0.5;
+    const double start_z = 4.0;
+    const double base_y = 2.0;
+
+    const double center_x = start_x + cell_x * block_size;
+    const double center_z = start_z + cell_z * block_size;
+    const double center_y = base_y - (cell_height - 1) * block_size;
+    const double face_x = center_x - half;
+
+    constexpr double half_pi = 1.5707963267948966;
+    render_set_camera_position({face_x - 8.0, center_y, center_z});
+    render_set_camera_rotation({half_pi, 0.0});
+
+    const size_t width = 200;
+    const size_t height = 160;
+    std::vector<uint32_t> framebuffer(width * height, 0u);
+    render_update_array(framebuffer.data(), width, height);
+    render_set_paused(false);
+
+    const double inset = half * 0.7;
+    const Vec2 top_proj = render_project_point({face_x, center_y - inset, center_z}, width, height);
+    const Vec2 bottom_proj = render_project_point({face_x, center_y + inset, center_z}, width, height);
+
+    REQUIRE(std::isfinite(top_proj.x));
+    REQUIRE(std::isfinite(top_proj.y));
+    REQUIRE(std::isfinite(bottom_proj.x));
+    REQUIRE(std::isfinite(bottom_proj.y));
+
+    const int top_x = std::clamp(static_cast<int>(std::lround(top_proj.x)), 0, static_cast<int>(width) - 1);
+    const int top_y = std::clamp(static_cast<int>(std::lround(top_proj.y)), 0, static_cast<int>(height) - 1);
+    const int bottom_x = std::clamp(static_cast<int>(std::lround(bottom_proj.x)), 0, static_cast<int>(width) - 1);
+    const int bottom_y = std::clamp(static_cast<int>(std::lround(bottom_proj.y)), 0, static_cast<int>(height) - 1);
+
+    double top_lum = 0.0;
+    double bottom_lum = 0.0;
+    REQUIRE(sample_average_luminance(framebuffer, width, height, top_x, top_y, sky_top, sky_bottom, top_lum));
+    REQUIRE(sample_average_luminance(framebuffer, width, height, bottom_x, bottom_y, sky_top, sky_bottom, bottom_lum));
+    REQUIRE(std::abs(top_lum - bottom_lum) >= 12.0);
+}
+
 TEST_CASE("vertex ambient occlusion darkens terrain when enabled")
 {
     reset_camera();
@@ -1712,6 +1996,37 @@ TEST_CASE("flat terrain corners do not self-occlude with ambient occlusion")
     else if (probe.sx == -1 && probe.sz == 1) corner_index = 3;
 
     REQUIRE(ao[corner_index] == Catch::Approx(1.0f).margin(1e-4f));
+}
+
+TEST_CASE("top face ambient occlusion varies beyond four discrete levels")
+{
+    reset_camera();
+    render_set_scene(RenderScene::CubeOnly);
+    render_set_paused(true);
+
+    constexpr int chunk_size = 16;
+    std::unordered_set<int> buckets;
+    float ao[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int z = 0; z < chunk_size; ++z)
+    {
+        for (int x = 0; x < chunk_size; ++x)
+        {
+            if (!render_get_terrain_top_ao(x, z, ao))
+            {
+                continue;
+            }
+            for (float value : ao)
+            {
+                const int bucket = static_cast<int>(std::lround(value * 1000.0f));
+                buckets.insert(bucket);
+            }
+        }
+    }
+
+    render_set_paused(false);
+
+    REQUIRE(buckets.size() > 4);
 }
 
 TEST_CASE("camera state setters and getters")
@@ -1853,6 +2168,77 @@ TEST_CASE("render_project_point centers consistently")
     const double square_offset = square.x - 40.0;
     const double wide_offset = wide.x - 100.0;
     REQUIRE(wide_offset == Catch::Approx(square_offset));
+}
+
+TEST_CASE("render_project_point returns NaN for points behind camera")
+{
+    reset_camera();
+    render_set_camera_position({0.0, 0.0, 0.0});
+    render_set_camera_rotation({0.0, 0.0});
+    const size_t width = 120;
+    const size_t height = 90;
+
+    const Vec2 projected = render_project_point({0.0, 0.0, -1.0}, width, height);
+    REQUIRE(std::isnan(projected.x));
+    REQUIRE(std::isnan(projected.y));
+}
+
+TEST_CASE("shadow cache ignores rotation when mesh does not rotate")
+{
+    reset_camera();
+    render_set_scene(RenderScene::CubeOnly);
+    render_set_sun_orbit_enabled(false);
+    render_set_light_direction({0.4, -0.6, 0.7});
+    render_set_light_intensity(1.0);
+    render_set_shadow_enabled(true);
+    render_set_paused(true);
+
+    render_debug_reset_shadow_build_counts();
+
+    const size_t width = 64;
+    const size_t height = 48;
+    std::vector<uint32_t> framebuffer(width * height, 0u);
+
+    render_set_rotation(0.1f);
+    render_update_array(framebuffer.data(), width, height);
+    const uint64_t first = render_debug_get_sun_shadow_build_count();
+    REQUIRE(first >= 1);
+
+    render_set_rotation(1.2f);
+    render_update_array(framebuffer.data(), width, height);
+    const uint64_t second = render_debug_get_sun_shadow_build_count();
+
+    render_set_paused(false);
+
+    REQUIRE(second == first);
+}
+
+TEST_CASE("render_debug_depth_at_sample uses perspective-correct interpolation")
+{
+    const Vec3 v0{10.0, 10.0, 1.0};
+    const Vec3 v1{30.0, 10.0, 4.0};
+    const Vec3 v2{10.0, 30.0, 8.0};
+    const Vec2 p{15.0, 15.0};
+
+    float depth = 0.0f;
+    REQUIRE(render_debug_depth_at_sample(v0, v1, v2, p, &depth));
+
+    auto edge = [](const Vec3& a, const Vec3& b, const Vec2& c) {
+        return static_cast<float>((c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x));
+    };
+
+    const float area = edge(v0, v1, {v2.x, v2.y});
+    REQUIRE(area != 0.0f);
+    float w0 = edge(v1, v2, p) / area;
+    float w1 = edge(v2, v0, p) / area;
+    float w2 = edge(v0, v1, p) / area;
+
+    const float inv_z = w0 * (1.0f / static_cast<float>(v0.z)) +
+                        w1 * (1.0f / static_cast<float>(v1.z)) +
+                        w2 * (1.0f / static_cast<float>(v2.z));
+    const float expected = 1.0f / inv_z;
+
+    REQUIRE(depth == Catch::Approx(expected).margin(1e-4f));
 }
 
 TEST_CASE("render_should_rasterize_triangle allows near-plane clipping")

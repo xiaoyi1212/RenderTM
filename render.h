@@ -2,24 +2,6 @@
 
 #include <cstdint>
 #include <cstddef>
-#include <vector>
-#include "vector.h"
-
-struct Object
-{
-    std::vector<vector> vertices;
-    std::vector<int64_t> indices; // 每3个索引组成一个三角形
-    vector position; // 物体在世界中的位置
-    vector rotation; // 物体自身的旋转
-    uint32_t color; // 物体的基础颜色
-};
-
-struct Point2D { int x, y; };
-
-struct PixelPoint {
-    int x, y;
-    double depth; // Z 值
-};
 
 struct Vec3
 {
@@ -66,6 +48,8 @@ void render_set_ambient_occlusion_enabled(bool enabled);
 bool render_get_ambient_occlusion_enabled();
 void render_set_shadow_enabled(bool enabled);
 bool render_get_shadow_enabled();
+void render_set_greedy_meshing_enabled(bool enabled);
+bool render_get_greedy_meshing_enabled();
 size_t render_get_shadow_map_resolution();
 int render_get_shadow_pcf_kernel();
 bool render_get_terrain_top_ao(int x, int z, float out_ao[4]);
@@ -79,6 +63,13 @@ void render_set_camera_rotation(Vec2 rot);
 Vec2 render_get_camera_rotation();
 void render_rotate_camera(Vec2 delta);
 Vec2 render_project_point(Vec3 world, size_t width, size_t height);
+bool render_debug_depth_at_sample(Vec3 v0, Vec3 v1, Vec3 v2, Vec2 p, float* out_depth);
+void render_debug_reset_shadow_build_counts();
+uint64_t render_debug_get_sun_shadow_build_count();
+size_t render_debug_get_terrain_block_count();
+size_t render_debug_get_terrain_visible_face_count();
+size_t render_debug_get_terrain_quad_count();
+size_t render_debug_get_terrain_triangle_count();
 bool render_should_rasterize_triangle(Vec3 v0, Vec3 v1, Vec3 v2);
 double render_get_near_plane();
 size_t render_clip_triangle_to_near_plane(Vec3 v0, Vec3 v1, Vec3 v2, Vec3* out_vertices, size_t max_vertices);
