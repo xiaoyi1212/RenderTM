@@ -205,6 +205,137 @@ static void build_heightmap(std::vector<int>& heights, std::vector<uint32_t>& to
     }
 }
 
+static bool heightmap_has_block(const std::vector<int>& heights, const int gx, const int gy, const int gz)
+{
+    const int chunk_size = 16;
+    if (gx < 0 || gx >= chunk_size || gz < 0 || gz >= chunk_size || gy < 0)
+    {
+        return false;
+    }
+    const size_t idx = static_cast<size_t>(gz * chunk_size + gx);
+    if (idx >= heights.size())
+    {
+        return false;
+    }
+    return gy < heights[idx];
+}
+
+static int heightmap_max_height(const std::vector<int>& heights)
+{
+    int max_height = 0;
+    for (int value : heights)
+    {
+        if (value > max_height)
+        {
+            max_height = value;
+        }
+    }
+    return max_height;
+}
+
+static Vec3 world_to_grid_coords(const Vec3& pos)
+{
+    const int chunk_size = 16;
+    const double block_size = 2.0;
+    const double half = block_size * 0.5;
+    const double start_x = -(chunk_size - 1) * block_size * 0.5;
+    const double start_z = 4.0;
+    const double base_y = 2.0;
+    return {
+        (pos.x - start_x + half) / block_size,
+        (base_y - pos.y + half) / block_size,
+        (pos.z - start_z + half) / block_size
+    };
+}
+
+static bool raymarch_shadow_hit(const std::vector<int>& heights, const Vec3& world,
+                                const Vec3& light_dir, const Vec3& normal)
+{
+    const int chunk_size = 16;
+    const int max_height = heightmap_max_height(heights);
+    if (max_height <= 0)
+    {
+        return false;
+    }
+
+    const double step = 0.1;
+    const int max_steps = 2000;
+    const double bias = 0.05;
+    Vec3 pos{
+        world.x + normal.x * bias,
+        world.y + normal.y * bias,
+        world.z + normal.z * bias
+    };
+
+    for (int i = 0; i < max_steps; ++i)
+    {
+        pos.x += light_dir.x * step;
+        pos.y += light_dir.y * step;
+        pos.z += light_dir.z * step;
+
+        const Vec3 grid = world_to_grid_coords(pos);
+        if (grid.x < 0.0 || grid.x >= chunk_size ||
+            grid.z < 0.0 || grid.z >= chunk_size ||
+            grid.y < 0.0 || grid.y >= max_height)
+        {
+            return false;
+        }
+
+        const int gx = static_cast<int>(std::floor(grid.x));
+        const int gy = static_cast<int>(std::floor(grid.y));
+        const int gz = static_cast<int>(std::floor(grid.z));
+        if (heightmap_has_block(heights, gx, gy, gz))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool find_shadow_sample(const std::vector<int>& heights, const Vec3& light_dir,
+                               const Vec3& normal, const bool want_shadow, Vec3* out_world)
+{
+    if (!out_world)
+    {
+        return false;
+    }
+    const int chunk_size = 16;
+    const double block_size = 2.0;
+    const double start_x = -(chunk_size - 1) * block_size * 0.5;
+    const double start_z = 4.0;
+    const double base_y = 2.0;
+
+    auto index = [chunk_size](int x, int z) {
+        return static_cast<size_t>(z * chunk_size + x);
+    };
+
+    for (int z = 0; z < chunk_size; ++z)
+    {
+        for (int x = 0; x < chunk_size; ++x)
+        {
+            const int height = heights[index(x, z)];
+            if (height <= 0)
+            {
+                continue;
+            }
+            const double center_y = base_y - (height - 1) * block_size;
+            const double top_y = center_y - block_size * 0.5;
+            const Vec3 world{
+                start_x + x * block_size,
+                top_y,
+                start_z + z * block_size
+            };
+            const bool hit = raymarch_shadow_hit(heights, world, light_dir, normal);
+            if (hit == want_shadow)
+            {
+                *out_world = world;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static size_t count_blocks(const std::vector<int>& heights, const int chunk_size)
 {
     size_t total = 0;
@@ -962,16 +1093,6 @@ TEST_CASE("render state setters and getters")
     render_set_paused(false);
 }
 
-TEST_CASE("shadow map resolution defaults to 256")
-{
-    REQUIRE(render_get_shadow_map_resolution() == 256);
-}
-
-TEST_CASE("shadow PCF kernel defaults to 5")
-{
-    REQUIRE(render_get_shadow_pcf_kernel() == 5);
-}
-
 TEST_CASE("terrain mesh culls internal faces")
 {
     reset_camera();
@@ -1540,7 +1661,7 @@ TEST_CASE("hemisphere lighting adds sun bounce to shadowed faces")
     REQUIRE(avg_on > avg_off + 3.0);
 }
 
-TEST_CASE("directional shadow mapping darkens terrain")
+TEST_CASE("directional shadowing darkens terrain")
 {
     reset_camera();
     render_set_paused(true);
@@ -1588,169 +1709,6 @@ TEST_CASE("directional shadow mapping darkens terrain")
     render_set_paused(false);
 
     REQUIRE(found_shadow);
-}
-
-TEST_CASE("shadow map responds to light direction changes")
-{
-    reset_camera();
-    render_set_paused(true);
-    render_set_light_intensity(1.0);
-    render_set_shadow_enabled(true);
-
-    std::vector<int> heights;
-    std::vector<uint32_t> top_colors;
-    build_heightmap(heights, top_colors);
-
-    const int chunk_size = 16;
-    const double block_size = 2.0;
-    const double start_x = -(chunk_size - 1) * block_size * 0.5;
-    const double start_z = 4.0;
-    const double base_y = 2.0;
-
-    auto index = [chunk_size](int x, int z) {
-        return static_cast<size_t>(z * chunk_size + x);
-    };
-
-    auto sample_factor = [&](int x, int z) {
-        const int height = heights[index(x, z)];
-        const double center_y = base_y - (height - 1) * block_size;
-        const double top_y = center_y - block_size * 0.5;
-        const Vec3 world{
-            start_x + x * block_size,
-            top_y,
-            start_z + z * block_size
-        };
-        float factor = 1.0f;
-        render_get_shadow_factor_at_point(world, {0.0, -1.0, 0.0}, &factor);
-        return factor;
-    };
-
-    render_set_light_direction({0.6, -0.3, 0.8});
-    std::vector<float> factors_a;
-    for (int z = 0; z < chunk_size; z += 3)
-    {
-        for (int x = 0; x < chunk_size; x += 3)
-        {
-            factors_a.push_back(sample_factor(x, z));
-        }
-    }
-
-    const float diff_eps = 2.0f / static_cast<float>(render_get_shadow_map_resolution());
-    render_set_light_direction({-0.4, -0.8, 0.2});
-    bool any_diff = false;
-    bool saw_shadow = false;
-    float max_diff = 0.0f;
-    size_t idx = 0;
-    for (int z = 0; z < chunk_size; z += 3)
-    {
-        for (int x = 0; x < chunk_size; x += 3)
-        {
-            const float factor = sample_factor(x, z);
-            if (factor < 0.95f)
-            {
-                saw_shadow = true;
-            }
-            if (idx < factors_a.size())
-            {
-                const float diff = std::abs(factor - factors_a[idx]);
-                max_diff = std::max(max_diff, diff);
-                if (diff > diff_eps)
-                {
-                    any_diff = true;
-                }
-            }
-            idx++;
-        }
-    }
-
-    render_set_paused(false);
-
-    INFO("diff_eps=" << diff_eps << " max_diff=" << max_diff);
-    REQUIRE(saw_shadow);
-    REQUIRE(any_diff);
-}
-
-TEST_CASE("shadow factor responds to sun orbit changes")
-{
-    reset_camera();
-    render_set_paused(true);
-    render_set_light_direction({0.3, -1.0, 0.2});
-    render_set_light_intensity(1.0);
-    render_set_shadow_enabled(true);
-    render_set_moon_intensity(0.0);
-    render_set_sun_orbit_enabled(true);
-
-    std::vector<int> heights;
-    std::vector<uint32_t> top_colors;
-    build_heightmap(heights, top_colors);
-
-    const int chunk_size = 16;
-    const double block_size = 2.0;
-    const double start_x = -(chunk_size - 1) * block_size * 0.5;
-    const double start_z = 4.0;
-    const double base_y = 2.0;
-
-    auto index = [chunk_size](int x, int z) {
-        return static_cast<size_t>(z * chunk_size + x);
-    };
-
-    auto sample_factor = [&](int x, int z) {
-        const int height = heights[index(x, z)];
-        const double center_y = base_y - (height - 1) * block_size;
-        const double top_y = center_y - block_size * 0.5;
-        const Vec3 world{
-            start_x + x * block_size,
-            top_y,
-            start_z + z * block_size
-        };
-        float factor = 1.0f;
-        render_get_shadow_factor_at_point(world, {0.0, -1.0, 0.0}, &factor);
-        return factor;
-    };
-
-    render_set_sun_orbit_angle(0.6);
-    std::vector<float> factors_a;
-    for (int z = 0; z < chunk_size; z += 3)
-    {
-        for (int x = 0; x < chunk_size; x += 3)
-        {
-            factors_a.push_back(sample_factor(x, z));
-        }
-    }
-
-    const float diff_eps = 2.0f / static_cast<float>(render_get_shadow_map_resolution());
-    render_set_sun_orbit_angle(1.6);
-    bool any_diff = false;
-    bool saw_shadow = false;
-    float max_diff = 0.0f;
-    size_t idx = 0;
-    for (int z = 0; z < chunk_size; z += 3)
-    {
-        for (int x = 0; x < chunk_size; x += 3)
-        {
-            const float factor = sample_factor(x, z);
-            if (factor < 0.95f)
-            {
-                saw_shadow = true;
-            }
-            if (idx < factors_a.size())
-            {
-                const float diff = std::abs(factor - factors_a[idx]);
-                max_diff = std::max(max_diff, diff);
-                if (diff > diff_eps)
-                {
-                    any_diff = true;
-                }
-            }
-            idx++;
-        }
-    }
-
-    render_set_paused(false);
-
-    INFO("diff_eps=" << diff_eps << " max_diff=" << max_diff);
-    REQUIRE(saw_shadow);
-    REQUIRE(any_diff);
 }
 
 TEST_CASE("light direction reads stay coherent under concurrent updates")
@@ -1804,80 +1762,7 @@ TEST_CASE("light direction reads stay coherent under concurrent updates")
     REQUIRE(!saw_mixed.load(std::memory_order_relaxed));
 }
 
-TEST_CASE("shadow factor is not quantized to PCF steps")
-{
-    reset_camera();
-    render_set_paused(true);
-    render_set_light_direction({0.3, -1.0, 0.2});
-    render_set_light_intensity(1.0);
-    render_set_shadow_enabled(true);
-
-    std::vector<int> heights;
-    std::vector<uint32_t> top_colors;
-    build_heightmap(heights, top_colors);
-
-    const int chunk_size = 16;
-    const double block_size = 2.0;
-    const double start_x = -(chunk_size - 1) * block_size * 0.5;
-    const double start_z = 4.0;
-    const double base_y = 2.0;
-
-    auto index = [chunk_size](int x, int z) {
-        return static_cast<size_t>(z * chunk_size + x);
-    };
-
-    const std::array<double, 4> offsets = {-0.35, -0.1, 0.1, 0.35};
-    bool saw_shadow = false;
-    bool saw_intermediate = false;
-    bool saw_continuous = false;
-
-    for (int z = 0; z < chunk_size && !saw_continuous; ++z)
-    {
-        for (int x = 0; x < chunk_size && !saw_continuous; ++x)
-        {
-            const int height = heights[index(x, z)];
-            const double base_x = start_x + x * block_size;
-            const double base_z = start_z + z * block_size;
-            const double center_y = base_y - (height - 1) * block_size;
-            const double world_y = center_y - block_size * 0.5;
-            for (double ox : offsets)
-            {
-                for (double oz : offsets)
-                {
-                    const Vec3 world{
-                        base_x + ox * block_size,
-                        world_y,
-                        base_z + oz * block_size
-                    };
-                    float factor = 1.0f;
-                    if (!render_get_shadow_factor_at_point(world, {0.0, -1.0, 0.0}, &factor))
-                    {
-                        continue;
-                    }
-                    if (factor < 0.95f) saw_shadow = true;
-                    if (factor > 0.05f && factor < 0.95f) saw_intermediate = true;
-
-                    const double scaled = static_cast<double>(factor) * 9.0;
-                    const double nearest = std::round(scaled);
-                    if (factor > 0.01f && factor < 0.99f && std::abs(scaled - nearest) > 0.02)
-                    {
-                        saw_continuous = true;
-                        break;
-                    }
-                }
-                if (saw_continuous) break;
-            }
-        }
-    }
-
-    render_set_paused(false);
-
-    REQUIRE(saw_shadow);
-    REQUIRE(saw_intermediate);
-    REQUIRE(saw_continuous);
-}
-
-TEST_CASE("shadow map uses terrain mesh triangles")
+TEST_CASE("DDA shadow factors are binary")
 {
     reset_camera();
     render_set_paused(true);
@@ -1891,29 +1776,67 @@ TEST_CASE("shadow map uses terrain mesh triangles")
     std::vector<uint32_t> top_colors;
     build_heightmap(heights, top_colors);
 
+    const Vec3 normal{0.0, -1.0, 0.0};
+    const Vec3 light_dir = normalize_vec3({0.5, -1.0, 0.3});
+    Vec3 shadow_world{};
+    Vec3 lit_world{};
+    REQUIRE(find_shadow_sample(heights, light_dir, normal, true, &shadow_world));
+    REQUIRE(find_shadow_sample(heights, light_dir, normal, false, &lit_world));
+
+    float factor = 1.0f;
+    REQUIRE(render_get_shadow_factor_at_point(shadow_world, normal, &factor));
+    REQUIRE(factor <= 0.02f);
+
+    REQUIRE(render_get_shadow_factor_at_point(lit_world, normal, &factor));
+    REQUIRE(factor >= 0.98f);
+
+    bool saw_intermediate = false;
     const int chunk_size = 16;
     const double block_size = 2.0;
     const double start_x = -(chunk_size - 1) * block_size * 0.5;
     const double start_z = 4.0;
     const double base_y = 2.0;
 
-    const int height = heights[0];
-    const double center_y = base_y - (height - 1) * block_size;
-    const double top_y = center_y - block_size * 0.5;
-    const Vec3 world{
-        start_x,
-        top_y,
-        start_z
+    auto index = [chunk_size](int x, int z) {
+        return static_cast<size_t>(z * chunk_size + x);
     };
-    float factor = 1.0f;
-    REQUIRE(render_get_shadow_factor_at_point(world, {0.0, -1.0, 0.0}, &factor));
 
-    const size_t shadow_triangles = render_debug_get_shadow_triangle_count();
-    const size_t terrain_triangles = render_debug_get_terrain_triangle_count();
+    const std::array<double, 2> offsets = {-0.25, 0.25};
+    for (int z = 0; z < chunk_size && !saw_intermediate; z += 3)
+    {
+        for (int x = 0; x < chunk_size && !saw_intermediate; x += 3)
+        {
+            const int height = heights[index(x, z)];
+            const double center_y = base_y - (height - 1) * block_size;
+            const double top_y = center_y - block_size * 0.5;
+            for (double ox : offsets)
+            {
+                for (double oz : offsets)
+                {
+                    const Vec3 world{
+                        start_x + x * block_size + ox * block_size,
+                        top_y,
+                        start_z + z * block_size + oz * block_size
+                    };
+                    float sample = 1.0f;
+                    if (!render_get_shadow_factor_at_point(world, normal, &sample))
+                    {
+                        continue;
+                    }
+                    if (sample > 0.02f && sample < 0.98f)
+                    {
+                        saw_intermediate = true;
+                        break;
+                    }
+                }
+                if (saw_intermediate) break;
+            }
+        }
+    }
 
     render_set_paused(false);
 
-    REQUIRE(shadow_triangles == terrain_triangles);
+    REQUIRE(!saw_intermediate);
 }
 
 TEST_CASE("moon light contributes when sun is disabled")
@@ -2536,33 +2459,6 @@ TEST_CASE("render_project_point returns NaN for points behind camera")
     const Vec2 projected = render_project_point({0.0, 0.0, -1.0}, width, height);
     REQUIRE(std::isnan(projected.x));
     REQUIRE(std::isnan(projected.y));
-}
-
-TEST_CASE("shadow cache reuses when lighting is unchanged")
-{
-    reset_camera();
-    render_set_sun_orbit_enabled(false);
-    render_set_light_direction({0.4, -0.6, 0.7});
-    render_set_light_intensity(1.0);
-    render_set_shadow_enabled(true);
-    render_set_paused(true);
-
-    render_debug_reset_shadow_build_counts();
-
-    const size_t width = 64;
-    const size_t height = 48;
-    std::vector<uint32_t> framebuffer(width * height, 0u);
-
-    render_update_array(framebuffer.data(), width, height);
-    const uint64_t first = render_debug_get_sun_shadow_build_count();
-    REQUIRE(first >= 1);
-
-    render_update_array(framebuffer.data(), width, height);
-    const uint64_t second = render_debug_get_sun_shadow_build_count();
-
-    render_set_paused(false);
-
-    REQUIRE(second == first);
 }
 
 TEST_CASE("render_debug_depth_at_sample uses perspective-correct interpolation")

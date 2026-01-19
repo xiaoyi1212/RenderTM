@@ -15,15 +15,6 @@ const Vec3 cubeVertices[8] = {
     {-1, -1,  1}, {1, -1,  1}, {1,  1,  1}, {-1,  1,  1}
 };
 
-const int cubeTriangles[12][3] = {
-    {4,5,6}, {4,6,7}, // front (+z)
-    {0,2,1}, {0,3,2}, // back (-z)
-    {0,7,3}, {0,4,7}, // left (-x)
-    {1,2,6}, {1,6,5}, // right (+x)
-    {3,6,2}, {3,7,6}, // top (+y)
-    {0,1,5}, {0,5,4}  // bottom (-y)
-};
-
 enum FaceIndex
 {
     FaceTop = 0,    // normal -Y
@@ -45,10 +36,10 @@ const int cubeFaceVertices[6][4] = {
 
 const int cubeFaceQuadOrder[6][4] = {
     {0, 1, 5, 4}, // top (-y)
-    {3, 7, 6, 2}, // bottom (+y), matches cubeTriangles winding
-    {0, 4, 7, 3}, // left (-x), matches cubeTriangles winding
+    {3, 7, 6, 2}, // bottom (+y)
+    {0, 4, 7, 3}, // left (-x)
     {1, 2, 6, 5}, // right (+x)
-    {0, 3, 2, 1}, // back (-z), matches cubeTriangles winding
+    {0, 3, 2, 1}, // back (-z)
     {4, 5, 6, 7}  // front (+z)
 };
 
@@ -106,8 +97,6 @@ static std::atomic<double> camera_yaw{-0.6911503837897546};
 static std::atomic<double> camera_pitch{-0.6003932626860493};
 static std::atomic<bool> ambientOcclusionEnabled{true};
 static std::atomic<bool> shadowEnabled{true};
-static std::atomic<uint64_t> sunShadowBuilds{0};
-static std::atomic<size_t> shadowTriangleCount{0};
 
 static Vec3 load_light_direction()
 {
@@ -186,15 +175,6 @@ struct ViewRotation
     double sp;
 };
 
-struct Mesh
-{
-    const Vec3* vertices;
-    size_t vertexCount;
-    const int (*triangles)[3];
-    size_t triangleCount;
-    Vec3 position;
-};
-
 struct Material
 {
     uint32_t color;
@@ -216,29 +196,6 @@ struct TopFaceLighting
     std::array<Vec3, 4> normals;
 };
 
-struct ShadowMap
-{
-    size_t resolution = 0;
-    std::vector<float> depth;
-    float min_x = 0.0f;
-    float max_x = 0.0f;
-    float min_y = 0.0f;
-    float max_y = 0.0f;
-    float scale_x = 1.0f;
-    float scale_y = 1.0f;
-    float depth_min = 0.0f;
-    Vec3 right{1.0, 0.0, 0.0};
-    Vec3 up{0.0, 1.0, 0.0};
-    Vec3 forward{0.0, 0.0, 1.0};
-    bool valid = false;
-};
-
-struct ShadowCacheState
-{
-    Vec3 dir{0.0, 0.0, 0.0};
-    bool valid = false;
-};
-
 struct ShadingContext
 {
     ColorRGB albedo;
@@ -257,15 +214,12 @@ struct ShadingContext
         Vec3 dir;
         double intensity;
         ColorRGB color;
-        const struct ShadowMap* shadow;
     };
     std::array<DirectionalLightInfo, 2> lights;
 };
 
 constexpr int kMsaaSamples = 2;
-constexpr size_t kShadowMapResolution = 256;
-constexpr int kShadowPcfRadius = 2;
-constexpr int kShadowPcfKernel = kShadowPcfRadius * 2 + 1;
+constexpr double kShadowRayBias = 0.05;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kSunLatitudeDeg = 30.0;
 constexpr double kSunLatitudeRad = kPi * kSunLatitudeDeg / 180.0;
@@ -290,8 +244,7 @@ constexpr double kSkyRayBias = 0.02;
 constexpr double kSkyRayCenterBias = 0.02;
 
 static Vec3 normalize_vec(const Vec3& v);
-static float compute_shadow_factor(const ShadowMap* shadow, const Vec3& light_dir,
-                                   const Vec3& world, const Vec3& normal);
+static float compute_shadow_factor(const Vec3& light_dir, const Vec3& world, const Vec3& normal);
 static bool triangle_in_front_of_near_plane(double z0, double z1, double z2);
 static void build_terrain_mesh();
 static void build_light_basis(const Vec3& light_dir, Vec3& right, Vec3& up, Vec3& forward);
@@ -378,7 +331,6 @@ struct VoxelBlock
 {
     Vec3 position;
     uint32_t color;
-    bool isTop;
     TopFaceLighting topFace;
     std::array<std::array<Vec3, 4>, 6> face_normals;
     std::array<std::array<float, 4>, 6> face_sky_visibility;
@@ -656,7 +608,6 @@ static void build_terrain_chunk()
                     color = dirt_color;
                 }
 
-                const bool is_top = (y == height - 1);
                 std::array<std::array<Vec3, 4>, 6> face_normals{};
                 for (int face = 0; face < 6; ++face)
                 {
@@ -666,10 +617,6 @@ static void build_terrain_chunk()
                         face_normals[face][corner] = base;
                     }
                 }
-                const TopFaceLighting top_face{
-                    {top_normal, top_normal, top_normal, top_normal}
-                };
-
                 std::array<std::array<float, 4>, 6> face_sky_visibility{};
                 for (auto& face_visibility : face_sky_visibility)
                 {
@@ -691,8 +638,7 @@ static void build_terrain_chunk()
                 terrainBlocks.push_back({
                     {start_x + x * block_size, base_y - y * block_size, start_z + z * block_size},
                     color,
-                    is_top,
-                    is_top ? top_face : empty_top,
+                    empty_top,
                     face_normals,
                     face_sky_visibility
                 });
@@ -959,22 +905,6 @@ static size_t clip_triangle_to_near_plane(const ClipVertex* input, const size_t 
     return out_count;
 }
 
-static bool shadow_cache_matches(const ShadowCacheState& cache, const Vec3& dir)
-{
-    if (!cache.valid)
-    {
-        return false;
-    }
-    const double dx = cache.dir.x - dir.x;
-    const double dy = cache.dir.y - dir.y;
-    const double dz = cache.dir.z - dir.z;
-    if ((dx * dx + dy * dy + dz * dz) > 1e-10)
-    {
-        return false;
-    }
-    return true;
-}
-
 static Vec3 add_vec(const Vec3& a, const Vec3& b)
 {
     return {a.x + b.x, a.y + b.y, a.z + b.z};
@@ -1148,13 +1078,7 @@ static inline float edge_function(const ScreenVertex& a, const ScreenVertex& b, 
     return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
 }
 
-static inline float smoothstep(const float edge0, const float edge1, const float x)
-{
-    const float t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
-    return t * t * (3.0f - 2.0f * t);
-}
-
-static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* sample_direct, uint8_t* sample_mask,
+static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* sample_direct,
                                  size_t width, size_t height,
                                  const ScreenVertex& v0, const ScreenVertex& v1, const ScreenVertex& v2,
                                  const Vec3& wp0, const Vec3& wp1, const Vec3& wp2,
@@ -1278,7 +1202,7 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient, Color
                                 float shadow_factor = 1.0f;
                                 if (ctx.shadows_enabled)
                                 {
-                                    shadow_factor = compute_shadow_factor(light.shadow, light.dir, world, normal);
+                                    shadow_factor = compute_shadow_factor(light.dir, world, normal);
                                 }
 
                                 const Vec3 half_vec = normalize_vec(add_vec(light.dir, view_dir));
@@ -1318,10 +1242,6 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient, Color
 
                         sample_ambient[idx] = ambient_color;
                         sample_direct[idx] = direct_color;
-                        if (sample_mask)
-                        {
-                            sample_mask[idx] = 1;
-                        }
                     }
                 }
             }
@@ -1341,248 +1261,123 @@ static void build_light_basis(const Vec3& light_dir, Vec3& right, Vec3& up, Vec3
     up = cross_vec(forward, right);
 }
 
-static void rasterize_shadow_triangle(std::vector<float>& depth, size_t resolution,
-                                      const ScreenVertex& v0, const ScreenVertex& v1, const ScreenVertex& v2)
+static bool shadow_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec3& light_dir)
 {
-    float min_x = std::min({v0.x, v1.x, v2.x});
-    float max_x = std::max({v0.x, v1.x, v2.x});
-    float min_y = std::min({v0.y, v1.y, v2.y});
-    float max_y = std::max({v0.y, v1.y, v2.y});
-
-    const int x0 = std::max(0, static_cast<int>(std::floor(min_x)));
-    const int x1 = std::min(static_cast<int>(resolution) - 1, static_cast<int>(std::ceil(max_x)));
-    const int y0 = std::max(0, static_cast<int>(std::floor(min_y)));
-    const int y1 = std::min(static_cast<int>(resolution) - 1, static_cast<int>(std::ceil(max_y)));
-
-    const float area = edge_function(v0, v1, v2);
-    if (area == 0.0f) return;
-
-    const bool area_positive = area > 0.0f;
-
-    for (int y = y0; y <= y1; ++y)
+    if (terrainSize <= 0 || terrainMaxHeight <= 0)
     {
-        for (int x = x0; x <= x1; ++x)
-        {
-            ScreenVertex p{static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, 0.0f};
-            float w0 = edge_function(v1, v2, p);
-            float w1 = edge_function(v2, v0, p);
-            float w2 = edge_function(v0, v1, p);
+        return false;
+    }
 
-            if ((w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f && area_positive) ||
-                (w0 <= 0.0f && w1 <= 0.0f && w2 <= 0.0f && !area_positive))
+    const double block_size = kTerrainBlockSize;
+    const double half = block_size * 0.5;
+    const double start_x = -(terrainSize - 1) * block_size * 0.5;
+    const double start_z = kTerrainStartZ;
+    const double base_y = kTerrainBaseY;
+    const double inv_block = 1.0 / block_size;
+
+    const Vec3 origin_world{
+        world.x + normal.x * kShadowRayBias,
+        world.y + normal.y * kShadowRayBias,
+        world.z + normal.z * kShadowRayBias
+    };
+    const Vec3 origin{
+        (origin_world.x - start_x + half) * inv_block,
+        (base_y - origin_world.y + half) * inv_block,
+        (origin_world.z - start_z + half) * inv_block
+    };
+    const Vec3 dir{
+        light_dir.x * inv_block,
+        -light_dir.y * inv_block,
+        light_dir.z * inv_block
+    };
+    if (dir.x == 0.0 && dir.y == 0.0 && dir.z == 0.0)
+    {
+        return false;
+    }
+
+    int x = static_cast<int>(std::floor(origin.x));
+    int y = static_cast<int>(std::floor(origin.y));
+    int z = static_cast<int>(std::floor(origin.z));
+
+    if (x < 0 || x >= terrainSize || z < 0 || z >= terrainSize || y < 0 || y >= terrainMaxHeight)
+    {
+        return false;
+    }
+
+    const double inf = std::numeric_limits<double>::infinity();
+    const int step_x = dir.x > 0.0 ? 1 : (dir.x < 0.0 ? -1 : 0);
+    const int step_y = dir.y > 0.0 ? 1 : (dir.y < 0.0 ? -1 : 0);
+    const int step_z = dir.z > 0.0 ? 1 : (dir.z < 0.0 ? -1 : 0);
+
+    const double t_delta_x = step_x != 0 ? 1.0 / std::abs(dir.x) : inf;
+    const double t_delta_y = step_y != 0 ? 1.0 / std::abs(dir.y) : inf;
+    const double t_delta_z = step_z != 0 ? 1.0 / std::abs(dir.z) : inf;
+
+    const double next_x = step_x > 0 ? (std::floor(origin.x) + 1.0) : std::floor(origin.x);
+    const double next_y = step_y > 0 ? (std::floor(origin.y) + 1.0) : std::floor(origin.y);
+    const double next_z = step_z > 0 ? (std::floor(origin.z) + 1.0) : std::floor(origin.z);
+
+    double t_max_x = step_x != 0 ? (next_x - origin.x) / dir.x : inf;
+    double t_max_y = step_y != 0 ? (next_y - origin.y) / dir.y : inf;
+    double t_max_z = step_z != 0 ? (next_z - origin.z) / dir.z : inf;
+
+    const int max_steps = (terrainSize + terrainSize + terrainMaxHeight) * 4;
+    bool skip_first = true;
+
+    for (int i = 0; i < max_steps; ++i)
+    {
+        if (!skip_first && terrain_has_block(x, y, z))
+        {
+            return true;
+        }
+        skip_first = false;
+
+        if (t_max_x < t_max_y)
+        {
+            if (t_max_x < t_max_z)
             {
-                w0 /= area;
-                w1 /= area;
-                w2 /= area;
-                const float depth_value = w0 * v0.z + w1 * v1.z + w2 * v2.z;
-                const size_t idx = static_cast<size_t>(y) * resolution + static_cast<size_t>(x);
-                if (depth_value > depth[idx])
-                {
-                    depth[idx] = depth_value;
-                }
+                x += step_x;
+                t_max_x += t_delta_x;
+            }
+            else
+            {
+                z += step_z;
+                t_max_z += t_delta_z;
             }
         }
+        else
+        {
+            if (t_max_y < t_max_z)
+            {
+                y += step_y;
+                t_max_y += t_delta_y;
+            }
+            else
+            {
+                z += step_z;
+                t_max_z += t_delta_z;
+            }
+        }
+
+        if (x < 0 || x >= terrainSize || z < 0 || z >= terrainSize || y < 0 || y >= terrainMaxHeight)
+        {
+            return false;
+        }
     }
+    return false;
 }
 
-static float compute_shadow_factor(const ShadowMap* shadow, const Vec3& light_dir,
-                                   const Vec3& world, const Vec3& normal)
+static float compute_shadow_factor(const Vec3& light_dir, const Vec3& world, const Vec3& normal)
 {
-    if (!shadow || !shadow->valid)
-    {
-        return 1.0f;
-    }
     const double ndotl = std::max(0.0, dot_vec(normal, light_dir));
     if (ndotl <= 0.0)
     {
         return 1.0f;
     }
-    const double slope = 1.0 - ndotl;
-    const float bias = static_cast<float>(0.02 + 0.08 * slope);
-    const float lx = static_cast<float>(dot_vec(world, shadow->right));
-    const float ly = static_cast<float>(dot_vec(world, shadow->up));
-    const float lz = static_cast<float>(dot_vec(world, shadow->forward));
-
-    if (lx < shadow->min_x || lx > shadow->max_x || ly < shadow->min_y || ly > shadow->max_y)
-    {
-        return 1.0f;
-    }
-
-    const float u = (lx - shadow->min_x) * shadow->scale_x;
-    const float v = (ly - shadow->min_y) * shadow->scale_y;
-    const int res = static_cast<int>(shadow->resolution);
-    const int cx = std::clamp(static_cast<int>(u + 0.5f), 0, res - 1);
-    const int cy = std::clamp(static_cast<int>(v + 0.5f), 0, res - 1);
-    float lit = 0.0f;
-    int samples = 0;
-    const float softness = static_cast<float>(0.05 + 0.08 * slope);
-    for (int dy = -kShadowPcfRadius; dy <= kShadowPcfRadius; ++dy)
-    {
-        const int sy = std::clamp(cy + dy, 0, res - 1);
-        for (int dx = -kShadowPcfRadius; dx <= kShadowPcfRadius; ++dx)
-        {
-            const int sx = std::clamp(cx + dx, 0, res - 1);
-            const float depth = shadow->depth[static_cast<size_t>(sy) * shadow->resolution + static_cast<size_t>(sx)];
-            if (depth <= shadow->depth_min)
-            {
-                continue;
-            }
-            samples++;
-            const float delta = static_cast<float>((lz + bias) - depth);
-            lit += smoothstep(-softness, softness, delta);
-        }
-    }
-    if (samples <= 0)
-    {
-        return 1.0f;
-    }
-    return lit / static_cast<float>(samples);
+    return shadow_raymarch_hit(world, normal, light_dir) ? 0.0f : 1.0f;
 }
 
-static bool build_shadow_map(ShadowMap& shadow, const Vec3& light_dir,
-                             const std::vector<RenderQuad>& quads)
-{
-    const Vec3 forward = normalize_vec(light_dir);
-    if (forward.x == 0.0 && forward.y == 0.0 && forward.z == 0.0)
-    {
-        shadow.valid = false;
-        shadowTriangleCount.store(0u, std::memory_order_relaxed);
-        return false;
-    }
-
-    Vec3 right;
-    Vec3 up;
-    build_light_basis(forward, right, up, shadow.forward);
-    shadow.right = right;
-    shadow.up = up;
-
-    float min_x = std::numeric_limits<float>::max();
-    float max_x = std::numeric_limits<float>::lowest();
-    float min_y = std::numeric_limits<float>::max();
-    float max_y = std::numeric_limits<float>::lowest();
-    bool has_bounds = false;
-
-    const size_t quad_count = quads.size();
-    constexpr size_t kQuadVertexCount = 4;
-    thread_local std::vector<ScreenVertex> light_vertices;
-    if (light_vertices.size() != quad_count * kQuadVertexCount)
-    {
-        light_vertices.resize(quad_count * kQuadVertexCount);
-    }
-
-    for (size_t q = 0; q < quad_count; ++q)
-    {
-        const RenderQuad& quad = quads[q];
-        const size_t base = q * kQuadVertexCount;
-        for (size_t i = 0; i < kQuadVertexCount; ++i)
-        {
-            const Vec3& v = quad.v[i];
-            const float lx = static_cast<float>(dot_vec(v, right));
-            const float ly = static_cast<float>(dot_vec(v, up));
-            const float lz = static_cast<float>(dot_vec(v, forward));
-            light_vertices[base + i] = {lx, ly, lz};
-            min_x = std::min(min_x, lx);
-            max_x = std::max(max_x, lx);
-            min_y = std::min(min_y, ly);
-            max_y = std::max(max_y, ly);
-            has_bounds = true;
-        }
-    }
-
-    if (!has_bounds)
-    {
-        shadow.valid = false;
-        shadowTriangleCount.store(0u, std::memory_order_relaxed);
-        return false;
-    }
-
-    const float padding = 1.0f;
-    min_x -= padding;
-    max_x += padding;
-    min_y -= padding;
-    max_y += padding;
-    if (std::abs(max_x - min_x) < 1e-3f)
-    {
-        min_x -= 1.0f;
-        max_x += 1.0f;
-    }
-    if (std::abs(max_y - min_y) < 1e-3f)
-    {
-        min_y -= 1.0f;
-        max_y += 1.0f;
-    }
-
-    const float texel_x = (max_x - min_x) / static_cast<float>(kShadowMapResolution - 1);
-    if (texel_x > 0.0f)
-    {
-        min_x = std::floor(min_x / texel_x) * texel_x;
-        max_x = std::ceil(max_x / texel_x) * texel_x;
-    }
-    const float texel_y = (max_y - min_y) / static_cast<float>(kShadowMapResolution - 1);
-    if (texel_y > 0.0f)
-    {
-        min_y = std::floor(min_y / texel_y) * texel_y;
-        max_y = std::ceil(max_y / texel_y) * texel_y;
-    }
-
-    shadow.min_x = min_x;
-    shadow.max_x = max_x;
-    shadow.min_y = min_y;
-    shadow.max_y = max_y;
-    shadow.scale_x = static_cast<float>(kShadowMapResolution - 1) / (max_x - min_x);
-    shadow.scale_y = static_cast<float>(kShadowMapResolution - 1) / (max_y - min_y);
-    shadow.resolution = kShadowMapResolution;
-    shadow.depth_min = std::numeric_limits<float>::lowest();
-    shadow.valid = true;
-    shadowTriangleCount.store(quad_count * 2u, std::memory_order_relaxed);
-
-    const size_t map_size = kShadowMapResolution * kShadowMapResolution;
-    if (shadow.depth.size() != map_size)
-    {
-        shadow.depth.assign(map_size, shadow.depth_min);
-    }
-    else
-    {
-        std::fill(shadow.depth.begin(), shadow.depth.end(), shadow.depth_min);
-    }
-
-    for (size_t q = 0; q < quad_count; ++q)
-    {
-        const size_t base = q * kQuadVertexCount;
-        const ScreenVertex& a = light_vertices[base];
-        const ScreenVertex& bvert = light_vertices[base + 1];
-        const ScreenVertex& cpos = light_vertices[base + 2];
-        const ScreenVertex& dpos = light_vertices[base + 3];
-
-        const ScreenVertex sv0{
-            (a.x - min_x) * shadow.scale_x,
-            (a.y - min_y) * shadow.scale_y,
-            a.z
-        };
-        const ScreenVertex sv1{
-            (bvert.x - min_x) * shadow.scale_x,
-            (bvert.y - min_y) * shadow.scale_y,
-            bvert.z
-        };
-        const ScreenVertex sv2{
-            (cpos.x - min_x) * shadow.scale_x,
-            (cpos.y - min_y) * shadow.scale_y,
-            cpos.z
-        };
-        const ScreenVertex sv3{
-            (dpos.x - min_x) * shadow.scale_x,
-            (dpos.y - min_y) * shadow.scale_y,
-            dpos.z
-        };
-
-        rasterize_shadow_triangle(shadow.depth, shadow.resolution, sv0, sv1, sv2);
-        rasterize_shadow_triangle(shadow.depth, shadow.resolution, sv0, sv2, sv3);
-    }
-
-    return true;
-}
-
-static void render_quad(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* sample_direct, uint8_t* sample_mask,
+static void render_quad(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* sample_direct,
                         size_t width, size_t height,
                         const RenderQuad& quad, const double fov_x, const double fov_y,
                         const Vec3& camera_pos, const ViewRotation& view_rot, const ShadingContext& ctx)
@@ -1643,7 +1438,7 @@ static void render_quad(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* samp
         const ScreenVertex sv0 = project_vertex(a.view);
         const ScreenVertex sv1 = project_vertex(b.view);
         const ScreenVertex sv2 = project_vertex(c.view);
-        draw_shaded_triangle(zbuffer, sample_ambient, sample_direct, sample_mask, width, height,
+        draw_shaded_triangle(zbuffer, sample_ambient, sample_direct, width, height,
                              sv0, sv1, sv2,
                              a.world, b.world, c.world,
                              a.normal, b.normal, c.normal,
@@ -1774,51 +1569,9 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
 
     const Vec3 moon_dir = normalize_vec(load_moon_direction());
     const bool shadows_on = shadowEnabled.load(std::memory_order_relaxed);
-    static ShadowMap sun_shadow;
-    static ShadowMap moon_shadow;
-    static ShadowCacheState sun_shadow_cache;
-    static ShadowCacheState moon_shadow_cache;
-    bool sun_shadow_valid = false;
-    bool moon_shadow_valid = false;
-    if (shadows_on && sun_intensity > 0.0)
-    {
-        const bool needs_rebuild = !sun_shadow.valid || !shadow_cache_matches(sun_shadow_cache, sun_dir);
-        if (needs_rebuild)
-        {
-            sunShadowBuilds.fetch_add(1u, std::memory_order_relaxed);
-            sun_shadow_valid = build_shadow_map(sun_shadow, sun_dir, terrainQuads);
-            sun_shadow_cache.valid = sun_shadow_valid;
-            if (sun_shadow_valid)
-            {
-                sun_shadow_cache.dir = sun_dir;
-            }
-        }
-        else
-        {
-            sun_shadow_valid = sun_shadow.valid;
-        }
-    }
-    if (shadows_on && moon_intensity > 0.0)
-    {
-        const bool needs_rebuild = !moon_shadow.valid || !shadow_cache_matches(moon_shadow_cache, moon_dir);
-        if (needs_rebuild)
-        {
-            moon_shadow_valid = build_shadow_map(moon_shadow, moon_dir, terrainQuads);
-            moon_shadow_cache.valid = moon_shadow_valid;
-            if (moon_shadow_valid)
-            {
-                moon_shadow_cache.dir = moon_dir;
-            }
-        }
-        else
-        {
-            moon_shadow_valid = moon_shadow.valid;
-        }
-    }
-
     const std::array<ShadingContext::DirectionalLightInfo, 2> lights = {
-        ShadingContext::DirectionalLightInfo{sun_dir, sun_intensity, kSunLightColorLinear, sun_shadow_valid ? &sun_shadow : nullptr},
-        ShadingContext::DirectionalLightInfo{moon_dir, moon_intensity, kMoonLightColorLinear, moon_shadow_valid ? &moon_shadow : nullptr}
+        ShadingContext::DirectionalLightInfo{sun_dir, sun_intensity, kSunLightColorLinear},
+        ShadingContext::DirectionalLightInfo{moon_dir, moon_intensity, kMoonLightColorLinear}
     };
 
     const bool direct_lighting_enabled = (lights[0].intensity > 0.0) || (lights[1].intensity > 0.0);
@@ -1875,7 +1628,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     for (const auto& quad : terrainQuads)
     {
         ShadingContext& ctx = get_ctx(quad.color);
-        render_quad(zbuffer.data(), sample_colors.data(), sample_direct.data(), nullptr, width, height, quad, fov_x, fov_y,
+        render_quad(zbuffer.data(), sample_colors.data(), sample_direct.data(), width, height, quad, fov_x, fov_y,
                     camera_pos, view_rot, ctx);
     }
 
@@ -2088,70 +1841,9 @@ void render_set_ambient_occlusion_enabled(const bool enabled)
     ambientOcclusionEnabled.store(enabled, std::memory_order_relaxed);
 }
 
-bool render_get_ambient_occlusion_enabled()
-{
-    return ambientOcclusionEnabled.load(std::memory_order_relaxed);
-}
-
 void render_set_shadow_enabled(const bool enabled)
 {
     shadowEnabled.store(enabled, std::memory_order_relaxed);
-}
-
-bool render_get_shadow_enabled()
-{
-    return shadowEnabled.load(std::memory_order_relaxed);
-}
-
-size_t render_get_shadow_map_resolution()
-{
-    return kShadowMapResolution;
-}
-
-int render_get_shadow_pcf_kernel()
-{
-    return kShadowPcfKernel;
-}
-
-bool render_get_terrain_face_sky_visibility(const int x, const int y, const int z,
-                                            const int face, float* out_visibility)
-{
-    if (!out_visibility)
-    {
-        return false;
-    }
-    generate_terrain_chunk();
-    if (face < 0 || face >= 6)
-    {
-        return false;
-    }
-    if (x < 0 || z < 0 || x >= terrainSize || z >= terrainSize)
-    {
-        return false;
-    }
-    const size_t idx = static_cast<size_t>(z * terrainSize + x);
-    if (idx >= terrainHeights.size())
-    {
-        return false;
-    }
-    const int height = terrainHeights[idx];
-    if (y < 0 || y >= height)
-    {
-        return false;
-    }
-    const VoxelBlock* block = terrain_block_at(x, y, z);
-    if (!block)
-    {
-        return false;
-    }
-    const auto& vis = block->face_sky_visibility[static_cast<size_t>(face)];
-    float sum = 0.0f;
-    for (float v : vis)
-    {
-        sum += v;
-    }
-    *out_visibility = sum / 4.0f;
-    return true;
 }
 
 bool render_get_terrain_vertex_sky_visibility(const int x, const int y, const int z,
@@ -2222,21 +1914,7 @@ bool render_get_shadow_factor_at_point(const Vec3 world, const Vec3 normal, floa
         return true;
     }
 
-    static ShadowMap shadow;
-    static ShadowCacheState shadow_cache;
-    const bool needs_rebuild = !shadow.valid || !shadow_cache_matches(shadow_cache, light_dir);
-    if (needs_rebuild)
-    {
-        if (!build_shadow_map(shadow, light_dir, terrainQuads))
-        {
-            shadow_cache.valid = false;
-            *out_factor = 1.0f;
-            return false;
-        }
-        shadow_cache.valid = true;
-        shadow_cache.dir = light_dir;
-    }
-    *out_factor = compute_shadow_factor(&shadow, light_dir, world, normalize_vec(normal));
+    *out_factor = compute_shadow_factor(light_dir, world, normalize_vec(normal));
     return true;
 }
 
@@ -2433,22 +2111,6 @@ Vec2 render_project_point(const Vec3 world, const size_t width, const size_t hei
     const double proj_y = view.y * inv_z * fov_y;
 
     return {proj_x + static_cast<double>(width) / 2.0, proj_y + static_cast<double>(height) / 2.0};
-}
-
-void render_debug_reset_shadow_build_counts()
-{
-    sunShadowBuilds.store(0u, std::memory_order_relaxed);
-    shadowTriangleCount.store(0u, std::memory_order_relaxed);
-}
-
-uint64_t render_debug_get_sun_shadow_build_count()
-{
-    return sunShadowBuilds.load(std::memory_order_relaxed);
-}
-
-size_t render_debug_get_shadow_triangle_count()
-{
-    return shadowTriangleCount.load(std::memory_order_relaxed);
 }
 
 size_t render_debug_get_terrain_block_count()
