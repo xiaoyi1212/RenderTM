@@ -16,28 +16,24 @@ add_executable(untitled main.cpp
         input.h
         controls.cpp
         controls.h
-        vector.cpp
-        vector.h
         keyboard.h
         keyboard.cpp)
 
-    FetchContent_Declare(
-            Catch2
-            GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-            GIT_TAG v3.12.0
-            GIT_SHALLOW TRUE
-            GIT_PROGRESS TRUE
-    )
+FetchContent_Declare(
+        Catch2
+        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+        GIT_TAG v3.12.0
+        GIT_SHALLOW TRUE
+        GIT_PROGRESS TRUE
+)
 FetchContent_MakeAvailable(Catch2)
 
 add_executable(untitled_tests
         tests/test_controls.cpp
         tests/test_input.cpp
-        tests/test_vector.cpp
         tests/test_render.cpp
         input.cpp
         controls.cpp
-        vector.cpp
         render.cpp)
 target_link_libraries(untitled_tests PRIVATE Catch2::Catch2WithMain)
 target_include_directories(untitled_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

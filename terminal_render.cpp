@@ -5,9 +5,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <fcntl.h>
-#include <iostream>
 #include <mutex>
-#include <ostream>
 #include <string>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -21,7 +19,6 @@ static double fps = 0.0;
 static const std::string render_char = "\u2580";
 
 static int stdout_flags = -1;
-static bool stdout_nonblock = true;
 static std::string pending_output;
 static size_t pending_offset = 0;
 static std::mutex frame_mutex;
@@ -32,19 +29,16 @@ static bool output_shutdown = false;
 
 static void stdout_init()
 {
-    if (stdout_nonblock)
+    stdout_flags = fcntl(STDOUT_FILENO, F_GETFL, 0);
+    if (stdout_flags >= 0)
     {
-        stdout_flags = fcntl(STDOUT_FILENO, F_GETFL, 0);
-        if (stdout_flags >= 0)
-        {
-            fcntl(STDOUT_FILENO, F_SETFL, stdout_flags | O_NONBLOCK);
-        }
+        fcntl(STDOUT_FILENO, F_SETFL, stdout_flags | O_NONBLOCK);
     }
 }
 
 static void stdout_restore()
 {
-    if (stdout_nonblock && stdout_flags >= 0)
+    if (stdout_flags >= 0)
     {
         fcntl(STDOUT_FILENO, F_SETFL, stdout_flags);
     }
@@ -52,23 +46,7 @@ static void stdout_restore()
 
 static void stdout_write(const char* data, size_t len)
 {
-    if (!stdout_nonblock)
-    {
-        size_t written = 0;
-        while (written < len)
-        {
-            const ssize_t n = ::write(STDOUT_FILENO, data + written, len - written);
-            if (n <= 0) break;
-            written += static_cast<size_t>(n);
-        }
-        return;
-    }
-
-    const ssize_t n = ::write(STDOUT_FILENO, data, len);
-    if (n < 0)
-    {
-        return;
-    }
+    (void)::write(STDOUT_FILENO, data, len);
 }
 
 static bool stdout_flush_pending()
@@ -238,27 +216,17 @@ void render_output_run()
     std::string frame;
     while (true)
     {
-        if (stdout_nonblock)
+        if (!stdout_flush_pending())
         {
-            if (!stdout_flush_pending())
-            {
-                usleep(1000);
-                continue;
-            }
+            usleep(1000);
+            continue;
         }
         if (!render_wait_for_frame(frame))
         {
             break;
         }
-        if (stdout_nonblock)
-        {
-            pending_output = std::move(frame);
-            pending_offset = 0;
-        }
-        else
-        {
-            stdout_write(frame.data(), frame.size());
-        }
+        pending_output = std::move(frame);
+        pending_offset = 0;
     }
 }
 

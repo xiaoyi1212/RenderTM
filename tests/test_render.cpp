@@ -27,33 +27,37 @@ static void reset_camera()
     render_set_moon_direction({0.0, 1.0, 0.0});
     render_set_moon_intensity(0.0);
     render_set_shadow_enabled(true);
+    render_set_exposure(1.0);
 }
 
-static uint32_t lerp_channel(uint32_t top, uint32_t bottom, float t)
-{
-    const float value = static_cast<float>(top) + (static_cast<float>(bottom) - static_cast<float>(top)) * t;
-    const long rounded = std::lround(value);
-    if (rounded < 0) return 0;
-    if (rounded > 255) return 255;
-    return static_cast<uint32_t>(rounded);
-}
+static float srgb_channel_to_linear(float channel);
+static float linear_channel_to_srgb(float channel);
 
 static uint32_t sky_color_for_row(size_t y, size_t height, uint32_t sky_top, uint32_t sky_bottom)
 {
-    if (height <= 1)
-    {
-        return sky_top;
-    }
-    const float t = static_cast<float>(y) / static_cast<float>(height - 1);
+    const float t = height > 1 ? static_cast<float>(y) / static_cast<float>(height - 1) : 0.0f;
     const uint32_t r0 = (sky_top >> 16) & 0xFF;
     const uint32_t g0 = (sky_top >> 8) & 0xFF;
     const uint32_t b0 = sky_top & 0xFF;
     const uint32_t r1 = (sky_bottom >> 16) & 0xFF;
     const uint32_t g1 = (sky_bottom >> 8) & 0xFF;
     const uint32_t b1 = sky_bottom & 0xFF;
-    const uint32_t r = lerp_channel(r0, r1, t);
-    const uint32_t g = lerp_channel(g0, g1, t);
-    const uint32_t b = lerp_channel(b0, b1, t);
+    const float r0_lin = srgb_channel_to_linear(static_cast<float>(r0));
+    const float g0_lin = srgb_channel_to_linear(static_cast<float>(g0));
+    const float b0_lin = srgb_channel_to_linear(static_cast<float>(b0));
+    const float r1_lin = srgb_channel_to_linear(static_cast<float>(r1));
+    const float g1_lin = srgb_channel_to_linear(static_cast<float>(g1));
+    const float b1_lin = srgb_channel_to_linear(static_cast<float>(b1));
+    const float r_lin = r0_lin + (r1_lin - r0_lin) * t;
+    const float g_lin = g0_lin + (g1_lin - g0_lin) * t;
+    const float b_lin = b0_lin + (b1_lin - b0_lin) * t;
+    const float exposure = static_cast<float>(std::max(0.0, render_get_exposure()));
+    const float r_mapped = exposure <= 0.0f ? 0.0f : (r_lin * exposure) / (1.0f + r_lin * exposure);
+    const float g_mapped = exposure <= 0.0f ? 0.0f : (g_lin * exposure) / (1.0f + g_lin * exposure);
+    const float b_mapped = exposure <= 0.0f ? 0.0f : (b_lin * exposure) / (1.0f + b_lin * exposure);
+    const uint32_t r = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(r_mapped) * 255.0f));
+    const uint32_t g = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(g_mapped) * 255.0f));
+    const uint32_t b = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(b_mapped) * 255.0f));
     return 0xFF000000u | (r << 16) | (g << 8) | b;
 }
 
@@ -215,6 +219,179 @@ static size_t count_blocks(const std::vector<int>& heights, const int chunk_size
 }
 
 static bool terrain_has_block(const std::vector<int>& heights, const int chunk_size,
+                              const int gx, const int gy, const int gz);
+
+extern double render_debug_eval_specular(double ndoth, double vdoth, double ndotl,
+                                         double shininess, double f0);
+
+constexpr int kFaceTop = 0;
+constexpr int kFaceBottom = 1;
+constexpr int kFaceLeft = 2;
+constexpr int kFaceRight = 3;
+constexpr int kFaceBack = 4;
+constexpr int kFaceFront = 5;
+
+constexpr int kCubeFaceNormal[6][3] = {
+    {0, 1, 0},
+    {0, -1, 0},
+    {-1, 0, 0},
+    {1, 0, 0},
+    {0, 0, -1},
+    {0, 0, 1}
+};
+
+constexpr int kCubeFaceVertices[6][4] = {
+    {0, 1, 5, 4},
+    {3, 2, 6, 7},
+    {0, 3, 7, 4},
+    {1, 2, 6, 5},
+    {0, 1, 2, 3},
+    {4, 5, 6, 7}
+};
+
+constexpr int kCubeVertexGrid[8][3] = {
+    {0, 1, 0},
+    {1, 1, 0},
+    {1, 0, 0},
+    {0, 0, 0},
+    {0, 1, 1},
+    {1, 1, 1},
+    {1, 0, 1},
+    {0, 0, 1}
+};
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr size_t kSkyRayCount = 128;
+constexpr double kSkyRayStep = 0.25;
+constexpr double kSkyRayMaxDistance = 6.0;
+constexpr double kSkyRayBias = 0.02;
+constexpr double kSkyRayCenterBias = 0.02;
+
+static double radical_inverse_vdc(uint32_t bits)
+{
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return static_cast<double>(bits) * 2.3283064365386963e-10;
+}
+
+static const std::vector<Vec3>& sky_sample_dirs()
+{
+    static std::vector<Vec3> samples = [] {
+        std::vector<Vec3> dirs;
+        dirs.reserve(kSkyRayCount);
+        for (size_t i = 0; i < kSkyRayCount; ++i)
+        {
+            const double u = (static_cast<double>(i) + 0.5) / static_cast<double>(kSkyRayCount);
+            const double v = radical_inverse_vdc(static_cast<uint32_t>(i));
+            const double r = std::sqrt(u);
+            const double theta = 2.0 * kPi * v;
+            const double x = r * std::cos(theta);
+            const double y = r * std::sin(theta);
+            const double z = std::sqrt(std::max(0.0, 1.0 - u));
+            dirs.push_back({x, y, z});
+        }
+        return dirs;
+    }();
+    return samples;
+}
+
+static Vec3 normalize_vec3(const Vec3& v)
+{
+    const double len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    if (len == 0.0) return {0.0, 0.0, 0.0};
+    return {v.x / len, v.y / len, v.z / len};
+}
+
+static void build_basis(const Vec3& n, Vec3& t, Vec3& b)
+{
+    Vec3 up{0.0, 1.0, 0.0};
+    if (std::abs(n.x * up.x + n.y * up.y + n.z * up.z) > 0.99)
+    {
+        up = {1.0, 0.0, 0.0};
+    }
+    t = normalize_vec3({up.y * n.z - up.z * n.y, up.z * n.x - up.x * n.z, up.x * n.y - up.y * n.x});
+    b = {n.y * t.z - n.z * t.y, n.z * t.x - n.x * t.z, n.x * t.y - n.y * t.x};
+}
+
+static Vec3 face_corner_position_grid(const int gx, const int gy, const int gz,
+                                      const int face, const int corner)
+{
+    const int vi = kCubeFaceVertices[face][corner];
+    return {
+        static_cast<double>(gx + kCubeVertexGrid[vi][0]),
+        static_cast<double>(gy + kCubeVertexGrid[vi][1]),
+        static_cast<double>(gz + kCubeVertexGrid[vi][2])
+    };
+}
+
+static float raycast_vertex_sky_visibility(const std::vector<int>& heights, const int chunk_size,
+                                           const int gx, const int gy, const int gz,
+                                           const int face, const int corner)
+{
+    const Vec3 normal = normalize_vec3({
+        static_cast<double>(kCubeFaceNormal[face][0]),
+        static_cast<double>(kCubeFaceNormal[face][1]),
+        static_cast<double>(kCubeFaceNormal[face][2])
+    });
+    Vec3 tangent{};
+    Vec3 bitangent{};
+    build_basis(normal, tangent, bitangent);
+
+    const Vec3 vertex = face_corner_position_grid(gx, gy, gz, face, corner);
+    const Vec3 center{
+        static_cast<double>(gx) + 0.5,
+        static_cast<double>(gy) + 0.5,
+        static_cast<double>(gz) + 0.5
+    };
+    Vec3 origin = vertex;
+    origin.x += normal.x * kSkyRayBias;
+    origin.y += normal.y * kSkyRayBias;
+    origin.z += normal.z * kSkyRayBias;
+    origin.x += (center.x - vertex.x) * kSkyRayCenterBias;
+    origin.y += (center.y - vertex.y) * kSkyRayCenterBias;
+    origin.z += (center.z - vertex.z) * kSkyRayCenterBias;
+
+    const auto& samples = sky_sample_dirs();
+    size_t occluded = 0;
+    for (const auto& sample : samples)
+    {
+        Vec3 dir{
+            tangent.x * sample.x + bitangent.x * sample.y + normal.x * sample.z,
+            tangent.y * sample.x + bitangent.y * sample.y + normal.y * sample.z,
+            tangent.z * sample.x + bitangent.z * sample.y + normal.z * sample.z
+        };
+
+        bool hit = false;
+        for (double t = kSkyRayStep; t <= kSkyRayMaxDistance; t += kSkyRayStep)
+        {
+            const Vec3 p{
+                origin.x + dir.x * t,
+                origin.y + dir.y * t,
+                origin.z + dir.z * t
+            };
+            const int vx = static_cast<int>(std::floor(p.x));
+            const int vy = static_cast<int>(std::floor(p.y));
+            const int vz = static_cast<int>(std::floor(p.z));
+            if (terrain_has_block(heights, chunk_size, vx, vy, vz))
+            {
+                hit = true;
+                break;
+            }
+        }
+        if (hit)
+        {
+            occluded++;
+        }
+    }
+
+    const double visibility = 1.0 - static_cast<double>(occluded) / static_cast<double>(samples.size());
+    return static_cast<float>(std::clamp(visibility, 0.0, 1.0));
+}
+
+static bool terrain_has_block(const std::vector<int>& heights, const int chunk_size,
                               const int gx, const int gy, const int gz)
 {
     if (gx < 0 || gx >= chunk_size || gz < 0 || gz >= chunk_size)
@@ -364,6 +541,14 @@ static bool find_flat_shared_corner(FlatCornerProbe& out_probe)
     }
 
     return false;
+}
+
+static int top_face_corner_from_offsets(const int sx, const int sz)
+{
+    if (sx > 0 && sz > 0) return 2;
+    if (sx > 0 && sz < 0) return 1;
+    if (sx < 0 && sz > 0) return 3;
+    return 0;
 }
 
 struct SideFaceAoProbe
@@ -559,16 +744,19 @@ static uint32_t expected_gamma_luminance(uint32_t albedo, float intensity)
     const float r_lin = srgb_channel_to_linear(static_cast<float>((albedo >> 16) & 0xFF)) * intensity;
     const float g_lin = srgb_channel_to_linear(static_cast<float>((albedo >> 8) & 0xFF)) * intensity;
     const float b_lin = srgb_channel_to_linear(static_cast<float>(albedo & 0xFF)) * intensity;
-    const uint32_t r = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(r_lin) * 255.0f));
-    const uint32_t g = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(g_lin) * 255.0f));
-    const uint32_t b = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(b_lin) * 255.0f));
+    const float exposure = static_cast<float>(std::max(0.0, render_get_exposure()));
+    const float r_mapped = exposure <= 0.0f ? 0.0f : (r_lin * exposure) / (1.0f + r_lin * exposure);
+    const float g_mapped = exposure <= 0.0f ? 0.0f : (g_lin * exposure) / (1.0f + g_lin * exposure);
+    const float b_mapped = exposure <= 0.0f ? 0.0f : (b_lin * exposure) / (1.0f + b_lin * exposure);
+    const uint32_t r = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(r_mapped) * 255.0f));
+    const uint32_t g = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(g_mapped) * 255.0f));
+    const uint32_t b = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(b_mapped) * 255.0f));
     return r + g + b;
 }
 
 TEST_CASE("render_update_array clears framebuffer and draws geometry")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
     render_set_paused(false);
     render_set_light_direction({0.0, 0.0, -1.0});
     render_set_light_intensity(1.0);
@@ -590,7 +778,6 @@ TEST_CASE("render_update_array clears framebuffer and draws geometry")
 TEST_CASE("render_update_array handles tiny even-sized buffers")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
     render_set_paused(false);
     render_set_light_direction({0.0, 0.0, 1.0});
     render_set_light_intensity(1.0);
@@ -615,7 +802,6 @@ TEST_CASE("render_update_array is stable when paused")
     std::vector<uint32_t> framebuffer_a(width * height, 0u);
     std::vector<uint32_t> framebuffer_b(width * height, 0u);
 
-    render_set_scene(RenderScene::CubeOnly);
     render_set_light_direction({0.0, 0.0, 1.0});
     render_set_light_intensity(1.0);
     render_set_paused(true);
@@ -626,7 +812,7 @@ TEST_CASE("render_update_array is stable when paused")
     REQUIRE(framebuffer_a == framebuffer_b);
 }
 
-TEST_CASE("render_update_array fills front face at zero rotation")
+TEST_CASE("render_update_array fills front face")
 {
     reset_camera();
     const size_t width = 120;
@@ -634,8 +820,6 @@ TEST_CASE("render_update_array fills front face at zero rotation")
 
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_light_direction({0.0, 0.0, 1.0});
     render_set_light_intensity(1.0);
     render_set_paused(true);
@@ -667,8 +851,6 @@ TEST_CASE("render_update_array shows multiple terrain materials")
 
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_light_direction({0.0, 1.0, 1.0});
     render_set_light_intensity(0.0);
@@ -704,8 +886,6 @@ TEST_CASE("render_update_array applies lighting as multiple shades")
 
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.6f);
     render_set_paused(true);
     render_set_light_direction({0.5, -1.0, 0.7});
     render_set_light_intensity(1.0);
@@ -737,11 +917,6 @@ TEST_CASE("render_update_array applies lighting as multiple shades")
 TEST_CASE("render state setters and getters")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    REQUIRE(render_get_scene() == RenderScene::CubeOnly);
-
-    render_set_rotation(1.234f);
-    REQUIRE(render_get_rotation() == Catch::Approx(1.234f));
 
     render_set_light_direction({0.1, 0.2, -0.3});
     const Vec3 dir = render_get_light_direction();
@@ -768,6 +943,9 @@ TEST_CASE("render state setters and getters")
     render_set_sky_light_intensity(0.77);
     REQUIRE(render_get_sky_light_intensity() == Catch::Approx(0.77));
 
+    render_set_exposure(1.4);
+    REQUIRE(render_get_exposure() == Catch::Approx(1.4));
+
     render_set_paused(false);
     REQUIRE_FALSE(render_is_paused());
     render_toggle_pause();
@@ -775,13 +953,12 @@ TEST_CASE("render state setters and getters")
     render_toggle_pause();
     REQUIRE_FALSE(render_is_paused());
 
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_light_direction({0.0, 0.0, -1.0});
     render_set_light_intensity(1.0);
     render_set_sky_top_color(0xFF78C2FF);
     render_set_sky_bottom_color(0xFF172433);
     render_set_sky_light_intensity(0.0);
+    render_set_exposure(1.0);
     render_set_paused(false);
 }
 
@@ -816,8 +993,6 @@ TEST_CASE("render_update_array renders sky gradient")
     reset_camera();
     render_set_camera_position({0.0, 25.0, -10.0});
     render_set_camera_rotation({0.0, -0.8});
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_light_direction({0.0, 0.0, 1.0});
     render_set_light_intensity(0.0);
@@ -866,8 +1041,6 @@ TEST_CASE("sky gradient follows sun altitude when orbit enabled")
     reset_camera();
     render_set_camera_position({0.0, 25.0, -10.0});
     render_set_camera_rotation({0.0, -0.8});
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_light_direction({0.0, 0.0, 1.0});
     render_set_light_intensity(1.0);
     render_set_sky_light_intensity(0.0);
@@ -923,8 +1096,6 @@ TEST_CASE("sky light intensity follows sun altitude")
     reset_camera();
     render_set_camera_position({0.0, -12.0, -10.0});
     render_set_camera_rotation({0.0, -0.7});
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_light_intensity(0.0);
     render_set_moon_intensity(0.0);
     render_set_shadow_enabled(false);
@@ -978,8 +1149,6 @@ TEST_CASE("sky light intensity follows sun altitude")
 TEST_CASE("low sun altitude keeps ambient above black")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_sun_orbit_enabled(true);
     render_set_sun_orbit_angle(0.08);
@@ -1030,8 +1199,6 @@ TEST_CASE("low sun altitude keeps ambient above black")
 TEST_CASE("sun light is warmer than moon light")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_sun_orbit_enabled(false);
     render_set_shadow_enabled(false);
@@ -1101,8 +1268,6 @@ TEST_CASE("sun light is warmer than moon light")
 TEST_CASE("moonlight adds ambient when sun is below horizon")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_sun_orbit_enabled(true);
     render_set_sun_orbit_angle(0.0);
@@ -1158,8 +1323,6 @@ TEST_CASE("moonlight adds ambient when sun is below horizon")
 TEST_CASE("sky color affects anti-aliased edges")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_light_direction({0.0, 0.0, 1.0});
     render_set_light_intensity(1.0);
@@ -1208,8 +1371,6 @@ TEST_CASE("sky color affects anti-aliased edges")
 TEST_CASE("sky light increases ambient brightness")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_light_direction({0.0, 0.0, 1.0});
     render_set_light_intensity(0.0);
@@ -1257,8 +1418,6 @@ TEST_CASE("sky light increases ambient brightness")
 TEST_CASE("gamma correction applies to midtone ambient")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_sun_orbit_enabled(false);
     render_set_light_intensity(0.0);
@@ -1306,11 +1465,29 @@ TEST_CASE("gamma correction applies to midtone ambient")
     REQUIRE(avg_lum == Catch::Approx(static_cast<double>(expected)).margin(12.0));
 }
 
+TEST_CASE("Reinhard tone mapping applies exposure in linear space")
+{
+    const Vec3 color{2.0, 0.5, 0.0};
+    const Vec3 mapped = render_debug_tonemap_reinhard(color, 1.0);
+    REQUIRE(mapped.x == Catch::Approx(2.0 / 3.0).margin(1e-6));
+    REQUIRE(mapped.y == Catch::Approx(0.5 / 1.5).margin(1e-6));
+    REQUIRE(mapped.z == Catch::Approx(0.0).margin(1e-9));
+
+    const Vec3 mapped_boost = render_debug_tonemap_reinhard(color, 2.0);
+    REQUIRE(mapped_boost.x == Catch::Approx(4.0 / 5.0).margin(1e-6));
+    REQUIRE(mapped_boost.y == Catch::Approx(1.0 / 2.0).margin(1e-6));
+    REQUIRE(mapped_boost.x > mapped.x);
+    REQUIRE(mapped_boost.y > mapped.y);
+
+    const Vec3 mapped_zero = render_debug_tonemap_reinhard(color, -1.0);
+    REQUIRE(mapped_zero.x == Catch::Approx(0.0).margin(1e-9));
+    REQUIRE(mapped_zero.y == Catch::Approx(0.0).margin(1e-9));
+    REQUIRE(mapped_zero.z == Catch::Approx(0.0).margin(1e-9));
+}
+
 TEST_CASE("hemisphere lighting adds sun bounce to shadowed faces")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_sun_orbit_enabled(false);
     render_set_light_direction({0.0, -1.0, 0.0});
@@ -1366,8 +1543,6 @@ TEST_CASE("hemisphere lighting adds sun bounce to shadowed faces")
 TEST_CASE("directional shadow mapping darkens terrain")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.2f);
     render_set_paused(true);
     render_set_light_direction({0.6, -0.3, 0.8});
     render_set_light_intensity(1.0);
@@ -1418,8 +1593,6 @@ TEST_CASE("directional shadow mapping darkens terrain")
 TEST_CASE("shadow map responds to light direction changes")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_light_intensity(1.0);
     render_set_shadow_enabled(true);
@@ -1500,8 +1673,6 @@ TEST_CASE("shadow map responds to light direction changes")
 TEST_CASE("shadow factor responds to sun orbit changes")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_light_direction({0.3, -1.0, 0.2});
     render_set_light_intensity(1.0);
@@ -1636,8 +1807,6 @@ TEST_CASE("light direction reads stay coherent under concurrent updates")
 TEST_CASE("shadow factor is not quantized to PCF steps")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_light_direction({0.3, -1.0, 0.2});
     render_set_light_intensity(1.0);
@@ -1711,8 +1880,6 @@ TEST_CASE("shadow factor is not quantized to PCF steps")
 TEST_CASE("moon light contributes when sun is disabled")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.1f);
     render_set_paused(true);
     render_set_light_direction({0.0, 1.0, 0.0});
     render_set_light_intensity(0.0);
@@ -1760,8 +1927,6 @@ TEST_CASE("moon light contributes when sun is disabled")
 TEST_CASE("phong shading varies within a terrain top face")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_light_intensity(0.0);
     render_set_sky_light_intensity(1.0);
@@ -1845,11 +2010,9 @@ TEST_CASE("phong shading varies within a terrain top face")
     REQUIRE((*minmax.second - *minmax.first) >= 8);
 }
 
-TEST_CASE("sky lighting varies across a terrain side face")
+TEST_CASE("sky lighting is consistent across a terrain side face")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_light_intensity(0.0);
     render_set_shadow_enabled(false);
@@ -1909,14 +2072,32 @@ TEST_CASE("sky lighting varies across a terrain side face")
     double bottom_lum = 0.0;
     REQUIRE(sample_average_luminance(framebuffer, width, height, top_x, top_y, sky_top, sky_bottom, top_lum));
     REQUIRE(sample_average_luminance(framebuffer, width, height, bottom_x, bottom_y, sky_top, sky_bottom, bottom_lum));
-    REQUIRE(std::abs(top_lum - bottom_lum) >= 12.0);
+    REQUIRE(std::abs(top_lum - bottom_lum) <= 6.0);
 }
 
-TEST_CASE("vertex ambient occlusion darkens terrain when enabled")
+TEST_CASE("normalized Blinn-Phong specular uses Schlick Fresnel")
+{
+    const double shininess = 24.0;
+    const double ndoth = 0.8;
+    const double ndotl = 0.75;
+    const double f0 = 0.2;
+
+    const double spec_normal = render_debug_eval_specular(ndoth, 1.0, ndotl, shininess, f0);
+    const double expected = ((shininess + 8.0) / (8.0 * kPi)) * std::pow(ndoth, shininess) * f0 * ndotl;
+    REQUIRE(spec_normal == Catch::Approx(expected).margin(1e-6));
+
+    const double spec_grazing = render_debug_eval_specular(ndoth, 0.2, ndotl, shininess, f0);
+    REQUIRE(spec_grazing > spec_normal);
+
+    const double spec_low_ndotl = render_debug_eval_specular(ndoth, 1.0, 0.2, shininess, f0);
+    REQUIRE(spec_low_ndotl < spec_normal);
+
+    REQUIRE(render_debug_eval_specular(ndoth, 0.2, ndotl, shininess, 0.0) == Catch::Approx(0.0).margin(1e-9));
+}
+
+TEST_CASE("sky visibility darkens terrain when enabled")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
-    render_set_rotation(0.0f);
     render_set_paused(true);
     render_set_light_intensity(0.0);
     render_set_sky_light_intensity(1.0);
@@ -1962,64 +2143,201 @@ TEST_CASE("vertex ambient occlusion darkens terrain when enabled")
     REQUIRE(avg_no - avg_with > 0.3);
 }
 
-TEST_CASE("side face AO responds to diagonal neighbor blocks")
+TEST_CASE("side face sky visibility responds to diagonal neighbor blocks")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
     render_set_paused(true);
 
     SideFaceAoProbe probe{};
     REQUIRE(find_right_face_diagonal_occluder(probe));
 
     constexpr int kFaceRight = 3;
-    float ao[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    REQUIRE(render_get_terrain_face_ao(probe.x, probe.height - 1, probe.z, kFaceRight, ao));
+    constexpr int kCornerTopFront = 3;
+    float visibility = 1.0f;
+    REQUIRE(render_get_terrain_vertex_sky_visibility(probe.x, probe.height - 1, probe.z,
+                                                     kFaceRight, kCornerTopFront, &visibility));
 
-    REQUIRE(ao[3] < 0.95f);
-    REQUIRE(ao[3] < ao[0]);
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+    const float expected = raycast_vertex_sky_visibility(heights, 16, probe.x, probe.height - 1, probe.z,
+                                                         kFaceRight, kCornerTopFront);
+
+    REQUIRE(visibility == Catch::Approx(expected).margin(0.02f));
     render_set_paused(false);
 }
 
-TEST_CASE("flat terrain corners do not self-occlude with ambient occlusion")
+TEST_CASE("side face sky visibility captures off-axis occluders")
+{
+    reset_camera();
+    render_set_paused(true);
+
+    SideFaceAoProbe probe{};
+    REQUIRE(find_right_face_diagonal_occluder(probe));
+
+    constexpr int kFaceRight = 3;
+    constexpr int kCornerTopFront = 3;
+    float visibility = 1.0f;
+    REQUIRE(render_get_terrain_vertex_sky_visibility(probe.x, probe.height - 1, probe.z,
+                                                     kFaceRight, kCornerTopFront, &visibility));
+    REQUIRE(visibility < 0.98f);
+
+    render_set_paused(false);
+}
+
+TEST_CASE("flat terrain top faces match sky visibility raycast")
 {
     reset_camera();
 
     FlatCornerProbe probe{};
     REQUIRE(find_flat_shared_corner(probe));
 
-    float ao[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    REQUIRE(render_get_terrain_top_ao(probe.x, probe.z, ao));
+    const int y = probe.height - 1;
+    float visibility = 1.0f;
+    const int corner = top_face_corner_from_offsets(probe.sx, probe.sz);
+    REQUIRE(render_get_terrain_vertex_sky_visibility(probe.x, y, probe.z, kFaceTop, corner, &visibility));
 
-    int corner_index = 0;
-    if (probe.sx == 1 && probe.sz == -1) corner_index = 1;
-    else if (probe.sx == 1 && probe.sz == 1) corner_index = 2;
-    else if (probe.sx == -1 && probe.sz == 1) corner_index = 3;
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+    const float expected = raycast_vertex_sky_visibility(heights, 16, probe.x, y, probe.z,
+                                                         kFaceTop, corner);
 
-    REQUIRE(ao[corner_index] == Catch::Approx(1.0f).margin(1e-4f));
+    REQUIRE(visibility == Catch::Approx(expected).margin(0.02f));
 }
 
-TEST_CASE("top face ambient occlusion varies beyond four discrete levels")
+TEST_CASE("vertex sky visibility varies within some top faces")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
+    render_set_paused(true);
+
+    constexpr int chunk_size = 16;
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+
+    bool found = false;
+    float visibility = 1.0f;
+    for (int z = 0; z < chunk_size && !found; ++z)
+    {
+        for (int x = 0; x < chunk_size && !found; ++x)
+        {
+            const int height = heights[static_cast<size_t>(z * chunk_size + x)];
+            const int y = height - 1;
+            if (y < 0)
+            {
+                continue;
+            }
+            float min_v = 1.0f;
+            float max_v = 0.0f;
+            for (int corner = 0; corner < 4; ++corner)
+            {
+                if (!render_get_terrain_vertex_sky_visibility(x, y, z, kFaceTop, corner, &visibility))
+                {
+                    min_v = 1.0f;
+                    max_v = 0.0f;
+                    break;
+                }
+                min_v = std::min(min_v, visibility);
+                max_v = std::max(max_v, visibility);
+            }
+            if (max_v - min_v > 0.02f)
+            {
+                found = true;
+            }
+        }
+    }
+
+    render_set_paused(false);
+
+    REQUIRE(found);
+}
+
+TEST_CASE("top face sky visibility varies beyond four discrete levels")
+{
+    reset_camera();
     render_set_paused(true);
 
     constexpr int chunk_size = 16;
     std::unordered_set<int> buckets;
-    float ao[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+    float visibility = 1.0f;
 
     for (int z = 0; z < chunk_size; ++z)
     {
         for (int x = 0; x < chunk_size; ++x)
         {
-            if (!render_get_terrain_top_ao(x, z, ao))
+            const int height = heights[static_cast<size_t>(z * chunk_size + x)];
+            const int y = height - 1;
+            for (int corner = 0; corner < 4; ++corner)
             {
-                continue;
-            }
-            for (float value : ao)
-            {
-                const int bucket = static_cast<int>(std::lround(value * 1000.0f));
+                if (!render_get_terrain_vertex_sky_visibility(x, y, z, kFaceTop, corner, &visibility))
+                {
+                    continue;
+                }
+                const int bucket = static_cast<int>(std::lround(visibility * 1000.0f));
                 buckets.insert(bucket);
+            }
+        }
+    }
+
+    render_set_paused(false);
+
+    REQUIRE(buckets.size() > 4);
+}
+
+TEST_CASE("side face sky visibility varies beyond four discrete levels")
+{
+    reset_camera();
+    render_set_paused(true);
+
+    constexpr int chunk_size = 16;
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+    const int max_height = *std::max_element(heights.begin(), heights.end());
+
+    std::unordered_set<int> buckets;
+    float visibility = 1.0f;
+    constexpr int kFaceRight = 3;
+    constexpr int kFaceFront = 5;
+
+    for (int z = 0; z < chunk_size; ++z)
+    {
+        for (int x = 0; x < chunk_size; ++x)
+        {
+            for (int y = 0; y < max_height; ++y)
+            {
+                if (!render_get_terrain_vertex_sky_visibility(x, y, z, kFaceRight, 0, &visibility))
+                {
+                    break;
+                }
+                const int bucket_right0 = static_cast<int>(std::lround(visibility * 1000.0f));
+                buckets.insert(bucket_right0);
+                for (int corner = 1; corner < 4; ++corner)
+                {
+                    if (render_get_terrain_vertex_sky_visibility(x, y, z, kFaceRight, corner, &visibility))
+                    {
+                        const int bucket_right = static_cast<int>(std::lround(visibility * 1000.0f));
+                        buckets.insert(bucket_right);
+                    }
+                }
+                if (!render_get_terrain_vertex_sky_visibility(x, y, z, kFaceFront, 0, &visibility))
+                {
+                    break;
+                }
+                const int bucket_front0 = static_cast<int>(std::lround(visibility * 1000.0f));
+                buckets.insert(bucket_front0);
+                for (int corner = 1; corner < 4; ++corner)
+                {
+                    if (render_get_terrain_vertex_sky_visibility(x, y, z, kFaceFront, corner, &visibility))
+                    {
+                        const int bucket_front = static_cast<int>(std::lround(visibility * 1000.0f));
+                        buckets.insert(bucket_front);
+                    }
+                }
             }
         }
     }
@@ -2073,7 +2391,6 @@ TEST_CASE("camera movement in world and local space")
 TEST_CASE("camera movement blocks entry into terrain")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
     render_set_paused(true);
 
     std::vector<int> heights;
@@ -2114,7 +2431,6 @@ TEST_CASE("camera movement blocks entry into terrain")
 TEST_CASE("camera forward movement does not climb when blocked by top face")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
     render_set_paused(true);
 
     std::vector<int> heights;
@@ -2183,10 +2499,9 @@ TEST_CASE("render_project_point returns NaN for points behind camera")
     REQUIRE(std::isnan(projected.y));
 }
 
-TEST_CASE("shadow cache ignores rotation when mesh does not rotate")
+TEST_CASE("shadow cache reuses when lighting is unchanged")
 {
     reset_camera();
-    render_set_scene(RenderScene::CubeOnly);
     render_set_sun_orbit_enabled(false);
     render_set_light_direction({0.4, -0.6, 0.7});
     render_set_light_intensity(1.0);
@@ -2199,12 +2514,10 @@ TEST_CASE("shadow cache ignores rotation when mesh does not rotate")
     const size_t height = 48;
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    render_set_rotation(0.1f);
     render_update_array(framebuffer.data(), width, height);
     const uint64_t first = render_debug_get_sun_shadow_build_count();
     REQUIRE(first >= 1);
 
-    render_set_rotation(1.2f);
     render_update_array(framebuffer.data(), width, height);
     const uint64_t second = render_debug_get_sun_shadow_build_count();
 
