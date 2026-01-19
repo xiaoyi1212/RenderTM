@@ -58,6 +58,7 @@ double render_debug_eval_specular(double ndoth, double vdoth, double ndotl,
 Vec3 render_debug_tonemap_reinhard(Vec3 color, double exposure);
 void render_debug_reset_shadow_build_counts();
 uint64_t render_debug_get_sun_shadow_build_count();
+size_t render_debug_get_shadow_triangle_count();
 size_t render_debug_get_terrain_block_count();
 size_t render_debug_get_terrain_visible_face_count();
 size_t render_debug_get_terrain_triangle_count();

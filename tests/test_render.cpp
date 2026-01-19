@@ -1877,6 +1877,45 @@ TEST_CASE("shadow factor is not quantized to PCF steps")
     REQUIRE(saw_continuous);
 }
 
+TEST_CASE("shadow map uses terrain mesh triangles")
+{
+    reset_camera();
+    render_set_paused(true);
+    render_set_sun_orbit_enabled(false);
+    render_set_light_direction({0.5, -1.0, 0.3});
+    render_set_light_intensity(1.0);
+    render_set_moon_intensity(0.0);
+    render_set_shadow_enabled(true);
+
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+
+    const int chunk_size = 16;
+    const double block_size = 2.0;
+    const double start_x = -(chunk_size - 1) * block_size * 0.5;
+    const double start_z = 4.0;
+    const double base_y = 2.0;
+
+    const int height = heights[0];
+    const double center_y = base_y - (height - 1) * block_size;
+    const double top_y = center_y - block_size * 0.5;
+    const Vec3 world{
+        start_x,
+        top_y,
+        start_z
+    };
+    float factor = 1.0f;
+    REQUIRE(render_get_shadow_factor_at_point(world, {0.0, -1.0, 0.0}, &factor));
+
+    const size_t shadow_triangles = render_debug_get_shadow_triangle_count();
+    const size_t terrain_triangles = render_debug_get_terrain_triangle_count();
+
+    render_set_paused(false);
+
+    REQUIRE(shadow_triangles == terrain_triangles);
+}
+
 TEST_CASE("moon light contributes when sun is disabled")
 {
     reset_camera();

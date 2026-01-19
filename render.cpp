@@ -107,6 +107,7 @@ static std::atomic<double> camera_pitch{-0.6003932626860493};
 static std::atomic<bool> ambientOcclusionEnabled{true};
 static std::atomic<bool> shadowEnabled{true};
 static std::atomic<uint64_t> sunShadowBuilds{0};
+static std::atomic<size_t> shadowTriangleCount{0};
 
 static Vec3 load_light_direction()
 {
@@ -1439,13 +1440,13 @@ static float compute_shadow_factor(const ShadowMap* shadow, const Vec3& light_di
 }
 
 static bool build_shadow_map(ShadowMap& shadow, const Vec3& light_dir,
-                             const std::vector<VoxelBlock>& blocks,
-                             const Mesh& base_mesh)
+                             const std::vector<RenderQuad>& quads)
 {
     const Vec3 forward = normalize_vec(light_dir);
     if (forward.x == 0.0 && forward.y == 0.0 && forward.z == 0.0)
     {
         shadow.valid = false;
+        shadowTriangleCount.store(0u, std::memory_order_relaxed);
         return false;
     }
 
@@ -1461,24 +1462,21 @@ static bool build_shadow_map(ShadowMap& shadow, const Vec3& light_dir,
     float max_y = std::numeric_limits<float>::lowest();
     bool has_bounds = false;
 
-    const size_t block_count = blocks.size();
-    const size_t vertex_count = base_mesh.vertexCount;
+    const size_t quad_count = quads.size();
+    constexpr size_t kQuadVertexCount = 4;
     thread_local std::vector<ScreenVertex> light_vertices;
-    if (light_vertices.size() != block_count * vertex_count)
+    if (light_vertices.size() != quad_count * kQuadVertexCount)
     {
-        light_vertices.resize(block_count * vertex_count);
+        light_vertices.resize(quad_count * kQuadVertexCount);
     }
 
-    for (size_t b = 0; b < block_count; ++b)
+    for (size_t q = 0; q < quad_count; ++q)
     {
-        const auto& block = blocks[b];
-        const size_t base = b * vertex_count;
-        for (size_t i = 0; i < vertex_count; ++i)
+        const RenderQuad& quad = quads[q];
+        const size_t base = q * kQuadVertexCount;
+        for (size_t i = 0; i < kQuadVertexCount; ++i)
         {
-            Vec3 v = base_mesh.vertices[i];
-            v.x += block.position.x;
-            v.y += block.position.y;
-            v.z += block.position.z;
+            const Vec3& v = quad.v[i];
             const float lx = static_cast<float>(dot_vec(v, right));
             const float ly = static_cast<float>(dot_vec(v, up));
             const float lz = static_cast<float>(dot_vec(v, forward));
@@ -1494,6 +1492,7 @@ static bool build_shadow_map(ShadowMap& shadow, const Vec3& light_dir,
     if (!has_bounds)
     {
         shadow.valid = false;
+        shadowTriangleCount.store(0u, std::memory_order_relaxed);
         return false;
     }
 
@@ -1535,6 +1534,7 @@ static bool build_shadow_map(ShadowMap& shadow, const Vec3& light_dir,
     shadow.resolution = kShadowMapResolution;
     shadow.depth_min = std::numeric_limits<float>::lowest();
     shadow.valid = true;
+    shadowTriangleCount.store(quad_count * 2u, std::memory_order_relaxed);
 
     const size_t map_size = kShadowMapResolution * kShadowMapResolution;
     if (shadow.depth.size() != map_size)
@@ -1546,37 +1546,37 @@ static bool build_shadow_map(ShadowMap& shadow, const Vec3& light_dir,
         std::fill(shadow.depth.begin(), shadow.depth.end(), shadow.depth_min);
     }
 
-    for (size_t b = 0; b < block_count; ++b)
+    for (size_t q = 0; q < quad_count; ++q)
     {
-        const size_t base = b * vertex_count;
-        for (size_t t = 0; t < base_mesh.triangleCount; ++t)
-        {
-            const int i0 = base_mesh.triangles[t][0];
-            const int i1 = base_mesh.triangles[t][1];
-            const int i2 = base_mesh.triangles[t][2];
+        const size_t base = q * kQuadVertexCount;
+        const ScreenVertex& a = light_vertices[base];
+        const ScreenVertex& bvert = light_vertices[base + 1];
+        const ScreenVertex& cpos = light_vertices[base + 2];
+        const ScreenVertex& dpos = light_vertices[base + 3];
 
-            const ScreenVertex& a = light_vertices[base + static_cast<size_t>(i0)];
-            const ScreenVertex& bvert = light_vertices[base + static_cast<size_t>(i1)];
-            const ScreenVertex& cpos = light_vertices[base + static_cast<size_t>(i2)];
+        const ScreenVertex sv0{
+            (a.x - min_x) * shadow.scale_x,
+            (a.y - min_y) * shadow.scale_y,
+            a.z
+        };
+        const ScreenVertex sv1{
+            (bvert.x - min_x) * shadow.scale_x,
+            (bvert.y - min_y) * shadow.scale_y,
+            bvert.z
+        };
+        const ScreenVertex sv2{
+            (cpos.x - min_x) * shadow.scale_x,
+            (cpos.y - min_y) * shadow.scale_y,
+            cpos.z
+        };
+        const ScreenVertex sv3{
+            (dpos.x - min_x) * shadow.scale_x,
+            (dpos.y - min_y) * shadow.scale_y,
+            dpos.z
+        };
 
-            const ScreenVertex sv0{
-                (a.x - min_x) * shadow.scale_x,
-                (a.y - min_y) * shadow.scale_y,
-                a.z
-            };
-            const ScreenVertex sv1{
-                (bvert.x - min_x) * shadow.scale_x,
-                (bvert.y - min_y) * shadow.scale_y,
-                bvert.z
-            };
-            const ScreenVertex sv2{
-                (cpos.x - min_x) * shadow.scale_x,
-                (cpos.y - min_y) * shadow.scale_y,
-                cpos.z
-            };
-
-            rasterize_shadow_triangle(shadow.depth, shadow.resolution, sv0, sv1, sv2);
-        }
+        rasterize_shadow_triangle(shadow.depth, shadow.resolution, sv0, sv1, sv2);
+        rasterize_shadow_triangle(shadow.depth, shadow.resolution, sv0, sv2, sv3);
     }
 
     return true;
@@ -1730,14 +1730,6 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     const double mat_diffuse = 1.0;
     const Material cube_material{0xFFFFFFFF, mat_ambient, mat_diffuse, 0.15, 24.0};
 
-    const Mesh cubeMesh{
-        cubeVertices,
-        8,
-        cubeTriangles,
-        12,
-        {0.0, 0.0, 0.0}
-    };
-
     generate_terrain_chunk();
 
     const bool sun_orbit = sunOrbitEnabled.load(std::memory_order_relaxed);
@@ -1794,7 +1786,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         if (needs_rebuild)
         {
             sunShadowBuilds.fetch_add(1u, std::memory_order_relaxed);
-            sun_shadow_valid = build_shadow_map(sun_shadow, sun_dir, terrainBlocks, cubeMesh);
+            sun_shadow_valid = build_shadow_map(sun_shadow, sun_dir, terrainQuads);
             sun_shadow_cache.valid = sun_shadow_valid;
             if (sun_shadow_valid)
             {
@@ -1811,7 +1803,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         const bool needs_rebuild = !moon_shadow.valid || !shadow_cache_matches(moon_shadow_cache, moon_dir);
         if (needs_rebuild)
         {
-            moon_shadow_valid = build_shadow_map(moon_shadow, moon_dir, terrainBlocks, cubeMesh);
+            moon_shadow_valid = build_shadow_map(moon_shadow, moon_dir, terrainQuads);
             moon_shadow_cache.valid = moon_shadow_valid;
             if (moon_shadow_valid)
             {
@@ -2232,17 +2224,10 @@ bool render_get_shadow_factor_at_point(const Vec3 world, const Vec3 normal, floa
 
     static ShadowMap shadow;
     static ShadowCacheState shadow_cache;
-    const Mesh cubeMesh{
-        cubeVertices,
-        8,
-        cubeTriangles,
-        12,
-        {0.0, 0.0, 0.0}
-    };
     const bool needs_rebuild = !shadow.valid || !shadow_cache_matches(shadow_cache, light_dir);
     if (needs_rebuild)
     {
-        if (!build_shadow_map(shadow, light_dir, terrainBlocks, cubeMesh))
+        if (!build_shadow_map(shadow, light_dir, terrainQuads))
         {
             shadow_cache.valid = false;
             *out_factor = 1.0f;
@@ -2453,11 +2438,17 @@ Vec2 render_project_point(const Vec3 world, const size_t width, const size_t hei
 void render_debug_reset_shadow_build_counts()
 {
     sunShadowBuilds.store(0u, std::memory_order_relaxed);
+    shadowTriangleCount.store(0u, std::memory_order_relaxed);
 }
 
 uint64_t render_debug_get_sun_shadow_build_count()
 {
     return sunShadowBuilds.load(std::memory_order_relaxed);
+}
+
+size_t render_debug_get_shadow_triangle_count()
+{
+    return shadowTriangleCount.load(std::memory_order_relaxed);
 }
 
 size_t render_debug_get_terrain_block_count()
