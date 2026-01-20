@@ -1,4 +1,5 @@
 #include "render.h"
+#include "blue_noise.h"
 #include "cmath"
 #include "cstring"
 #include <algorithm>
@@ -72,6 +73,7 @@ static Vec3 face_normal_world(const int face)
 }
 
 static std::atomic<bool> rotationPaused{false};
+static std::atomic<uint32_t> renderFrameIndex{0};
 static std::atomic<double> lightDirectionX{0.0};
 static std::atomic<double> lightDirectionY{0.0};
 static std::atomic<double> lightDirectionZ{-1.0};
@@ -90,6 +92,9 @@ static std::atomic<uint32_t> skyBottomColor{0xFF172433};
 static std::atomic<double> skyLightIntensity{0.32};
 static std::atomic<double> ambientLight{0.13};
 static std::atomic<double> exposure{1.0};
+static std::atomic<bool> taaEnabled{true};
+static std::atomic<double> taaBlend{0.2};
+static std::atomic<uint64_t> renderStateVersion{1};
 static std::atomic<double> camera_x{16.0};
 static std::atomic<double> camera_y{-19.72};
 static std::atomic<double> camera_z{-1.93};
@@ -97,6 +102,11 @@ static std::atomic<double> camera_yaw{-0.6911503837897546};
 static std::atomic<double> camera_pitch{-0.6003932626860493};
 static std::atomic<bool> ambientOcclusionEnabled{true};
 static std::atomic<bool> shadowEnabled{true};
+
+static void mark_render_state_dirty()
+{
+    renderStateVersion.fetch_add(1u, std::memory_order_relaxed);
+}
 
 static Vec3 load_light_direction()
 {
@@ -214,15 +224,18 @@ struct ShadingContext
         Vec3 dir;
         double intensity;
         ColorRGB color;
+        double angular_radius;
     };
     std::array<DirectionalLightInfo, 2> lights;
 };
 
-constexpr int kMsaaSamples = 2;
 constexpr double kShadowRayBias = 0.05;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kSunLatitudeDeg = 30.0;
 constexpr double kSunLatitudeRad = kPi * kSunLatitudeDeg / 180.0;
+constexpr double kSunDiskRadius = 0.03;
+constexpr int kSunShadowSalt = 17;
+constexpr int kMoonShadowSalt = 19;
 constexpr uint32_t kSkySunriseTopColor = 0xFFB55A1A;
 constexpr uint32_t kSkySunriseBottomColor = 0xFF4A200A;
 constexpr double kHemisphereBounceStrength = 0.35;
@@ -242,12 +255,29 @@ constexpr double kSkyRayStep = 0.25;
 constexpr double kSkyRayMaxDistance = 6.0;
 constexpr double kSkyRayBias = 0.02;
 constexpr double kSkyRayCenterBias = 0.02;
+constexpr int kTaaJitterSalt = 37;
+constexpr float kShadowFilterDepthSigma = 0.6f;
+constexpr float kShadowFilterNormalSigma = 0.35f;
+constexpr float kShadowGaussianWeights[9] = {
+    1.0f, 2.0f, 1.0f,
+    2.0f, 4.0f, 2.0f,
+    1.0f, 2.0f, 1.0f
+};
 
 static Vec3 normalize_vec(const Vec3& v);
 static float compute_shadow_factor(const Vec3& light_dir, const Vec3& world, const Vec3& normal);
 static bool triangle_in_front_of_near_plane(double z0, double z1, double z2);
 static void build_terrain_mesh();
 static void build_light_basis(const Vec3& light_dir, Vec3& right, Vec3& up, Vec3& forward);
+static Vec3 jitter_shadow_direction(const Vec3& light_dir, 
+                                    const Vec3& right_scaled,
+                                    const Vec3& up_scaled,
+                                    const int px, const int py,
+                                    const uint32_t frame, const int salt);
+static float shadow_filter_3x3_at(const float* mask, const float* depth, const Vec3* normals,
+                                  size_t width, size_t height, int x, int y, float depth_max);
+static void filter_shadow_mask_3x3(const float* mask, float* out_mask, const float* depth,
+                                   const Vec3* normals, size_t width, size_t height, float depth_max);
 static Vec3 add_vec(const Vec3& a, const Vec3& b);
 static double dot_vec(const Vec3& a, const Vec3& b);
 static Vec3 cross_vec(const Vec3& a, const Vec3& b);
@@ -427,6 +457,24 @@ static const std::array<Vec3, kSkyRayCount>& sky_sample_dirs()
         return samples;
     }();
     return dirs;
+}
+
+static const std::array<Vec2, 64>& disk_sample_points()
+{
+    static const std::array<Vec2, 64> samples = [] {
+        std::array<Vec2, 64> points{};
+        constexpr double golden_angle = 2.39996322972865332;
+        const double count_inv = 1.0 / static_cast<double>(points.size());
+        for (size_t i = 0; i < points.size(); ++i)
+        {
+            const double u = (static_cast<double>(i) + 0.5) * count_inv;
+            const double r = std::sqrt(u);
+            const double theta = static_cast<double>(i) * golden_angle;
+            points[i] = {r * std::cos(theta), r * std::sin(theta)};
+        }
+        return points;
+    }();
+    return samples;
 }
 
 static float compute_vertex_sky_visibility(const int gx, const int gy, const int gz,
@@ -758,6 +806,16 @@ static ColorRGB lerp_color(const ColorRGB& a, const ColorRGB& b, float t)
     };
 }
 
+static ColorRGB scale_color(const ColorRGB& color, float scale)
+{
+    return {color.r * scale, color.g * scale, color.b * scale};
+}
+
+static ColorRGB add_color(const ColorRGB& a, const ColorRGB& b)
+{
+    return {a.r + b.r, a.g + b.g, a.b + b.b};
+}
+
 static ColorRGB compute_hemisphere_ground(const ColorRGB& base_ground,
                                           const std::array<ShadingContext::DirectionalLightInfo, 2>& lights)
 {
@@ -1078,19 +1136,19 @@ static inline float edge_function(const ScreenVertex& a, const ScreenVertex& b, 
     return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
 }
 
-static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* sample_direct,
-                                 size_t width, size_t height,
+static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
+                                 ColorRGB* sample_direct_sun, ColorRGB* sample_direct_moon,
+                                 float* shadow_mask_sun, float* shadow_mask_moon,
+                                 Vec3* sample_normals, size_t width, size_t height,
                                  const ScreenVertex& v0, const ScreenVertex& v1, const ScreenVertex& v2,
                                  const Vec3& wp0, const Vec3& wp1, const Vec3& wp2,
                                  const Vec3& n0, const Vec3& n1, const Vec3& n2,
                                  const float vis0, const float vis1, const float vis2,
-                                 const ShadingContext& ctx)
+                                 const ShadingContext& ctx, const uint32_t frame_index,
+                                 const float jitter_x, const float jitter_y,
+                                 const std::array<Vec3, 2>& lights_right_scaled,
+                                 const std::array<Vec3, 2>& lights_up_scaled)
 {
-    static constexpr float sample_offsets[kMsaaSamples][2] = {
-        {0.25f, 0.75f},
-        {0.75f, 0.25f}
-    };
-
     float min_x = std::min({v0.x, v1.x, v2.x});
     float max_x = std::max({v0.x, v1.x, v2.x});
     float min_y = std::min({v0.y, v1.y, v2.y});
@@ -1113,136 +1171,144 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient, Color
     {
         for (int x = x0; x <= x1; ++x)
         {
-            for (int s = 0; s < kMsaaSamples; ++s)
+            ScreenVertex p{
+                static_cast<float>(x) + 0.5f + jitter_x,
+                static_cast<float>(y) + 0.5f + jitter_y,
+                0.0f
+            };
+            float w0 = edge_function(v1, v2, p);
+            float w1 = edge_function(v2, v0, p);
+            float w2 = edge_function(v0, v1, p);
+
+            if ((w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f && area_positive) ||
+                (w0 <= 0.0f && w1 <= 0.0f && w2 <= 0.0f && !area_positive))
             {
-                ScreenVertex p{
-                    static_cast<float>(x) + sample_offsets[s][0],
-                    static_cast<float>(y) + sample_offsets[s][1],
-                    0.0f
-                };
-                float w0 = edge_function(v1, v2, p);
-                float w1 = edge_function(v2, v0, p);
-                float w2 = edge_function(v0, v1, p);
-
-                if ((w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f && area_positive) ||
-                    (w0 <= 0.0f && w1 <= 0.0f && w2 <= 0.0f && !area_positive))
+                w0 /= area;
+                w1 /= area;
+                w2 /= area;
+                const float inv_z = w0 * inv_z0 + w1 * inv_z1 + w2 * inv_z2;
+                if (inv_z <= 0.0f)
                 {
-                    w0 /= area;
-                    w1 /= area;
-                    w2 /= area;
-                    const float inv_z = w0 * inv_z0 + w1 * inv_z1 + w2 * inv_z2;
-                    if (inv_z <= 0.0f)
+                    continue;
+                }
+                const float depth = 1.0f / inv_z;
+                const size_t idx = static_cast<size_t>(y) * width + static_cast<size_t>(x);
+                if (depth < zbuffer[idx])
+                {
+                    zbuffer[idx] = depth;
+                    const float w0p = w0 * inv_z0 / inv_z;
+                    const float w1p = w1 * inv_z1 / inv_z;
+                    const float w2p = w2 * inv_z2 / inv_z;
+                    const float visibility = ctx.ambient_occlusion_enabled
+                                                 ? std::clamp(w0p * vis0 + w1p * vis1 + w2p * vis2, 0.0f, 1.0f)
+                                                 : 1.0f;
+                    Vec3 normal{
+                        w0p * n0.x + w1p * n1.x + w2p * n2.x,
+                        w0p * n0.y + w1p * n1.y + w2p * n2.y,
+                        w0p * n0.z + w1p * n1.z + w2p * n2.z
+                    };
+                    normal = normalize_vec(normal);
+
+                    Vec3 world{
+                        w0p * wp0.x + w1p * wp1.x + w2p * wp2.x,
+                        w0p * wp0.y + w1p * wp1.y + w2p * wp2.y,
+                        w0p * wp0.z + w1p * wp1.z + w2p * wp2.z
+                    };
+
+                    const double ambient = ctx.direct_lighting_enabled ? ctx.ambient_light * ctx.material.ambient : 0.0;
+                    ColorRGB ambient_color{
+                        static_cast<float>(ctx.albedo.r * ambient),
+                        static_cast<float>(ctx.albedo.g * ambient),
+                        static_cast<float>(ctx.albedo.b * ambient)
+                    };
+                    if (ctx.sky_scale > 0.0f)
                     {
-                        continue;
+                        float sky_t = static_cast<float>((-normal.y) * 0.5 + 0.5);
+                        sky_t = std::clamp(sky_t, 0.0f, 1.0f);
+                        const ColorRGB sky = lerp_color(ctx.hemi_ground, ctx.sky_top, sky_t);
+                        ambient_color.r = sky.r * ctx.sky_scale * ctx.albedo.r;
+                        ambient_color.g = sky.g * ctx.sky_scale * ctx.albedo.g;
+                        ambient_color.b = sky.b * ctx.sky_scale * ctx.albedo.b;
                     }
-                    const float depth = 1.0f / inv_z;
-                    const size_t base = (static_cast<size_t>(y) * width + static_cast<size_t>(x)) * kMsaaSamples;
-                    const size_t idx = base + static_cast<size_t>(s);
-                    if (depth < zbuffer[idx])
+                    ambient_color.r *= visibility;
+                    ambient_color.g *= visibility;
+                    ambient_color.b *= visibility;
+
+                    ColorRGB direct_sun{0.0f, 0.0f, 0.0f};
+                    ColorRGB direct_moon{0.0f, 0.0f, 0.0f};
+                    float shadow_sun = 1.0f;
+                    float shadow_moon = 1.0f;
+                    if (ctx.direct_lighting_enabled)
                     {
-                        zbuffer[idx] = depth;
-                        const float w0p = w0 * inv_z0 / inv_z;
-                        const float w1p = w1 * inv_z1 / inv_z;
-                        const float w2p = w2 * inv_z2 / inv_z;
-                        const float visibility = ctx.ambient_occlusion_enabled
-                                                     ? std::clamp(w0p * vis0 + w1p * vis1 + w2p * vis2, 0.0f, 1.0f)
-                                                     : 1.0f;
-                        Vec3 normal{
-                            w0p * n0.x + w1p * n1.x + w2p * n2.x,
-                            w0p * n0.y + w1p * n1.y + w2p * n2.y,
-                            w0p * n0.z + w1p * n1.z + w2p * n2.z
+                        const Vec3 view_vec{
+                            ctx.camera_pos.x - world.x,
+                            ctx.camera_pos.y - world.y,
+                            ctx.camera_pos.z - world.z
                         };
-                        normal = normalize_vec(normal);
+                        const Vec3 view_dir = normalize_vec(view_vec);
 
-                        Vec3 world{
-                            w0p * wp0.x + w1p * wp1.x + w2p * wp2.x,
-                            w0p * wp0.y + w1p * wp1.y + w2p * wp2.y,
-                            w0p * wp0.z + w1p * wp1.z + w2p * wp2.z
-                        };
+                        auto eval_light = [&](const ShadingContext::DirectionalLightInfo& light,
+                                              const int light_idx, const int shadow_salt,
+                                              ColorRGB& out_direct, float& out_shadow) {
+                            out_direct = {0.0f, 0.0f, 0.0f};
+                            out_shadow = 1.0f;
+                            if (light.intensity <= 0.0)
+                            {
+                                return;
+                            }
+                            const double ndotl = std::max(0.0, dot_vec(normal, light.dir));
+                            if (ndotl <= 0.0)
+                            {
+                                return;
+                            }
+                            if (ctx.shadows_enabled)
+                            {
+                                const Vec3 shadow_dir = jitter_shadow_direction(light.dir,
+                                                        lights_right_scaled[light_idx],
+                                                        lights_up_scaled[light_idx],
+                                                        x, y, frame_index,
+                                                        shadow_salt);
+                                out_shadow = compute_shadow_factor(shadow_dir, world, normal);
+                            }
 
-                        const double ambient = ctx.direct_lighting_enabled ? ctx.ambient_light * ctx.material.ambient : 0.0;
-                        ColorRGB ambient_color{
-                            static_cast<float>(ctx.albedo.r * ambient),
-                            static_cast<float>(ctx.albedo.g * ambient),
-                            static_cast<float>(ctx.albedo.b * ambient)
-                        };
-                        if (ctx.sky_scale > 0.0f)
-                        {
-                            float sky_t = static_cast<float>((-normal.y) * 0.5 + 0.5);
-                            sky_t = std::clamp(sky_t, 0.0f, 1.0f);
-                            const ColorRGB sky = lerp_color(ctx.hemi_ground, ctx.sky_top, sky_t);
-                            ambient_color.r = sky.r * ctx.sky_scale * ctx.albedo.r;
-                            ambient_color.g = sky.g * ctx.sky_scale * ctx.albedo.g;
-                            ambient_color.b = sky.b * ctx.sky_scale * ctx.albedo.b;
-                        }
-                        ambient_color.r *= visibility;
-                        ambient_color.g *= visibility;
-                        ambient_color.b *= visibility;
-
-                        ColorRGB direct_color{0.0f, 0.0f, 0.0f};
-                        if (ctx.direct_lighting_enabled)
-                        {
-                            const Vec3 view_vec{
-                                ctx.camera_pos.x - world.x,
-                                ctx.camera_pos.y - world.y,
-                                ctx.camera_pos.z - world.z
+                            const Vec3 half_vec = normalize_vec(add_vec(light.dir, view_dir));
+                            const double f0 = std::clamp(ctx.material.specular, 0.0, 1.0);
+                            const double vdoth = std::max(0.0, dot_vec(view_dir, half_vec));
+                            const double fresnel = schlick_fresnel(vdoth, f0);
+                            const double diffuse_scale = std::clamp(1.0 - fresnel, 0.0, 1.0);
+                            const double diffuse = ndotl * light.intensity * ctx.material.diffuse * diffuse_scale;
+                            ColorRGB light_color{
+                                static_cast<float>(ctx.albedo.r * diffuse),
+                                static_cast<float>(ctx.albedo.g * diffuse),
+                                static_cast<float>(ctx.albedo.b * diffuse)
                             };
-                            const Vec3 view_dir = normalize_vec(view_vec);
+                            light_color.r *= light.color.r;
+                            light_color.g *= light.color.g;
+                            light_color.b *= light.color.b;
+                            if (f0 > 0.0)
+                            {
+                                const double spec_dot = std::max(0.0, dot_vec(normal, half_vec));
+                                double spec = eval_specular_term(spec_dot, vdoth, ndotl,
+                                                                 ctx.material.shininess, f0);
+                                spec *= light.intensity;
+                                spec = std::clamp(spec, 0.0, 1.0);
+                                light_color.r += light.color.r * static_cast<float>(spec);
+                                light_color.g += light.color.g * static_cast<float>(spec);
+                                light_color.b += light.color.b * static_cast<float>(spec);
+                            }
+                            out_direct = light_color;
+                        };
 
-                            auto add_light = [&](const ShadingContext::DirectionalLightInfo& light) {
-                                if (light.intensity <= 0.0)
-                                {
-                                    return;
-                                }
-                                const double ndotl = std::max(0.0, dot_vec(normal, light.dir));
-                                if (ndotl <= 0.0)
-                                {
-                                    return;
-                                }
-                                float shadow_factor = 1.0f;
-                                if (ctx.shadows_enabled)
-                                {
-                                    shadow_factor = compute_shadow_factor(light.dir, world, normal);
-                                }
-
-                                const Vec3 half_vec = normalize_vec(add_vec(light.dir, view_dir));
-                                const double f0 = std::clamp(ctx.material.specular, 0.0, 1.0);
-                                const double vdoth = std::max(0.0, dot_vec(view_dir, half_vec));
-                                const double fresnel = schlick_fresnel(vdoth, f0);
-                                const double diffuse_scale = std::clamp(1.0 - fresnel, 0.0, 1.0);
-                                const double diffuse = ndotl * light.intensity * ctx.material.diffuse *
-                                                       shadow_factor * diffuse_scale;
-                                ColorRGB light_color{
-                                    static_cast<float>(ctx.albedo.r * diffuse),
-                                    static_cast<float>(ctx.albedo.g * diffuse),
-                                    static_cast<float>(ctx.albedo.b * diffuse)
-                                };
-                                light_color.r *= light.color.r;
-                                light_color.g *= light.color.g;
-                                light_color.b *= light.color.b;
-                                if (f0 > 0.0)
-                                {
-                                    const double spec_dot = std::max(0.0, dot_vec(normal, half_vec));
-                                    double spec = eval_specular_term(spec_dot, vdoth, ndotl,
-                                                                     ctx.material.shininess, f0);
-                                    spec *= light.intensity * shadow_factor;
-                                    spec = std::clamp(spec, 0.0, 1.0);
-                                    light_color.r += light.color.r * static_cast<float>(spec);
-                                    light_color.g += light.color.g * static_cast<float>(spec);
-                                    light_color.b += light.color.b * static_cast<float>(spec);
-                                }
-                                direct_color.r += light_color.r;
-                                direct_color.g += light_color.g;
-                                direct_color.b += light_color.b;
-                            };
-
-                            add_light(ctx.lights[0]);
-                            add_light(ctx.lights[1]);
-                        }
-
-                        sample_ambient[idx] = ambient_color;
-                        sample_direct[idx] = direct_color;
+                        eval_light(ctx.lights[0], 0, kSunShadowSalt, direct_sun, shadow_sun);
+                        eval_light(ctx.lights[1], 1, kMoonShadowSalt, direct_moon, shadow_moon);
                     }
+
+                    sample_ambient[idx] = ambient_color;
+                    sample_direct_sun[idx] = direct_sun;
+                    sample_direct_moon[idx] = direct_moon;
+                    shadow_mask_sun[idx] = shadow_sun;
+                    shadow_mask_moon[idx] = shadow_moon;
+                    sample_normals[idx] = normal;
                 }
             }
         }
@@ -1259,6 +1325,33 @@ static void build_light_basis(const Vec3& light_dir, Vec3& right, Vec3& up, Vec3
     }
     right = normalize_vec(cross_vec(up_guess, forward));
     up = cross_vec(forward, right);
+}
+
+static Vec3 jitter_shadow_direction(const Vec3& light_dir, 
+                                    const Vec3& right_scaled,
+                                    const Vec3& up_scaled,
+                                    const int px, const int py,
+                                    const uint32_t frame, const int salt)
+{
+    if (right_scaled.x == 0.0 && right_scaled.y == 0.0 && right_scaled.z == 0.0)
+    {
+        return light_dir;
+    }
+
+    const float u1 = sample_noise(px, py, static_cast<int>(frame), salt);
+    const float u2 = sample_noise(px, py, static_cast<int>(frame), salt + 1);
+    const int ix = static_cast<int>(u1 * 8.0f);
+    const int iy = static_cast<int>(u2 * 8.0f);
+    const size_t idx = static_cast<size_t>((iy & 7) * 8 + (ix & 7));
+    const Vec2 sample = disk_sample_points()[idx];
+    const double dx = sample.x;
+    const double dy = sample.y;
+
+    return Vec3{
+        light_dir.x + right_scaled.x * dx + up_scaled.x * dy,
+        light_dir.y + right_scaled.y * dx + up_scaled.y * dy,
+        light_dir.z + right_scaled.z * dx + up_scaled.z * dy
+    };
 }
 
 static bool shadow_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec3& light_dir)
@@ -1377,10 +1470,105 @@ static float compute_shadow_factor(const Vec3& light_dir, const Vec3& world, con
     return shadow_raymarch_hit(world, normal, light_dir) ? 0.0f : 1.0f;
 }
 
-static void render_quad(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* sample_direct,
+static float shadow_filter_3x3_at(const float* mask, const float* depth, const Vec3* normals,
+                                  const size_t width, const size_t height,
+                                  const int x, const int y, const float depth_max)
+{
+    const int ix = std::clamp(x, 0, static_cast<int>(width) - 1);
+    const int iy = std::clamp(y, 0, static_cast<int>(height) - 1);
+    const size_t center_idx = static_cast<size_t>(iy) * width + static_cast<size_t>(ix);
+    const float center_depth = depth[center_idx];
+    if (center_depth >= depth_max)
+    {
+        return mask[center_idx];
+    }
+    const Vec3 center_normal = normals[center_idx];
+    const double normal_len_sq = center_normal.x * center_normal.x +
+                                 center_normal.y * center_normal.y +
+                                 center_normal.z * center_normal.z;
+    if (normal_len_sq <= 1e-6)
+    {
+        return mask[center_idx];
+    }
+
+    const float inv_depth_sigma2 = 1.0f / (2.0f * kShadowFilterDepthSigma * kShadowFilterDepthSigma);
+    const float inv_normal_sigma2 = 1.0f / (2.0f * kShadowFilterNormalSigma * kShadowFilterNormalSigma);
+    float sum = 0.0f;
+    float weight_sum = 0.0f;
+    int k = 0;
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        const int sy = std::clamp(iy + dy, 0, static_cast<int>(height) - 1);
+        for (int dx = -1; dx <= 1; ++dx, ++k)
+        {
+            const int sx = std::clamp(ix + dx, 0, static_cast<int>(width) - 1);
+            const size_t idx = static_cast<size_t>(sy) * width + static_cast<size_t>(sx);
+            const float neighbor_depth = depth[idx];
+            if (neighbor_depth >= depth_max)
+            {
+                continue;
+            }
+            const Vec3 neighbor_normal = normals[idx];
+            const double neighbor_len_sq = neighbor_normal.x * neighbor_normal.x +
+                                           neighbor_normal.y * neighbor_normal.y +
+                                           neighbor_normal.z * neighbor_normal.z;
+            if (neighbor_len_sq <= 1e-6)
+            {
+                continue;
+            }
+
+            float weight = kShadowGaussianWeights[k];
+            const float depth_diff = neighbor_depth - center_depth;
+            const float depth_w = std::exp(-(depth_diff * depth_diff) * inv_depth_sigma2);
+            const float dot = static_cast<float>(center_normal.x * neighbor_normal.x +
+                                                 center_normal.y * neighbor_normal.y +
+                                                 center_normal.z * neighbor_normal.z);
+            const float clamped_dot = std::clamp(dot, -1.0f, 1.0f);
+            const float normal_diff = 1.0f - clamped_dot;
+            const float normal_w = std::exp(-(normal_diff * normal_diff) * inv_normal_sigma2);
+            weight *= depth_w * normal_w;
+            sum += mask[idx] * weight;
+            weight_sum += weight;
+        }
+    }
+
+    if (weight_sum <= 0.0f)
+    {
+        return mask[center_idx];
+    }
+    float filtered = sum / weight_sum;
+    filtered = std::clamp(filtered, 0.0f, 1.0f);
+    return filtered;
+}
+
+static void filter_shadow_mask_3x3(const float* mask, float* out_mask, const float* depth,
+                                   const Vec3* normals, const size_t width, const size_t height,
+                                   const float depth_max)
+{
+    for (size_t y = 0; y < height; ++y)
+    {
+        for (size_t x = 0; x < width; ++x)
+        {
+            const size_t idx = y * width + x;
+            out_mask[idx] = shadow_filter_3x3_at(mask, depth, normals,
+                                                 width, height,
+                                                 static_cast<int>(x),
+                                                 static_cast<int>(y),
+                                                 depth_max);
+        }
+    }
+}
+
+static void render_quad(float* zbuffer, ColorRGB* sample_ambient,
+                        ColorRGB* sample_direct_sun, ColorRGB* sample_direct_moon,
+                        float* shadow_mask_sun, float* shadow_mask_moon, Vec3* sample_normals,
                         size_t width, size_t height,
                         const RenderQuad& quad, const double fov_x, const double fov_y,
-                        const Vec3& camera_pos, const ViewRotation& view_rot, const ShadingContext& ctx)
+                        const Vec3& camera_pos, const ViewRotation& view_rot, const ShadingContext& ctx,
+                        const uint32_t frame_index, const float jitter_x, const float jitter_y,
+                        const std::array<Vec3, 2>& lights_right_scaled,
+                        const std::array<Vec3, 2>& lights_up_scaled)
+
 {
     Vec3 view_space[4];
     for (int i = 0; i < 4; ++i)
@@ -1438,12 +1626,17 @@ static void render_quad(float* zbuffer, ColorRGB* sample_ambient, ColorRGB* samp
         const ScreenVertex sv0 = project_vertex(a.view);
         const ScreenVertex sv1 = project_vertex(b.view);
         const ScreenVertex sv2 = project_vertex(c.view);
-        draw_shaded_triangle(zbuffer, sample_ambient, sample_direct, width, height,
+        draw_shaded_triangle(zbuffer, sample_ambient,
+                             sample_direct_sun, sample_direct_moon,
+                             shadow_mask_sun, shadow_mask_moon, sample_normals,
+                             width, height,
                              sv0, sv1, sv2,
                              a.world, b.world, c.world,
                              a.normal, b.normal, c.normal,
                              a.sky_visibility, b.sky_visibility, c.sky_visibility,
-                             ctx);
+                             ctx, frame_index,
+                             jitter_x, jitter_y,
+                             lights_right_scaled, lights_up_scaled);
     };
 
     auto draw_clipped = [&](int i0, int i1, int i2) {
@@ -1480,8 +1673,26 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     static std::vector<float> zbuffer;
     static std::vector<ColorRGB> sample_colors;
     static std::vector<ColorRGB> sample_direct;
-    const size_t sample_count = width * height * kMsaaSamples;
+    static std::vector<ColorRGB> sample_direct_sun;
+    static std::vector<ColorRGB> sample_direct_moon;
+    static std::vector<float> shadow_mask_sun;
+    static std::vector<float> shadow_mask_moon;
+    static std::vector<float> shadow_mask_filtered_sun;
+    static std::vector<float> shadow_mask_filtered_moon;
+    static std::vector<Vec3> sample_normals;
+    static std::vector<ColorRGB> taa_history;
+    static size_t taa_width = 0;
+    static size_t taa_height = 0;
+    static bool taa_history_valid = false;
+    static uint64_t taa_state_version = 0;
+    static bool taa_was_enabled = false;
+    const size_t sample_count = width * height;
     const float depth_max = std::numeric_limits<float>::max();
+
+    const bool taa_on = taaEnabled.load(std::memory_order_relaxed);
+    const float base_blend = static_cast<float>(std::clamp(taaBlend.load(std::memory_order_relaxed), 0.0, 1.0));
+    const float taa_factor = base_blend;
+    const uint64_t state_version = renderStateVersion.load(std::memory_order_relaxed);
 
     if (width != cached_width || height != cached_height)
     {
@@ -1490,15 +1701,49 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         zbuffer.assign(sample_count, depth_max);
         sample_colors.assign(sample_count, {0.0f, 0.0f, 0.0f});
         sample_direct.assign(sample_count, {0.0f, 0.0f, 0.0f});
+        sample_direct_sun.assign(sample_count, {0.0f, 0.0f, 0.0f});
+        sample_direct_moon.assign(sample_count, {0.0f, 0.0f, 0.0f});
+        shadow_mask_sun.assign(sample_count, 1.0f);
+        shadow_mask_moon.assign(sample_count, 1.0f);
+        shadow_mask_filtered_sun.assign(sample_count, 1.0f);
+        shadow_mask_filtered_moon.assign(sample_count, 1.0f);
+        sample_normals.assign(sample_count, {0.0, 0.0, 0.0});
     }
     else
     {
         std::fill(zbuffer.begin(), zbuffer.end(), depth_max);
         std::fill(sample_colors.begin(), sample_colors.end(), ColorRGB{0.0f, 0.0f, 0.0f});
         std::fill(sample_direct.begin(), sample_direct.end(), ColorRGB{0.0f, 0.0f, 0.0f});
+        std::fill(sample_direct_sun.begin(), sample_direct_sun.end(), ColorRGB{0.0f, 0.0f, 0.0f});
+        std::fill(sample_direct_moon.begin(), sample_direct_moon.end(), ColorRGB{0.0f, 0.0f, 0.0f});
+        std::fill(shadow_mask_sun.begin(), shadow_mask_sun.end(), 1.0f);
+        std::fill(shadow_mask_moon.begin(), shadow_mask_moon.end(), 1.0f);
+        std::fill(shadow_mask_filtered_sun.begin(), shadow_mask_filtered_sun.end(), 1.0f);
+        std::fill(shadow_mask_filtered_moon.begin(), shadow_mask_filtered_moon.end(), 1.0f);
+        std::fill(sample_normals.begin(), sample_normals.end(), Vec3{0.0, 0.0, 0.0});
     }
 
-    if (sunOrbitEnabled.load(std::memory_order_relaxed) && !rotationPaused.load(std::memory_order_relaxed))
+    if (taa_on)
+    {
+        if (width != taa_width || height != taa_height || !taa_was_enabled || taa_state_version != state_version)
+        {
+            taa_width = width;
+            taa_height = height;
+            taa_history.assign(sample_count, {0.0f, 0.0f, 0.0f});
+            taa_history_valid = false;
+            taa_state_version = state_version;
+        }
+    }
+    else
+    {
+        taa_history_valid = false;
+    }
+    taa_was_enabled = taa_on;
+
+    const bool paused = rotationPaused.load(std::memory_order_relaxed);
+    const uint32_t frame_index = renderFrameIndex.fetch_add(1u, std::memory_order_relaxed);
+
+    if (sunOrbitEnabled.load(std::memory_order_relaxed) && !paused)
     {
         double angle = sunOrbitAngle.load(std::memory_order_relaxed) +
                        sunOrbitSpeed.load(std::memory_order_relaxed);
@@ -1519,6 +1764,17 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     };
     const double yaw = camera_yaw.load(std::memory_order_relaxed);
     const double pitch = camera_pitch.load(std::memory_order_relaxed);
+
+    float jitter_x = 0.0f;
+    float jitter_y = 0.0f;
+    if (taa_on)
+    {
+        const float jitter_scale = 1.0f;
+        const float u = sample_noise(0, 0, static_cast<int>(frame_index), kTaaJitterSalt);
+        const float v = sample_noise(1, 0, static_cast<int>(frame_index), kTaaJitterSalt + 1);
+        jitter_x = (u - 0.5f) * jitter_scale;
+        jitter_y = (v - 0.5f) * jitter_scale;
+    }
     const ViewRotation view_rot = make_view_rotation(-yaw, -pitch);
 
     const double mat_ambient = 0.25;
@@ -1570,9 +1826,30 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     const Vec3 moon_dir = normalize_vec(load_moon_direction());
     const bool shadows_on = shadowEnabled.load(std::memory_order_relaxed);
     const std::array<ShadingContext::DirectionalLightInfo, 2> lights = {
-        ShadingContext::DirectionalLightInfo{sun_dir, sun_intensity, kSunLightColorLinear},
-        ShadingContext::DirectionalLightInfo{moon_dir, moon_intensity, kMoonLightColorLinear}
+        ShadingContext::DirectionalLightInfo{sun_dir, sun_intensity, kSunLightColorLinear, kSunDiskRadius},
+        ShadingContext::DirectionalLightInfo{moon_dir, moon_intensity, kMoonLightColorLinear, 0.0}
     };
+
+    std::array<Vec3, 2> lights_right_scaled{};
+    std::array<Vec3, 2> lights_up_scaled{};
+
+    for (int i = 0; i < 2; ++i)
+    {
+        if (lights[i].angular_radius > 0.0 && lights[i].intensity > 0.0)
+        {
+            Vec3 right, up, forward;
+            build_light_basis(lights[i].dir, right, up, forward);
+            const double scale = std::tan(lights[i].angular_radius);
+            
+            lights_right_scaled[i] = {right.x * scale, right.y * scale, right.z * scale};
+            lights_up_scaled[i]    = {up.x * scale, up.y * scale, up.z * scale};
+        }
+        else
+        {
+            lights_right_scaled[i] = {0.0, 0.0, 0.0};
+            lights_up_scaled[i]    = {0.0, 0.0, 0.0};
+        }
+    }
 
     const bool direct_lighting_enabled = (lights[0].intensity > 0.0) || (lights[1].intensity > 0.0);
     const bool ao_enabled = ambientOcclusionEnabled.load(std::memory_order_relaxed);
@@ -1628,8 +1905,38 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     for (const auto& quad : terrainQuads)
     {
         ShadingContext& ctx = get_ctx(quad.color);
-        render_quad(zbuffer.data(), sample_colors.data(), sample_direct.data(), width, height, quad, fov_x, fov_y,
-                    camera_pos, view_rot, ctx);
+        render_quad(zbuffer.data(), sample_colors.data(),
+                    sample_direct_sun.data(), sample_direct_moon.data(),
+                    shadow_mask_sun.data(), shadow_mask_moon.data(),
+                    sample_normals.data(),
+                    width, height, quad, fov_x, fov_y,
+                    camera_pos, view_rot, ctx, frame_index, jitter_x, jitter_y,
+                    lights_right_scaled, lights_up_scaled); 
+    }
+
+    if (shadows_on)
+    {
+        filter_shadow_mask_3x3(shadow_mask_sun.data(), shadow_mask_filtered_sun.data(),
+                               zbuffer.data(), sample_normals.data(),
+                               width, height, depth_max);
+        filter_shadow_mask_3x3(shadow_mask_moon.data(), shadow_mask_filtered_moon.data(),
+                               zbuffer.data(), sample_normals.data(),
+                               width, height, depth_max);
+        for (size_t i = 0; i < sample_count; ++i)
+        {
+            const ColorRGB sun = sample_direct_sun[i];
+            const ColorRGB moon = sample_direct_moon[i];
+            const ColorRGB sun_shadowed = scale_color(sun, shadow_mask_filtered_sun[i]);
+            const ColorRGB moon_shadowed = scale_color(moon, shadow_mask_filtered_moon[i]);
+            sample_direct[i] = add_color(sun_shadowed, moon_shadowed);
+        }
+    }
+    else
+    {
+        for (size_t i = 0; i < sample_count; ++i)
+        {
+            sample_direct[i] = add_color(sample_direct_sun[i], sample_direct_moon[i]);
+        }
     }
 
     static constexpr int bayer4[4][4] = {
@@ -1642,6 +1949,24 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     const float dither_scale = dither_strength / 16.0f;
 
     const float exposure_factor = static_cast<float>(std::max(0.0, exposure.load(std::memory_order_relaxed)));
+    const bool use_history = taa_on && taa_history_valid;
+
+    auto current_linear_at = [&](int ix, int iy) -> ColorRGB {
+        ix = std::clamp(ix, 0, static_cast<int>(width) - 1);
+        iy = std::clamp(iy, 0, static_cast<int>(height) - 1);
+        const size_t idx = static_cast<size_t>(iy) * width + static_cast<size_t>(ix);
+        if (zbuffer[idx] >= depth_max)
+        {
+            const float t = height > 1 ? static_cast<float>(iy) / static_cast<float>(height - 1) : 0.0f;
+            return lerp_color(sky_top_linear, sky_bottom_linear, t);
+        }
+        ColorRGB accum = sample_colors[idx];
+        const ColorRGB direct = sample_direct[idx];
+        accum.r += direct.r;
+        accum.g += direct.g;
+        accum.b += direct.b;
+        return accum;
+    };
 
     for (size_t y = 0; y < height; ++y)
     {
@@ -1650,66 +1975,68 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         for (size_t x = 0; x < width; ++x)
         {
             const size_t pixel = y * width + x;
-            const size_t base = (y * width + x) * kMsaaSamples;
-
-            ColorRGB accum{0.0f, 0.0f, 0.0f};
-            float weight_sum = 0.0f;
-            bool any_coverage = false;
-            for (int s = 0; s < kMsaaSamples; ++s)
+            const float depth = zbuffer[pixel];
+            const bool is_sky = depth >= depth_max;
+            ColorRGB current_linear = sky_row_linear;
+            if (!is_sky)
             {
-                const float depth = zbuffer[base + static_cast<size_t>(s)];
-                if (depth >= depth_max)
+                ColorRGB accum = sample_colors[pixel];
+                const ColorRGB direct = sample_direct[pixel];
+                accum.r += direct.r;
+                accum.g += direct.g;
+                accum.b += direct.b;
+                current_linear = accum;
+            }
+
+            ColorRGB blended = current_linear;
+            if (taa_on)
+            {
+                if (use_history)
                 {
-                    accum.r += sky_row_linear.r;
-                    accum.g += sky_row_linear.g;
-                    accum.b += sky_row_linear.b;
-                    weight_sum += 1.0f;
-                    continue;
+                    ColorRGB prev = taa_history[pixel];
+                    ColorRGB minc = current_linear;
+                    ColorRGB maxc = current_linear;
+                    for (int ny = -1; ny <= 1; ++ny)
+                    {
+                        for (int nx = -1; nx <= 1; ++nx)
+                        {
+                            const ColorRGB neighbor = current_linear_at(static_cast<int>(x) + nx,
+                                                                       static_cast<int>(y) + ny);
+                            minc.r = std::min(minc.r, neighbor.r);
+                            minc.g = std::min(minc.g, neighbor.g);
+                            minc.b = std::min(minc.b, neighbor.b);
+                            maxc.r = std::max(maxc.r, neighbor.r);
+                            maxc.g = std::max(maxc.g, neighbor.g);
+                            maxc.b = std::max(maxc.b, neighbor.b);
+                        }
+                    }
+                    prev.r = std::clamp(prev.r, minc.r, maxc.r);
+                    prev.g = std::clamp(prev.g, minc.g, maxc.g);
+                    prev.b = std::clamp(prev.b, minc.b, maxc.b);
+                    blended.r = prev.r + (current_linear.r - prev.r) * taa_factor;
+                    blended.g = prev.g + (current_linear.g - prev.g) * taa_factor;
+                    blended.b = prev.b + (current_linear.b - prev.b) * taa_factor;
                 }
-                const float weight = 1.0f;
-                any_coverage = true;
-                ColorRGB c = sample_colors[base + static_cast<size_t>(s)];
-                const ColorRGB direct = sample_direct[base + static_cast<size_t>(s)];
-                c.r += direct.r;
-                c.g += direct.g;
-                c.b += direct.b;
-
-                accum.r += c.r * weight;
-                accum.g += c.g * weight;
-                accum.b += c.b * weight;
-                weight_sum += weight;
+                taa_history[pixel] = blended;
             }
 
-            if (!any_coverage)
-            {
-                const ColorRGB sky_mapped = tonemap_reinhard(sky_row_linear, exposure_factor);
-                ColorRGB sky_srgb = linear_to_srgb(sky_mapped);
-                framebuffer[y * width + x] = pack_color(sky_srgb);
-                continue;
-            }
-
-            if (weight_sum <= 0.0f)
-            {
-                const ColorRGB sky_mapped = tonemap_reinhard(sky_row_linear, exposure_factor);
-                ColorRGB sky_srgb = linear_to_srgb(sky_mapped);
-                framebuffer[y * width + x] = pack_color(sky_srgb);
-                continue;
-            }
-
-            const float inv_weight = 1.0f / weight_sum;
-            accum.r *= inv_weight;
-            accum.g *= inv_weight;
-            accum.b *= inv_weight;
-
-            const ColorRGB mapped = tonemap_reinhard(accum, exposure_factor);
+            const ColorRGB mapped = tonemap_reinhard(blended, exposure_factor);
             ColorRGB srgb = linear_to_srgb(mapped);
-            const float dither = (static_cast<float>(bayer4[y & 3][x & 3]) - 7.5f) * dither_scale;
-            srgb.r += dither;
-            srgb.g += dither;
-            srgb.b += dither;
+            if (!is_sky)
+            {
+                const float dither = (static_cast<float>(bayer4[y & 3][x & 3]) - 7.5f) * dither_scale;
+                srgb.r += dither;
+                srgb.g += dither;
+                srgb.b += dither;
+            }
 
-            framebuffer[y * width + x] = pack_color(srgb);
+            framebuffer[pixel] = pack_color(srgb);
         }
+    }
+
+    if (taa_on)
+    {
+        taa_history_valid = true;
     }
 }
 
@@ -1749,6 +2076,7 @@ void render_toggle_pause()
 void render_set_light_direction(const Vec3 dir)
 {
     store_light_direction(dir);
+    mark_render_state_dirty();
 }
 
 Vec3 render_get_light_direction()
@@ -1759,6 +2087,7 @@ Vec3 render_get_light_direction()
 void render_set_light_intensity(const double intensity)
 {
     lightIntensity.store(intensity, std::memory_order_relaxed);
+    mark_render_state_dirty();
 }
 
 double render_get_light_intensity()
@@ -1769,6 +2098,7 @@ double render_get_light_intensity()
 void render_set_sun_orbit_enabled(const bool enabled)
 {
     sunOrbitEnabled.store(enabled, std::memory_order_relaxed);
+    mark_render_state_dirty();
 }
 
 bool render_get_sun_orbit_enabled()
@@ -1779,6 +2109,7 @@ bool render_get_sun_orbit_enabled()
 void render_set_sun_orbit_angle(const double angle)
 {
     sunOrbitAngle.store(angle, std::memory_order_relaxed);
+    mark_render_state_dirty();
 }
 
 double render_get_sun_orbit_angle()
@@ -1789,16 +2120,19 @@ double render_get_sun_orbit_angle()
 void render_set_moon_direction(const Vec3 dir)
 {
     store_moon_direction(dir);
+    mark_render_state_dirty();
 }
 
 void render_set_moon_intensity(const double intensity)
 {
     moonIntensity.store(intensity, std::memory_order_relaxed);
+    mark_render_state_dirty();
 }
 
 void render_set_sky_top_color(const uint32_t color)
 {
     skyTopColor.store(color, std::memory_order_relaxed);
+    mark_render_state_dirty();
 }
 
 uint32_t render_get_sky_top_color()
@@ -1809,6 +2143,7 @@ uint32_t render_get_sky_top_color()
 void render_set_sky_bottom_color(const uint32_t color)
 {
     skyBottomColor.store(color, std::memory_order_relaxed);
+    mark_render_state_dirty();
 }
 
 uint32_t render_get_sky_bottom_color()
@@ -1819,6 +2154,7 @@ uint32_t render_get_sky_bottom_color()
 void render_set_sky_light_intensity(const double intensity)
 {
     skyLightIntensity.store(intensity, std::memory_order_relaxed);
+    mark_render_state_dirty();
 }
 
 double render_get_sky_light_intensity()
@@ -1829,6 +2165,7 @@ double render_get_sky_light_intensity()
 void render_set_exposure(const double value)
 {
     exposure.store(std::max(0.0, value), std::memory_order_relaxed);
+    mark_render_state_dirty();
 }
 
 double render_get_exposure()
@@ -1836,14 +2173,43 @@ double render_get_exposure()
     return exposure.load(std::memory_order_relaxed);
 }
 
+void render_set_taa_enabled(const bool enabled)
+{
+    taaEnabled.store(enabled, std::memory_order_relaxed);
+    mark_render_state_dirty();
+}
+
+bool render_get_taa_enabled()
+{
+    return taaEnabled.load(std::memory_order_relaxed);
+}
+
+void render_set_taa_blend(const double blend)
+{
+    taaBlend.store(std::clamp(blend, 0.0, 1.0), std::memory_order_relaxed);
+    mark_render_state_dirty();
+}
+
+double render_get_taa_blend()
+{
+    return taaBlend.load(std::memory_order_relaxed);
+}
+
+void render_reset_taa_history()
+{
+    mark_render_state_dirty();
+}
+
 void render_set_ambient_occlusion_enabled(const bool enabled)
 {
     ambientOcclusionEnabled.store(enabled, std::memory_order_relaxed);
+    mark_render_state_dirty();
 }
 
 void render_set_shadow_enabled(const bool enabled)
 {
     shadowEnabled.store(enabled, std::memory_order_relaxed);
+    mark_render_state_dirty();
 }
 
 bool render_get_terrain_vertex_sky_visibility(const int x, const int y, const int z,
@@ -1916,6 +2282,50 @@ bool render_get_shadow_factor_at_point(const Vec3 world, const Vec3 normal, floa
 
     *out_factor = compute_shadow_factor(light_dir, world, normalize_vec(normal));
     return true;
+}
+
+bool render_debug_shadow_factor_with_frame(const Vec3 world, const Vec3 normal, const Vec3 light_dir,
+                                           const int pixel_x, const int pixel_y, const int frame,
+                                           float* out_factor)
+{
+    if (!out_factor)
+    {
+        return false;
+    }
+    generate_terrain_chunk();
+    if (!shadowEnabled.load(std::memory_order_relaxed))
+    {
+        *out_factor = 1.0f;
+        return true;
+    }
+
+    const Vec3 dir = normalize_vec(light_dir);
+
+    Vec3 right, up, forward;
+    build_light_basis(dir, right, up, forward);
+
+    const double scale = std::tan(kSunDiskRadius);
+    const Vec3 right_scaled = {right.x * scale, right.y * scale, right.z * scale};
+    const Vec3 up_scaled    = {up.x * scale, up.y * scale, up.z * scale};
+
+    const Vec3 shadow_dir = jitter_shadow_direction(dir, 
+                                                    right_scaled, up_scaled,
+                                                    pixel_x, pixel_y, 
+                                                    static_cast<uint32_t>(frame),
+                                                    kSunShadowSalt);
+                                                    
+    *out_factor = compute_shadow_factor(shadow_dir, world, normalize_vec(normal));
+    return true;
+}
+
+float render_debug_shadow_filter_3x3(const float* mask, const float* depth, const Vec3* normals)
+{
+    if (!mask || !depth || !normals)
+    {
+        return 0.0f;
+    }
+    const float depth_max = std::numeric_limits<float>::max();
+    return shadow_filter_3x3_at(mask, depth, normals, 3, 3, 1, 1, depth_max);
 }
 
 static bool camera_intersects_block(const Vec3& pos)

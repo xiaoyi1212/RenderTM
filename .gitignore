@@ -7,5 +7,5 @@ AGENTS.md
 /.idea
 
 # Perf related files
-perf.data
+perf.*
 report.txt

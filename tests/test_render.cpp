@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "render.h"
+#include "blue_noise.h"
 
 static void reset_camera()
 {
@@ -28,6 +29,8 @@ static void reset_camera()
     render_set_moon_intensity(0.0);
     render_set_shadow_enabled(true);
     render_set_exposure(1.0);
+    render_set_taa_enabled(true);
+    render_set_taa_blend(0.2);
 }
 
 static float srgb_channel_to_linear(float channel);
@@ -82,6 +85,36 @@ static size_t count_geometry_pixels(const std::vector<uint32_t>& framebuffer, si
 static uint32_t pixel_luminance(uint32_t color)
 {
     return ((color >> 16) & 0xFF) + ((color >> 8) & 0xFF) + (color & 0xFF);
+}
+
+static double average_luminance_delta_masked(const std::vector<uint32_t>& a,
+                                             const std::vector<uint32_t>& b,
+                                             size_t width, size_t height,
+                                             uint32_t sky_top, uint32_t sky_bottom)
+{
+    double sum = 0.0;
+    size_t count = 0;
+    for (size_t y = 0; y < height; ++y)
+    {
+        const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom);
+        for (size_t x = 0; x < width; ++x)
+        {
+            const size_t idx = y * width + x;
+            if (a[idx] == sky && b[idx] == sky)
+            {
+                continue;
+            }
+            const uint32_t la = pixel_luminance(a[idx]);
+            const uint32_t lb = pixel_luminance(b[idx]);
+            sum += static_cast<double>(la > lb ? la - lb : lb - la);
+            count++;
+        }
+    }
+    if (count == 0)
+    {
+        return 0.0;
+    }
+    return sum / static_cast<double>(count);
 }
 
 static std::array<int, 512> make_permutation(const int seed)
@@ -885,6 +918,73 @@ static uint32_t expected_gamma_luminance(uint32_t albedo, float intensity)
     return r + g + b;
 }
 
+TEST_CASE("blue noise sampling responds to salt and frame")
+{
+    const float base = sample_noise(5, 7, 0, 0);
+    REQUIRE(base >= 0.0f);
+    REQUIRE(base < 1.0f);
+
+    int same_salt = 0;
+    int same_frame = 0;
+    int total = 0;
+    for (int y = 0; y < 8; ++y)
+    {
+        for (int x = 0; x < 8; ++x)
+        {
+            const float a = sample_noise(x, y, 0, 0);
+            const float b = sample_noise(x, y, 0, 1);
+            const float c = sample_noise(x, y, 1, 0);
+            if (a == b) same_salt++;
+            if (a == c) same_frame++;
+            total++;
+        }
+    }
+
+    REQUIRE(same_salt < total);
+    REQUIRE(same_frame < total);
+}
+
+TEST_CASE("shadow spatial filter applies gaussian blur with bilateral rejection")
+{
+    const std::array<float, 9> mask = {1.0f, 1.0f, 1.0f,
+                                       1.0f, 0.0f, 1.0f,
+                                       1.0f, 1.0f, 1.0f};
+    std::array<float, 9> depth_same{};
+    depth_same.fill(5.0f);
+    std::array<Vec3, 9> normals_same{};
+    for (auto& n : normals_same)
+    {
+        n = {0.0, 1.0, 0.0};
+    }
+
+    const float baseline = render_debug_shadow_filter_3x3(mask.data(), depth_same.data(), normals_same.data());
+    REQUIRE(baseline == Catch::Approx(0.75f).margin(0.02f));
+
+    std::array<float, 9> depth_far = depth_same;
+    for (size_t i = 0; i < depth_far.size(); ++i)
+    {
+        if (i != 4)
+        {
+            depth_far[i] = 50.0f;
+        }
+    }
+    const float depth_filtered = render_debug_shadow_filter_3x3(mask.data(), depth_far.data(), normals_same.data());
+    REQUIRE(depth_filtered < baseline);
+    REQUIRE(depth_filtered < 0.2f);
+
+    std::array<Vec3, 9> normals_flipped = normals_same;
+    for (size_t i = 0; i < normals_flipped.size(); ++i)
+    {
+        if (i != 4)
+        {
+            normals_flipped[i] = {0.0, -1.0, 0.0};
+        }
+    }
+    const float normal_filtered = render_debug_shadow_filter_3x3(mask.data(), depth_same.data(), normals_flipped.data());
+    REQUIRE(normal_filtered < baseline);
+    REQUIRE(normal_filtered < 0.2f);
+}
+
 TEST_CASE("render_update_array clears framebuffer and draws geometry")
 {
     reset_camera();
@@ -924,23 +1024,135 @@ TEST_CASE("render_update_array handles tiny even-sized buffers")
     }
 }
 
-TEST_CASE("render_update_array is stable when paused")
+TEST_CASE("pause stops sun orbit but keeps rendering active")
 {
     reset_camera();
     const size_t width = 64;
     const size_t height = 64;
 
-    std::vector<uint32_t> framebuffer_a(width * height, 0u);
-    std::vector<uint32_t> framebuffer_b(width * height, 0u);
-
     render_set_light_direction({0.0, 0.0, 1.0});
     render_set_light_intensity(1.0);
+    render_set_sun_orbit_enabled(true);
+    render_set_sun_orbit_angle(0.5);
+
+    std::vector<uint32_t> framebuffer(width * height, 0u);
+
+    render_set_paused(false);
+    for (int i = 0; i < 4; ++i)
+    {
+        render_update_array(framebuffer.data(), width, height);
+    }
+    const double moved_angle = render_get_sun_orbit_angle();
+    REQUIRE(std::abs(moved_angle - 0.5) > 1e-4);
+
     render_set_paused(true);
-    render_update_array(framebuffer_a.data(), width, height);
-    render_update_array(framebuffer_b.data(), width, height);
+    const double paused_angle = render_get_sun_orbit_angle();
+    for (int i = 0; i < 4; ++i)
+    {
+        render_update_array(framebuffer.data(), width, height);
+    }
     render_set_paused(false);
 
-    REQUIRE(framebuffer_a == framebuffer_b);
+    REQUIRE(render_get_sun_orbit_angle() == Catch::Approx(paused_angle));
+}
+
+TEST_CASE("temporal accumulation reduces frame-to-frame noise")
+{
+    reset_camera();
+    render_set_sun_orbit_enabled(false);
+    render_set_light_intensity(1.0);
+    render_set_moon_intensity(0.0);
+    render_set_shadow_enabled(true);
+    render_set_sky_light_intensity(0.0);
+    render_set_ambient_occlusion_enabled(false);
+    render_set_exposure(1.0);
+    render_set_paused(false);
+
+    const size_t width = 200;
+    const size_t height = 160;
+    const uint32_t sky_top = 0xFF78C2FF;
+    const uint32_t sky_bottom = 0xFF172433;
+
+    struct Config
+    {
+        Vec3 camera_pos;
+        Vec2 camera_rot;
+        Vec3 light_dir;
+    };
+
+    const std::array<Config, 3> configs = {{
+        {{0.0, 0.0, -4.0}, {0.0, 0.0}, {0.6, -0.3, 0.8}},
+        {{0.0, 10.0, -12.0}, {0.0, -0.5}, {0.9, -0.2, 0.3}},
+        {{0.0, 22.0, -10.0}, {0.0, -0.8}, {0.4, -0.5, 0.8}}
+    }};
+
+    auto max_luminance_delta = [&](const std::vector<uint32_t>& a,
+                                   const std::vector<uint32_t>& b) {
+        double max_delta = 0.0;
+        for (size_t y = 0; y < height; ++y)
+        {
+            const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom);
+            for (size_t x = 0; x < width; ++x)
+            {
+                const size_t idx = y * width + x;
+                if (a[idx] == sky || b[idx] == sky)
+                {
+                    continue;
+                }
+                const double delta = std::abs(static_cast<double>(pixel_luminance(a[idx])) -
+                                              static_cast<double>(pixel_luminance(b[idx])));
+                if (delta > max_delta)
+                {
+                    max_delta = delta;
+                }
+            }
+        }
+        return max_delta;
+    };
+
+    std::vector<uint32_t> frame0(width * height, 0u);
+    std::vector<uint32_t> frame1(width * height, 0u);
+
+    double delta_no_taa = 0.0;
+    bool found = false;
+    for (const auto& cfg : configs)
+    {
+        render_set_camera_position(cfg.camera_pos);
+        render_set_camera_rotation(cfg.camera_rot);
+        render_set_light_direction(cfg.light_dir);
+
+        render_set_taa_enabled(false);
+        render_update_array(frame0.data(), width, height);
+        render_update_array(frame1.data(), width, height);
+
+        delta_no_taa = max_luminance_delta(frame0, frame1);
+        if (delta_no_taa > 0.0)
+        {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found)
+    {
+        SUCCEED("No temporal noise detected in the current configurations.");
+        return;
+    }
+
+    render_set_taa_enabled(true);
+    render_set_taa_blend(0.2);
+
+    std::vector<uint32_t> scratch(width * height, 0u);
+    render_update_array(scratch.data(), width, height);
+    render_update_array(scratch.data(), width, height);
+
+    std::vector<uint32_t> frame2(width * height, 0u);
+    std::vector<uint32_t> frame3(width * height, 0u);
+    render_update_array(frame2.data(), width, height);
+    render_update_array(frame3.data(), width, height);
+
+    const double delta_taa = max_luminance_delta(frame2, frame3);
+    REQUIRE(delta_taa < delta_no_taa);
 }
 
 TEST_CASE("render_update_array fills front face")
@@ -1077,6 +1289,14 @@ TEST_CASE("render state setters and getters")
     render_set_exposure(1.4);
     REQUIRE(render_get_exposure() == Catch::Approx(1.4));
 
+    render_set_taa_enabled(true);
+    REQUIRE(render_get_taa_enabled());
+    render_set_taa_enabled(false);
+    REQUIRE_FALSE(render_get_taa_enabled());
+
+    render_set_taa_blend(0.25);
+    REQUIRE(render_get_taa_blend() == Catch::Approx(0.25));
+
     render_set_paused(false);
     REQUIRE_FALSE(render_is_paused());
     render_toggle_pause();
@@ -1090,6 +1310,8 @@ TEST_CASE("render state setters and getters")
     render_set_sky_bottom_color(0xFF172433);
     render_set_sky_light_intensity(0.0);
     render_set_exposure(1.0);
+    render_set_taa_enabled(true);
+    render_set_taa_blend(0.2);
     render_set_paused(false);
 }
 
@@ -1441,54 +1663,6 @@ TEST_CASE("moonlight adds ambient when sun is below horizon")
     REQUIRE(avg_on > avg_off + 8.0);
 }
 
-TEST_CASE("sky color affects anti-aliased edges")
-{
-    reset_camera();
-    render_set_paused(true);
-    render_set_light_direction({0.0, 0.0, 1.0});
-    render_set_light_intensity(1.0);
-    render_set_sky_light_intensity(0.0);
-
-    const size_t width = 120;
-    const size_t height = 80;
-    std::vector<uint32_t> frame_a(width * height, 0u);
-    std::vector<uint32_t> frame_b(width * height, 0u);
-
-    const uint32_t top_a = 0xFFFF00FF;
-    const uint32_t bottom_a = 0xFF00FFFF;
-    const uint32_t top_b = 0xFF112244;
-    const uint32_t bottom_b = 0xFFCC6600;
-
-    render_set_sky_top_color(top_a);
-    render_set_sky_bottom_color(bottom_a);
-    render_update_array(frame_a.data(), width, height);
-
-    render_set_sky_top_color(top_b);
-    render_set_sky_bottom_color(bottom_b);
-    render_update_array(frame_b.data(), width, height);
-    render_set_paused(false);
-
-    bool found = false;
-    for (size_t y = 0; y < height && !found; ++y)
-    {
-        const uint32_t sky_a = sky_color_for_row(y, height, top_a, bottom_a);
-        const uint32_t sky_b = sky_color_for_row(y, height, top_b, bottom_b);
-        for (size_t x = 0; x < width; ++x)
-        {
-            const size_t idx = y * width + x;
-            const uint32_t pa = frame_a[idx];
-            const uint32_t pb = frame_b[idx];
-            if (pa != sky_a && pb != sky_b && pa != pb)
-            {
-                found = true;
-                break;
-            }
-        }
-    }
-
-    REQUIRE(found);
-}
-
 TEST_CASE("sky light increases ambient brightness")
 {
     reset_camera();
@@ -1762,12 +1936,12 @@ TEST_CASE("light direction reads stay coherent under concurrent updates")
     REQUIRE(!saw_mixed.load(std::memory_order_relaxed));
 }
 
-TEST_CASE("DDA shadow factors are binary")
+TEST_CASE("stochastic DDA varies across frames near shadow boundaries")
 {
     reset_camera();
     render_set_paused(true);
     render_set_sun_orbit_enabled(false);
-    render_set_light_direction({0.5, -1.0, 0.3});
+    render_set_light_direction({0.6, -0.2, 0.7});
     render_set_light_intensity(1.0);
     render_set_moon_intensity(0.0);
     render_set_shadow_enabled(true);
@@ -1777,20 +1951,9 @@ TEST_CASE("DDA shadow factors are binary")
     build_heightmap(heights, top_colors);
 
     const Vec3 normal{0.0, -1.0, 0.0};
-    const Vec3 light_dir = normalize_vec3({0.5, -1.0, 0.3});
-    Vec3 shadow_world{};
-    Vec3 lit_world{};
-    REQUIRE(find_shadow_sample(heights, light_dir, normal, true, &shadow_world));
-    REQUIRE(find_shadow_sample(heights, light_dir, normal, false, &lit_world));
+    const Vec3 light_dir = normalize_vec3({0.6, -0.2, 0.7});
 
-    float factor = 1.0f;
-    REQUIRE(render_get_shadow_factor_at_point(shadow_world, normal, &factor));
-    REQUIRE(factor <= 0.02f);
-
-    REQUIRE(render_get_shadow_factor_at_point(lit_world, normal, &factor));
-    REQUIRE(factor >= 0.98f);
-
-    bool saw_intermediate = false;
+    bool saw_variation = false;
     const int chunk_size = 16;
     const double block_size = 2.0;
     const double start_x = -(chunk_size - 1) * block_size * 0.5;
@@ -1801,12 +1964,16 @@ TEST_CASE("DDA shadow factors are binary")
         return static_cast<size_t>(z * chunk_size + x);
     };
 
-    const std::array<double, 2> offsets = {-0.25, 0.25};
-    for (int z = 0; z < chunk_size && !saw_intermediate; z += 3)
+    const std::array<double, 3> offsets = {-0.35, 0.0, 0.35};
+    for (int z = 0; z < chunk_size && !saw_variation; z += 2)
     {
-        for (int x = 0; x < chunk_size && !saw_intermediate; x += 3)
+        for (int x = 0; x < chunk_size && !saw_variation; x += 2)
         {
             const int height = heights[index(x, z)];
+            if (height <= 0)
+            {
+                continue;
+            }
             const double center_y = base_y - (height - 1) * block_size;
             const double top_y = center_y - block_size * 0.5;
             for (double ox : offsets)
@@ -1818,25 +1985,34 @@ TEST_CASE("DDA shadow factors are binary")
                         top_y,
                         start_z + z * block_size + oz * block_size
                     };
-                    float sample = 1.0f;
-                    if (!render_get_shadow_factor_at_point(world, normal, &sample))
+                    float min_factor = 1.0f;
+                    float max_factor = 0.0f;
+                    for (int frame = 0; frame < 24; ++frame)
                     {
-                        continue;
+                        float sample = 1.0f;
+                        if (!render_debug_shadow_factor_with_frame(world, normal, light_dir,
+                                                                   x, z, frame, &sample))
+                        {
+                            continue;
+                        }
+                        min_factor = std::min(min_factor, sample);
+                        max_factor = std::max(max_factor, sample);
+                        if (min_factor < 0.05f && max_factor > 0.95f)
+                        {
+                            saw_variation = true;
+                            break;
+                        }
                     }
-                    if (sample > 0.02f && sample < 0.98f)
-                    {
-                        saw_intermediate = true;
-                        break;
-                    }
+                    if (saw_variation) break;
                 }
-                if (saw_intermediate) break;
+                if (saw_variation) break;
             }
         }
     }
 
     render_set_paused(false);
 
-    REQUIRE(!saw_intermediate);
+    REQUIRE(saw_variation);
 }
 
 TEST_CASE("moon light contributes when sun is disabled")

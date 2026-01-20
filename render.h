@@ -35,6 +35,11 @@ void render_set_sky_light_intensity(double intensity);
 double render_get_sky_light_intensity();
 void render_set_exposure(double exposure);
 double render_get_exposure();
+void render_set_taa_enabled(bool enabled);
+bool render_get_taa_enabled();
+void render_set_taa_blend(double blend);
+double render_get_taa_blend();
+void render_reset_taa_history();
 void render_set_ambient_occlusion_enabled(bool enabled);
 void render_set_shadow_enabled(bool enabled);
 bool render_get_shadow_factor_at_point(Vec3 world, Vec3 normal, float* out_factor);
@@ -51,6 +56,10 @@ bool render_debug_depth_at_sample(Vec3 v0, Vec3 v1, Vec3 v2, Vec2 p, float* out_
 double render_debug_eval_specular(double ndoth, double vdoth, double ndotl,
                                   double shininess, double f0);
 Vec3 render_debug_tonemap_reinhard(Vec3 color, double exposure);
+bool render_debug_shadow_factor_with_frame(Vec3 world, Vec3 normal, Vec3 light_dir,
+                                           int pixel_x, int pixel_y, int frame,
+                                           float* out_factor);
+float render_debug_shadow_filter_3x3(const float* mask, const float* depth, const Vec3* normals);
 size_t render_debug_get_terrain_block_count();
 size_t render_debug_get_terrain_visible_face_count();
 size_t render_debug_get_terrain_triangle_count();
