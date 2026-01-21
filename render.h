@@ -44,6 +44,8 @@ void render_set_taa_enabled(bool enabled);
 bool render_get_taa_enabled();
 void render_set_taa_blend(double blend);
 double render_get_taa_blend();
+void render_set_taa_clamp_enabled(bool enabled);
+bool render_get_taa_clamp_enabled();
 void render_reset_taa_history();
 void render_set_ambient_occlusion_enabled(bool enabled);
 void render_set_shadow_enabled(bool enabled);
@@ -64,6 +66,7 @@ double render_debug_eval_specular(double ndoth, double vdoth, double ndotl,
                                   double shininess, double f0);
 Vec3 render_debug_tonemap_reinhard(Vec3 color, double exposure);
 Vec3 render_debug_sample_history_bilinear(const Vec3* buffer, size_t width, size_t height, Vec2 screen_coord);
+void render_debug_set_sky_colors_raw(uint32_t top, uint32_t bottom);
 Mat4 render_debug_get_current_vp();
 Mat4 render_debug_get_previous_vp();
 Mat4 render_debug_get_inverse_current_vp();

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -33,6 +34,7 @@ static void reset_camera()
     render_set_exposure(1.0);
     render_set_taa_enabled(true);
     render_set_taa_blend(0.2);
+    render_set_taa_clamp_enabled(true);
 }
 
 static Mat4 mat4_multiply(const Mat4& a, const Mat4& b)
@@ -105,6 +107,32 @@ static std::string mat4_to_string(const Mat4& m)
         }
     }
     return oss.str();
+}
+
+static Vec2 reproject_with_vp(const Mat4& vp, const Vec3 world, const size_t width, const size_t height)
+{
+    if (width == 0 || height == 0)
+    {
+        return {0.0, 0.0};
+    }
+
+    const double clip_x = vp.m[0][0] * world.x + vp.m[0][1] * world.y + vp.m[0][2] * world.z + vp.m[0][3];
+    const double clip_y = vp.m[1][0] * world.x + vp.m[1][1] * world.y + vp.m[1][2] * world.z + vp.m[1][3];
+    const double clip_w = vp.m[3][0] * world.x + vp.m[3][1] * world.y + vp.m[3][2] * world.z + vp.m[3][3];
+    const double near_plane = render_get_near_plane();
+
+    if (clip_w <= near_plane)
+    {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        return {nan, nan};
+    }
+
+    const double inv_w = 1.0 / clip_w;
+    const double ndc_x = clip_x * inv_w;
+    const double ndc_y = clip_y * inv_w;
+    const double screen_x = (ndc_x * 0.5 + 0.5) * static_cast<double>(width);
+    const double screen_y = (ndc_y * 0.5 + 0.5) * static_cast<double>(height);
+    return {screen_x, screen_y};
 }
 
 static Vec3 rotate_yaw_pitch(const Vec3& v, const double yaw, const double pitch)
@@ -1241,6 +1269,96 @@ TEST_CASE("temporal accumulation reduces frame-to-frame noise")
 
     const double delta_taa = max_luminance_delta(frame2, frame3);
     REQUIRE(delta_taa < delta_no_taa);
+}
+
+TEST_CASE("UnjitterCheck")
+{
+    reset_camera();
+    render_set_paused(true);
+    render_set_taa_enabled(true);
+    render_set_taa_blend(0.1);
+    render_set_taa_clamp_enabled(true);
+
+    const size_t width = 160;
+    const size_t height = 120;
+    const uint32_t sky_top = render_get_sky_top_color();
+    const uint32_t sky_bottom = render_get_sky_bottom_color();
+
+    std::vector<uint32_t> warm(width * height, 0u);
+    render_update_array(warm.data(), width, height);
+    render_update_array(warm.data(), width, height);
+
+    std::vector<uint32_t> frame_a(width * height, 0u);
+    std::vector<uint32_t> frame_b(width * height, 0u);
+    render_update_array(frame_a.data(), width, height);
+    render_update_array(frame_b.data(), width, height);
+
+    auto max_luminance_delta = [&](const std::vector<uint32_t>& a,
+                                   const std::vector<uint32_t>& b) {
+        double max_delta = 0.0;
+        for (size_t y = 0; y < height; ++y)
+        {
+            const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom);
+            for (size_t x = 0; x < width; ++x)
+            {
+                const size_t idx = y * width + x;
+                if (a[idx] == sky || b[idx] == sky)
+                {
+                    continue;
+                }
+                const double delta = std::abs(static_cast<double>(pixel_luminance(a[idx])) -
+                                              static_cast<double>(pixel_luminance(b[idx])));
+                if (delta > max_delta)
+                {
+                    max_delta = delta;
+                }
+            }
+        }
+        return max_delta;
+    };
+
+    const double average_delta = average_luminance_delta_masked(frame_a, frame_b,
+                                                                width, height,
+                                                                sky_top, sky_bottom);
+    const double max_delta = max_luminance_delta(frame_a, frame_b);
+
+    REQUIRE(average_delta < 2.0);
+    REQUIRE(max_delta < 64.0);
+
+    render_set_paused(false);
+}
+
+TEST_CASE("ClampingCheck")
+{
+    reset_camera();
+    render_set_paused(true);
+    render_set_camera_rotation({0.0, 1.2});
+    render_set_taa_enabled(true);
+    render_set_taa_blend(0.1);
+    render_set_taa_clamp_enabled(true);
+
+    const size_t width = 96;
+    const size_t height = 72;
+    std::vector<uint32_t> frame(width * height, 0u);
+    const uint32_t original_top = render_get_sky_top_color();
+    const uint32_t original_bottom = render_get_sky_bottom_color();
+
+    const uint32_t red = 0xFFFF0000;
+    render_debug_set_sky_colors_raw(red, red);
+    render_update_array(frame.data(), width, height);
+
+    const uint32_t green = 0xFF00FF00;
+    render_debug_set_sky_colors_raw(green, green);
+    render_update_array(frame.data(), width, height);
+
+    const size_t sample_x = width / 2;
+    const size_t sample_y = 0;
+    const uint32_t expected = sky_color_for_row(sample_y, height, green, green);
+    REQUIRE(frame[sample_y * width + sample_x] == expected);
+
+    render_set_sky_top_color(original_top);
+    render_set_sky_bottom_color(original_bottom);
+    render_set_paused(false);
 }
 
 TEST_CASE("render_update_array fills front face")
@@ -2801,6 +2919,196 @@ TEST_CASE("render_reproject_point maps world position into previous frame")
     const double fov_x = static_cast<double>(height) * 0.8;
     const double expected_delta = (point.x - camera_pos.x) / view_z * fov_x;
     REQUIRE((current.x - prev.x) == Catch::Approx(expected_delta).margin(1e-6));
+}
+
+TEST_CASE("ReprojectionAlignmentTest")
+{
+    reset_camera();
+    render_set_taa_enabled(true);
+    render_set_taa_clamp_enabled(false);
+    render_set_camera_position({0.0, 0.0, -4.0});
+    render_set_camera_rotation({0.0, 0.0});
+
+    const size_t width = 160;
+    const size_t height = 120;
+    std::vector<uint32_t> framebuffer(width * height, 0u);
+
+    render_update_array(framebuffer.data(), width, height);
+
+    const Vec3 point{0.0, 0.0, 12.0};
+    const Vec2 p1 = render_project_point(point, width, height);
+    REQUIRE(std::isfinite(p1.x));
+    REQUIRE(std::isfinite(p1.y));
+
+    Vec3 cam_pos = render_get_camera_position();
+    render_set_camera_position({cam_pos.x + 2.0, cam_pos.y, cam_pos.z});
+
+    render_update_array(framebuffer.data(), width, height);
+
+    const Vec2 p2 = render_project_point(point, width, height);
+    REQUIRE(std::isfinite(p2.x));
+    REQUIRE(std::isfinite(p2.y));
+
+    cam_pos = render_get_camera_position();
+    const Vec2 cam_rot = render_get_camera_rotation();
+    const Vec3 view = rotate_yaw_pitch({point.x - cam_pos.x,
+                                        point.y - cam_pos.y,
+                                        point.z - cam_pos.z},
+                                       -cam_rot.x, -cam_rot.y);
+    REQUIRE(view.z > 0.0);
+
+    const Vec3 reconstructed = render_unproject_point({p2.x, p2.y, view.z}, width, height);
+    const Vec2 prev = render_reproject_point(reconstructed, width, height);
+
+    REQUIRE(prev.x == Catch::Approx(p1.x).margin(1e-4));
+    REQUIRE(prev.y == Catch::Approx(p1.y).margin(1e-4));
+
+    render_set_taa_clamp_enabled(true);
+}
+
+TEST_CASE("BoundaryReject")
+{
+    reset_camera();
+    render_set_paused(true);
+    render_set_taa_enabled(true);
+    render_set_taa_blend(0.1);
+    render_set_taa_clamp_enabled(false);
+
+    const size_t width = 160;
+    const size_t height = 120;
+    const uint32_t sky_top = render_get_sky_top_color();
+    const uint32_t sky_bottom = render_get_sky_bottom_color();
+
+    std::vector<uint32_t> frame1(width * height, 0u);
+    std::vector<uint32_t> frame_with_history(width * height, 0u);
+    std::vector<uint32_t> frame_current(width * height, 0u);
+
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+    const int chunk_size = 16;
+    const double block_size = 2.0;
+    const double half = block_size * 0.5;
+    const double start_x = -(chunk_size - 1) * block_size * 0.5;
+    const double start_z = 4.0;
+    const double base_y = 2.0;
+
+    bool found = false;
+    size_t target_idx = 0;
+    Vec2 prev_screen{};
+    constexpr double half_pi = 1.5707963267948966;
+
+    struct CameraConfig
+    {
+        Vec3 pos;
+        Vec2 rot;
+    };
+
+    const std::array<CameraConfig, 3> configs = {{
+        {{0.0, -8.0, -4.0}, {0.0, -0.6}},
+        {{0.0, -10.0, 10.0}, {0.0, -0.7}},
+        {{0.0, -12.0, 20.0}, {0.0, -0.7}}
+    }};
+
+    for (const auto& cfg : configs)
+    {
+        render_reset_taa_history();
+        render_set_camera_position(cfg.pos);
+        render_set_camera_rotation(cfg.rot);
+        render_update_array(frame1.data(), width, height);
+
+        render_set_camera_rotation({cfg.rot.x + half_pi, cfg.rot.y});
+        render_update_array(frame_with_history.data(), width, height);
+        const Mat4 prev_vp = render_debug_get_previous_vp();
+
+        render_reset_taa_history();
+        render_update_array(frame_current.data(), width, height);
+
+        for (int pass = 0; pass < 2 && !found; ++pass)
+        {
+            const bool require_diff = (pass == 0);
+            const int left_limit = (pass == 0) ? 4 : 8;
+
+            for (int z = 0; z < chunk_size && !found; ++z)
+            {
+                for (int x = 0; x < chunk_size && !found; ++x)
+                {
+                    const int h = heights[static_cast<size_t>(z * chunk_size + x)];
+                    if (h <= 0)
+                    {
+                        continue;
+                    }
+                    const double block_x = start_x + x * block_size;
+                    const double block_z = start_z + z * block_size;
+                    const double block_y = base_y - (h - 1) * block_size;
+                    const Vec3 world{block_x, block_y - half, block_z};
+
+                    const Vec2 projected = render_project_point(world, width, height);
+                    if (!std::isfinite(projected.x) || !std::isfinite(projected.y))
+                    {
+                        continue;
+                    }
+                    if (projected.x < 0.0 || projected.x >= static_cast<double>(width) ||
+                        projected.y < 0.0 || projected.y >= static_cast<double>(height))
+                    {
+                        continue;
+                    }
+                    const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
+                    const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
+                    if (px > left_limit)
+                    {
+                        continue;
+                    }
+
+                    const uint32_t sky = sky_color_for_row(static_cast<size_t>(py), height, sky_top, sky_bottom);
+                    const size_t idx = static_cast<size_t>(py) * width + static_cast<size_t>(px);
+                    if (frame_current[idx] == sky)
+                    {
+                        continue;
+                    }
+                    if (require_diff)
+                    {
+                        const int diff = std::abs(static_cast<int>(pixel_luminance(frame_current[idx])) -
+                                                  static_cast<int>(pixel_luminance(frame1[idx])));
+                        if (diff < 30)
+                        {
+                            continue;
+                        }
+                    }
+
+                    const Vec2 prev = reproject_with_vp(prev_vp, world, width, height);
+                    if (!std::isfinite(prev.x) || !std::isfinite(prev.y))
+                    {
+                        continue;
+                    }
+                    if (prev.x >= 0.0 && prev.x <= static_cast<double>(width) &&
+                        prev.y >= 0.0 && prev.y <= static_cast<double>(height))
+                    {
+                        continue;
+                    }
+
+                    found = true;
+                    target_idx = idx;
+                    prev_screen = prev;
+                }
+            }
+        }
+        if (found)
+        {
+            break;
+        }
+    }
+
+    INFO("Prev screen coord: " << prev_screen.x << ", " << prev_screen.y);
+    REQUIRE(found);
+
+    const int output_delta = std::abs(static_cast<int>(pixel_luminance(frame_with_history[target_idx])) -
+                                      static_cast<int>(pixel_luminance(frame_current[target_idx])));
+    INFO("Output delta: " << output_delta);
+    REQUIRE(output_delta <= 2);
+
+    render_set_paused(false);
+    render_set_taa_clamp_enabled(true);
 }
 
 TEST_CASE("history bilinear sampling blends across top row midpoint")

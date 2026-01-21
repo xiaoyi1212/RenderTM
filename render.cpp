@@ -93,7 +93,8 @@ static std::atomic<double> skyLightIntensity{0.32};
 static std::atomic<double> ambientLight{0.13};
 static std::atomic<double> exposure{1.0};
 static std::atomic<bool> taaEnabled{true};
-static std::atomic<double> taaBlend{0.2};
+static std::atomic<double> taaBlend{0.1};
+static std::atomic<bool> taaClampEnabled{true};
 static std::atomic<uint64_t> renderStateVersion{1};
 static std::atomic<double> camera_x{16.0};
 static std::atomic<double> camera_y{-19.72};
@@ -1947,6 +1948,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     const bool taa_on = taaEnabled.load(std::memory_order_relaxed);
     const float base_blend = static_cast<float>(std::clamp(taaBlend.load(std::memory_order_relaxed), 0.0, 1.0));
     const float taa_factor = base_blend;
+    const bool clamp_history = taaClampEnabled.load(std::memory_order_relaxed);
     const uint64_t state_version = renderStateVersion.load(std::memory_order_relaxed);
 
     if (width != cached_width || height != cached_height)
@@ -2258,13 +2260,15 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
             ColorRGB blended = current_linear;
             if (taa_on)
             {
-                if (use_history)
+                bool history_valid = use_history;
+                ColorRGB prev = current_linear;
+                if (history_valid)
                 {
-                    ColorRGB prev = taa_history[pixel];
+                    prev = taa_history[pixel];
                     if (!is_sky)
                     {
-                        const double screen_x = static_cast<double>(x) + 0.5 + static_cast<double>(jitter_x);
-                        const double screen_y = static_cast<double>(y) + 0.5 + static_cast<double>(jitter_y);
+                        const double screen_x = static_cast<double>(x) + 0.5;
+                        const double screen_y = static_cast<double>(y) + 0.5;
                         const Vec3 world = render_unproject_point({screen_x, screen_y, depth}, width, height);
                         const Vec2 prev_screen = render_reproject_point(world, width, height);
                         if (std::isfinite(prev_screen.x) && std::isfinite(prev_screen.y) &&
@@ -2274,7 +2278,15 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                             prev = sample_bilinear_history(taa_history.data(), width, height,
                                                            prev_screen.x, prev_screen.y);
                         }
+                        else
+                        {
+                            history_valid = false;
+                        }
                     }
+                }
+
+                if (history_valid && clamp_history)
+                {
                     ColorRGB minc = current_linear;
                     ColorRGB maxc = current_linear;
                     for (int ny = -1; ny <= 1; ++ny)
@@ -2294,10 +2306,19 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                     prev.r = std::clamp(prev.r, minc.r, maxc.r);
                     prev.g = std::clamp(prev.g, minc.g, maxc.g);
                     prev.b = std::clamp(prev.b, minc.b, maxc.b);
+                }
+
+                if (history_valid)
+                {
                     blended.r = prev.r + (current_linear.r - prev.r) * taa_factor;
                     blended.g = prev.g + (current_linear.g - prev.g) * taa_factor;
                     blended.b = prev.b + (current_linear.b - prev.b) * taa_factor;
                 }
+                else
+                {
+                    blended = current_linear;
+                }
+
                 taa_history[pixel] = blended;
             }
 
@@ -2337,6 +2358,12 @@ Vec3 render_debug_tonemap_reinhard(const Vec3 color, const double exposure_value
     };
     const ColorRGB mapped = tonemap_reinhard(input, exposure_factor);
     return {mapped.r, mapped.g, mapped.b};
+}
+
+void render_debug_set_sky_colors_raw(const uint32_t top, const uint32_t bottom)
+{
+    skyTopColor.store(top, std::memory_order_relaxed);
+    skyBottomColor.store(bottom, std::memory_order_relaxed);
 }
 
 Vec3 render_debug_sample_history_bilinear(const Vec3* buffer, const size_t width, const size_t height,
@@ -2495,6 +2522,17 @@ void render_set_taa_blend(const double blend)
 double render_get_taa_blend()
 {
     return taaBlend.load(std::memory_order_relaxed);
+}
+
+void render_set_taa_clamp_enabled(const bool enabled)
+{
+    taaClampEnabled.store(enabled, std::memory_order_relaxed);
+    mark_render_state_dirty();
+}
+
+bool render_get_taa_clamp_enabled()
+{
+    return taaClampEnabled.load(std::memory_order_relaxed);
 }
 
 void render_reset_taa_history()
