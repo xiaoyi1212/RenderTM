@@ -6,8 +6,10 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -31,6 +33,92 @@ static void reset_camera()
     render_set_exposure(1.0);
     render_set_taa_enabled(true);
     render_set_taa_blend(0.2);
+}
+
+static Mat4 mat4_multiply(const Mat4& a, const Mat4& b)
+{
+    Mat4 r{};
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            double sum = 0.0;
+            for (int k = 0; k < 4; ++k)
+            {
+                sum += a.m[i][k] * b.m[k][j];
+            }
+            r.m[i][j] = sum;
+        }
+    }
+    return r;
+}
+
+static bool mat4_near_equal(const Mat4& a, const Mat4& b, const double eps)
+{
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            if (std::fabs(a.m[i][j] - b.m[i][j]) > eps)
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool mat4_is_identity(const Mat4& m, const double eps)
+{
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            const double expected = (i == j) ? 1.0 : 0.0;
+            if (std::fabs(m.m[i][j] - expected) > eps)
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static std::string mat4_to_string(const Mat4& m)
+{
+    std::ostringstream oss;
+    oss.setf(std::ios::fixed);
+    oss << std::setprecision(6);
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            oss << m.m[i][j];
+            if (j < 3)
+            {
+                oss << ", ";
+            }
+        }
+        if (i < 3)
+        {
+            oss << '\n';
+        }
+    }
+    return oss.str();
+}
+
+static Vec3 rotate_yaw_pitch(const Vec3& v, const double yaw, const double pitch)
+{
+    const double cy = std::cos(yaw);
+    const double sy = std::sin(yaw);
+    const double cp = std::cos(pitch);
+    const double sp = std::sin(pitch);
+    const double x1 = v.x * cy + v.z * sy;
+    const double z1 = -v.x * sy + v.z * cy;
+    const double y1 = v.y;
+    const double y2 = y1 * cp - z1 * sp;
+    const double z2 = y1 * sp + z1 * cp;
+    return {x1, y2, z2};
 }
 
 static float srgb_channel_to_linear(float channel);
@@ -2526,6 +2614,50 @@ TEST_CASE("camera movement in world and local space")
     REQUIRE(pos.z == Catch::Approx(-20.0).margin(1e-6));
 }
 
+TEST_CASE("reprojection matrices stay stable without camera motion")
+{
+    reset_camera();
+    render_set_taa_enabled(true);
+    const size_t width = 96;
+    const size_t height = 72;
+    std::vector<uint32_t> framebuffer(width * height);
+
+    render_update_array(framebuffer.data(), width, height);
+    render_update_array(framebuffer.data(), width, height);
+
+    const Mat4 prev = render_debug_get_previous_vp();
+    const Mat4 curr = render_debug_get_current_vp();
+    const Mat4 inv = render_debug_get_inverse_current_vp();
+    const Mat4 product = mat4_multiply(curr, inv);
+
+    INFO("PreviousVP:\n" << mat4_to_string(prev));
+    INFO("CurrentVP:\n" << mat4_to_string(curr));
+    INFO("CurrentVP * Inverse(CurrentVP):\n" << mat4_to_string(product));
+
+    REQUIRE(mat4_near_equal(prev, curr, 1e-12));
+    REQUIRE(mat4_is_identity(product, 1e-7));
+}
+
+TEST_CASE("reprojection matrices change when camera moves")
+{
+    reset_camera();
+    render_set_taa_enabled(true);
+    const size_t width = 96;
+    const size_t height = 72;
+    std::vector<uint32_t> framebuffer(width * height);
+
+    render_update_array(framebuffer.data(), width, height);
+    Vec3 pos = render_get_camera_position();
+    render_set_camera_position({pos.x + 1.0, pos.y, pos.z});
+    render_update_array(framebuffer.data(), width, height);
+
+    const Mat4 prev = render_debug_get_previous_vp();
+    const Mat4 curr = render_debug_get_current_vp();
+    INFO("PreviousVP:\n" << mat4_to_string(prev));
+    INFO("CurrentVP:\n" << mat4_to_string(curr));
+    REQUIRE_FALSE(mat4_near_equal(prev, curr, 1e-9));
+}
+
 TEST_CASE("camera movement blocks entry into terrain")
 {
     reset_camera();
@@ -2605,6 +2737,98 @@ TEST_CASE("camera forward movement does not climb when blocked by top face")
     }
 
     render_set_paused(false);
+}
+
+TEST_CASE("render_unproject_point reconstructs world position")
+{
+    reset_camera();
+    const size_t width = 160;
+    const size_t height = 120;
+    const Vec3 camera_pos{2.0, -1.5, -3.0};
+    const Vec2 camera_rot{0.35, -0.2};
+    render_set_camera_position(camera_pos);
+    render_set_camera_rotation(camera_rot);
+
+    const Vec3 target{10.0, 0.0, 5.0};
+    const Vec2 projected = render_project_point(target, width, height);
+    REQUIRE_FALSE(std::isnan(projected.x));
+    REQUIRE_FALSE(std::isnan(projected.y));
+
+    const Vec3 view = rotate_yaw_pitch({target.x - camera_pos.x,
+                                        target.y - camera_pos.y,
+                                        target.z - camera_pos.z},
+                                       -camera_rot.x, -camera_rot.y);
+    REQUIRE(view.z > 0.0);
+
+    const Vec3 reconstructed = render_unproject_point({projected.x, projected.y, view.z},
+                                                      width, height);
+    REQUIRE(reconstructed.x == Catch::Approx(target.x).margin(1e-6));
+    REQUIRE(reconstructed.y == Catch::Approx(target.y).margin(1e-6));
+    REQUIRE(reconstructed.z == Catch::Approx(target.z).margin(1e-6));
+}
+
+TEST_CASE("render_reproject_point maps world position into previous frame")
+{
+    reset_camera();
+    render_set_camera_rotation({0.0, 0.0});
+    const size_t width = 160;
+    const size_t height = 120;
+    std::vector<uint32_t> framebuffer(width * height);
+
+    render_set_camera_position({0.0, 0.0, 0.0});
+    render_update_array(framebuffer.data(), width, height);
+
+    render_set_camera_position({-10.0, 0.0, 0.0});
+    render_update_array(framebuffer.data(), width, height);
+
+    const Vec3 point{0.0, 0.0, 100.0};
+    const Vec2 current = render_project_point(point, width, height);
+    REQUIRE(current.x > width / 2.0);
+
+    const Vec3 camera_pos = render_get_camera_position();
+    const double view_z = point.z - camera_pos.z;
+    REQUIRE(view_z > 0.0);
+
+    const Vec3 reconstructed = render_unproject_point({current.x, current.y, view_z}, width, height);
+    REQUIRE(reconstructed.x == Catch::Approx(point.x).margin(1e-6));
+    REQUIRE(reconstructed.y == Catch::Approx(point.y).margin(1e-6));
+    REQUIRE(reconstructed.z == Catch::Approx(point.z).margin(1e-6));
+
+    const Vec2 prev = render_reproject_point(reconstructed, width, height);
+    REQUIRE(prev.x == Catch::Approx(width / 2.0).margin(1e-6));
+    REQUIRE(prev.y == Catch::Approx(height / 2.0).margin(1e-6));
+
+    const double fov_x = static_cast<double>(height) * 0.8;
+    const double expected_delta = (point.x - camera_pos.x) / view_z * fov_x;
+    REQUIRE((current.x - prev.x) == Catch::Approx(expected_delta).margin(1e-6));
+}
+
+TEST_CASE("history bilinear sampling blends across top row midpoint")
+{
+    const size_t width = 2;
+    const size_t height = 2;
+    const std::array<Vec3, 4> history = {{
+        {0.0, 0.0, 0.0}, {1.0, 1.0, 1.0},
+        {0.0, 0.0, 0.0}, {1.0, 1.0, 1.0}
+    }};
+    const Vec3 sample = render_debug_sample_history_bilinear(history.data(), width, height, {1.0, 0.5});
+    REQUIRE(sample.x == Catch::Approx(0.5));
+    REQUIRE(sample.y == Catch::Approx(0.5));
+    REQUIRE(sample.z == Catch::Approx(0.5));
+}
+
+TEST_CASE("history bilinear sampling uses fractional weights")
+{
+    const size_t width = 2;
+    const size_t height = 2;
+    const std::array<Vec3, 4> history = {{
+        {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0},
+        {0.0, 0.0, 1.0}, {1.0, 1.0, 0.0}
+    }};
+    const Vec3 sample = render_debug_sample_history_bilinear(history.data(), width, height, {1.25, 0.75});
+    REQUIRE(sample.x == Catch::Approx(0.375));
+    REQUIRE(sample.y == Catch::Approx(0.75));
+    REQUIRE(sample.z == Catch::Approx(0.0625));
 }
 
 TEST_CASE("render_project_point centers consistently")

@@ -102,6 +102,18 @@ static std::atomic<double> camera_yaw{-0.6911503837897546};
 static std::atomic<double> camera_pitch{-0.6003932626860493};
 static std::atomic<bool> ambientOcclusionEnabled{true};
 static std::atomic<bool> shadowEnabled{true};
+static Mat4 currentVP{{{1.0, 0.0, 0.0, 0.0},
+                       {0.0, 1.0, 0.0, 0.0},
+                       {0.0, 0.0, 1.0, 0.0},
+                       {0.0, 0.0, 0.0, 1.0}}};
+static Mat4 previousVP{{{1.0, 0.0, 0.0, 0.0},
+                        {0.0, 1.0, 0.0, 0.0},
+                        {0.0, 0.0, 1.0, 0.0},
+                        {0.0, 0.0, 0.0, 1.0}}};
+static Mat4 inverseCurrentVP{{{1.0, 0.0, 0.0, 0.0},
+                              {0.0, 1.0, 0.0, 0.0},
+                              {0.0, 0.0, 1.0, 0.0},
+                              {0.0, 0.0, 0.0, 1.0}}};
 
 static void mark_render_state_dirty()
 {
@@ -246,6 +258,7 @@ constexpr ColorRGB kMoonLightColorLinear{1.0f, 1.0f, 1.0f};
 constexpr double kSunIntensityBoost = 1.2;
 constexpr double kMoonSkyLightFloor = 0.22;
 constexpr double kNearPlane = 0.05;
+constexpr double kFarPlane = 1000.0;
 constexpr int kTerrainChunkSize = 16;
 constexpr double kTerrainBlockSize = 2.0;
 constexpr double kTerrainStartZ = 4.0;
@@ -806,6 +819,77 @@ static ColorRGB lerp_color(const ColorRGB& a, const ColorRGB& b, float t)
     };
 }
 
+static Vec3 lerp_vec3(const Vec3& a, const Vec3& b, const double t)
+{
+    return {
+        a.x + (b.x - a.x) * t,
+        a.y + (b.y - a.y) * t,
+        a.z + (b.z - a.z) * t
+    };
+}
+
+static ColorRGB sample_bilinear_history(const ColorRGB* buffer, const size_t width, const size_t height,
+                                        const double screen_x, const double screen_y)
+{
+    if (!buffer || width == 0 || height == 0)
+    {
+        return {0.0f, 0.0f, 0.0f};
+    }
+
+    double x = screen_x - 0.5;
+    double y = screen_y - 0.5;
+    x = std::clamp(x, 0.0, static_cast<double>(width - 1));
+    y = std::clamp(y, 0.0, static_cast<double>(height - 1));
+
+    const int x0 = static_cast<int>(std::floor(x));
+    const int y0 = static_cast<int>(std::floor(y));
+    const int x1 = std::min(x0 + 1, static_cast<int>(width) - 1);
+    const int y1 = std::min(y0 + 1, static_cast<int>(height) - 1);
+    const float fx = static_cast<float>(x - static_cast<double>(x0));
+    const float fy = static_cast<float>(y - static_cast<double>(y0));
+
+    const size_t row0 = static_cast<size_t>(y0) * width;
+    const size_t row1 = static_cast<size_t>(y1) * width;
+    const ColorRGB c00 = buffer[row0 + static_cast<size_t>(x0)];
+    const ColorRGB c10 = buffer[row0 + static_cast<size_t>(x1)];
+    const ColorRGB c01 = buffer[row1 + static_cast<size_t>(x0)];
+    const ColorRGB c11 = buffer[row1 + static_cast<size_t>(x1)];
+    const ColorRGB top = lerp_color(c00, c10, fx);
+    const ColorRGB bottom = lerp_color(c01, c11, fx);
+    return lerp_color(top, bottom, fy);
+}
+
+static Vec3 sample_bilinear_history_vec3(const Vec3* buffer, const size_t width, const size_t height,
+                                         const double screen_x, const double screen_y)
+{
+    if (!buffer || width == 0 || height == 0)
+    {
+        return {0.0, 0.0, 0.0};
+    }
+
+    double x = screen_x - 0.5;
+    double y = screen_y - 0.5;
+    x = std::clamp(x, 0.0, static_cast<double>(width - 1));
+    y = std::clamp(y, 0.0, static_cast<double>(height - 1));
+
+    const int x0 = static_cast<int>(std::floor(x));
+    const int y0 = static_cast<int>(std::floor(y));
+    const int x1 = std::min(x0 + 1, static_cast<int>(width) - 1);
+    const int y1 = std::min(y0 + 1, static_cast<int>(height) - 1);
+    const double fx = x - static_cast<double>(x0);
+    const double fy = y - static_cast<double>(y0);
+
+    const size_t row0 = static_cast<size_t>(y0) * width;
+    const size_t row1 = static_cast<size_t>(y1) * width;
+    const Vec3 c00 = buffer[row0 + static_cast<size_t>(x0)];
+    const Vec3 c10 = buffer[row0 + static_cast<size_t>(x1)];
+    const Vec3 c01 = buffer[row1 + static_cast<size_t>(x0)];
+    const Vec3 c11 = buffer[row1 + static_cast<size_t>(x1)];
+    const Vec3 top = lerp_vec3(c00, c10, fx);
+    const Vec3 bottom = lerp_vec3(c01, c11, fx);
+    return lerp_vec3(top, bottom, fy);
+}
+
 static ColorRGB scale_color(const ColorRGB& color, float scale)
 {
     return {color.r * scale, color.g * scale, color.b * scale};
@@ -1118,9 +1202,180 @@ static Vec3 rotate_yaw_pitch(const Vec3& v, const double yaw, const double pitch
     return rotate_yaw_pitch_cached(v, cy, sy, cp, sp);
 }
 
+static Vec3 rotate_pitch_yaw(const Vec3& v, const double yaw, const double pitch)
+{
+    const double cy = std::cos(yaw);
+    const double sy = std::sin(yaw);
+    const double cp = std::cos(pitch);
+    const double sp = std::sin(pitch);
+
+    const double x1 = v.x;
+    const double y1 = v.y * cp - v.z * sp;
+    const double z1 = v.y * sp + v.z * cp;
+
+    const double x2 = x1 * cy + z1 * sy;
+    const double z2 = -x1 * sy + z1 * cy;
+
+    return {x2, y1, z2};
+}
+
 static ViewRotation make_view_rotation(const double yaw, const double pitch)
 {
     return {std::cos(yaw), std::sin(yaw), std::cos(pitch), std::sin(pitch)};
+}
+
+static Mat4 mat4_identity()
+{
+    Mat4 m{};
+    m.m[0][0] = 1.0;
+    m.m[1][1] = 1.0;
+    m.m[2][2] = 1.0;
+    m.m[3][3] = 1.0;
+    return m;
+}
+
+static Mat4 mat4_multiply(const Mat4& a, const Mat4& b)
+{
+    Mat4 r{};
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            double sum = 0.0;
+            for (int k = 0; k < 4; ++k)
+            {
+                sum += a.m[i][k] * b.m[k][j];
+            }
+            r.m[i][j] = sum;
+        }
+    }
+    return r;
+}
+
+static bool mat4_invert(const Mat4& m, Mat4* out)
+{
+    if (!out)
+    {
+        return false;
+    }
+    double aug[4][8]{};
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            aug[i][j] = m.m[i][j];
+        }
+        for (int j = 0; j < 4; ++j)
+        {
+            aug[i][j + 4] = (i == j) ? 1.0 : 0.0;
+        }
+    }
+
+    for (int col = 0; col < 4; ++col)
+    {
+        int pivot = col;
+        double max_abs = std::fabs(aug[col][col]);
+        for (int row = col + 1; row < 4; ++row)
+        {
+            const double value = std::fabs(aug[row][col]);
+            if (value > max_abs)
+            {
+                max_abs = value;
+                pivot = row;
+            }
+        }
+        if (max_abs < 1e-12)
+        {
+            return false;
+        }
+        if (pivot != col)
+        {
+            for (int j = 0; j < 8; ++j)
+            {
+                std::swap(aug[col][j], aug[pivot][j]);
+            }
+        }
+
+        const double inv_pivot = 1.0 / aug[col][col];
+        for (int j = 0; j < 8; ++j)
+        {
+            aug[col][j] *= inv_pivot;
+        }
+
+        for (int row = 0; row < 4; ++row)
+        {
+            if (row == col)
+            {
+                continue;
+            }
+            const double factor = aug[row][col];
+            if (factor == 0.0)
+            {
+                continue;
+            }
+            for (int j = 0; j < 8; ++j)
+            {
+                aug[row][j] -= factor * aug[col][j];
+            }
+        }
+    }
+
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            out->m[i][j] = aug[i][j + 4];
+        }
+    }
+    return true;
+}
+
+static Mat4 make_view_matrix(const Vec3& pos, const double yaw, const double pitch)
+{
+    const double cy = std::cos(yaw);
+    const double sy = std::sin(yaw);
+    const double cp = std::cos(pitch);
+    const double sp = std::sin(pitch);
+
+    Mat4 m = mat4_identity();
+    m.m[0][0] = cy;
+    m.m[0][1] = 0.0;
+    m.m[0][2] = sy;
+
+    m.m[1][0] = sy * sp;
+    m.m[1][1] = cp;
+    m.m[1][2] = -cy * sp;
+
+    m.m[2][0] = -sy * cp;
+    m.m[2][1] = sp;
+    m.m[2][2] = cy * cp;
+
+    m.m[0][3] = -(m.m[0][0] * pos.x + m.m[0][1] * pos.y + m.m[0][2] * pos.z);
+    m.m[1][3] = -(m.m[1][0] * pos.x + m.m[1][1] * pos.y + m.m[1][2] * pos.z);
+    m.m[2][3] = -(m.m[2][0] * pos.x + m.m[2][1] * pos.y + m.m[2][2] * pos.z);
+    return m;
+}
+
+static Mat4 make_projection_matrix(const double width, const double height,
+                                   const double fov_x, const double fov_y)
+{
+    if (width <= 0.0 || height <= 0.0 || kFarPlane <= kNearPlane)
+    {
+        return mat4_identity();
+    }
+    const double sx = 2.0 * fov_x / width;
+    const double sy = 2.0 * fov_y / height;
+    const double inv_range = 1.0 / (kFarPlane - kNearPlane);
+    const double a = kFarPlane * inv_range;
+    const double b = -kNearPlane * kFarPlane * inv_range;
+
+    Mat4 m{};
+    m.m[0][0] = sx;
+    m.m[1][1] = sy;
+    m.m[2][2] = a;
+    m.m[2][3] = b;
+    m.m[3][2] = 1.0;
+    return m;
 }
 
 static double clamp_pitch(const double pitch)
@@ -1742,6 +1997,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
 
     const bool paused = rotationPaused.load(std::memory_order_relaxed);
     const uint32_t frame_index = renderFrameIndex.fetch_add(1u, std::memory_order_relaxed);
+    previousVP = currentVP;
 
     if (sunOrbitEnabled.load(std::memory_order_relaxed) && !paused)
     {
@@ -1764,6 +2020,17 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     };
     const double yaw = camera_yaw.load(std::memory_order_relaxed);
     const double pitch = camera_pitch.load(std::memory_order_relaxed);
+    const double view_yaw = -yaw;
+    const double view_pitch = -pitch;
+    const Mat4 view = make_view_matrix(camera_pos, view_yaw, view_pitch);
+    const Mat4 proj = make_projection_matrix(static_cast<double>(width),
+                                             static_cast<double>(height),
+                                             fov_x, fov_y);
+    currentVP = mat4_multiply(proj, view);
+    if (!mat4_invert(currentVP, &inverseCurrentVP))
+    {
+        inverseCurrentVP = mat4_identity();
+    }
 
     float jitter_x = 0.0f;
     float jitter_y = 0.0f;
@@ -1775,7 +2042,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         jitter_x = (u - 0.5f) * jitter_scale;
         jitter_y = (v - 0.5f) * jitter_scale;
     }
-    const ViewRotation view_rot = make_view_rotation(-yaw, -pitch);
+    const ViewRotation view_rot = make_view_rotation(view_yaw, view_pitch);
 
     const double mat_ambient = 0.25;
     const double mat_diffuse = 1.0;
@@ -1994,6 +2261,20 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                 if (use_history)
                 {
                     ColorRGB prev = taa_history[pixel];
+                    if (!is_sky)
+                    {
+                        const double screen_x = static_cast<double>(x) + 0.5 + static_cast<double>(jitter_x);
+                        const double screen_y = static_cast<double>(y) + 0.5 + static_cast<double>(jitter_y);
+                        const Vec3 world = render_unproject_point({screen_x, screen_y, depth}, width, height);
+                        const Vec2 prev_screen = render_reproject_point(world, width, height);
+                        if (std::isfinite(prev_screen.x) && std::isfinite(prev_screen.y) &&
+                            prev_screen.x >= 0.0 && prev_screen.x <= static_cast<double>(width) &&
+                            prev_screen.y >= 0.0 && prev_screen.y <= static_cast<double>(height))
+                        {
+                            prev = sample_bilinear_history(taa_history.data(), width, height,
+                                                           prev_screen.x, prev_screen.y);
+                        }
+                    }
                     ColorRGB minc = current_linear;
                     ColorRGB maxc = current_linear;
                     for (int ny = -1; ny <= 1; ++ny)
@@ -2056,6 +2337,27 @@ Vec3 render_debug_tonemap_reinhard(const Vec3 color, const double exposure_value
     };
     const ColorRGB mapped = tonemap_reinhard(input, exposure_factor);
     return {mapped.r, mapped.g, mapped.b};
+}
+
+Vec3 render_debug_sample_history_bilinear(const Vec3* buffer, const size_t width, const size_t height,
+                                          const Vec2 screen_coord)
+{
+    return sample_bilinear_history_vec3(buffer, width, height, screen_coord.x, screen_coord.y);
+}
+
+Mat4 render_debug_get_current_vp()
+{
+    return currentVP;
+}
+
+Mat4 render_debug_get_previous_vp()
+{
+    return previousVP;
+}
+
+Mat4 render_debug_get_inverse_current_vp()
+{
+    return inverseCurrentVP;
 }
 
 void render_set_paused(const bool paused)
@@ -2521,6 +2823,64 @@ Vec2 render_project_point(const Vec3 world, const size_t width, const size_t hei
     const double proj_y = view.y * inv_z * fov_y;
 
     return {proj_x + static_cast<double>(width) / 2.0, proj_y + static_cast<double>(height) / 2.0};
+}
+
+Vec3 render_unproject_point(const Vec3 screen, const size_t width, const size_t height)
+{
+    if (width == 0 || height == 0)
+    {
+        return {0.0, 0.0, 0.0};
+    }
+
+    const Vec3 camera_pos{
+        camera_x.load(std::memory_order_relaxed),
+        camera_y.load(std::memory_order_relaxed),
+        camera_z.load(std::memory_order_relaxed)
+    };
+    const double yaw = camera_yaw.load(std::memory_order_relaxed);
+    const double pitch = camera_pitch.load(std::memory_order_relaxed);
+
+    const double fov_y = static_cast<double>(height) * 0.8;
+    const double fov_x = fov_y;
+    const double half_w = static_cast<double>(width) / 2.0;
+    const double half_h = static_cast<double>(height) / 2.0;
+
+    const double view_x = (screen.x - half_w) / fov_x * screen.z;
+    const double view_y = (screen.y - half_h) / fov_y * screen.z;
+    const double view_z = screen.z;
+
+    Vec3 view{view_x, view_y, view_z};
+    Vec3 world = rotate_pitch_yaw(view, yaw, pitch);
+    world.x += camera_pos.x;
+    world.y += camera_pos.y;
+    world.z += camera_pos.z;
+    return world;
+}
+
+Vec2 render_reproject_point(const Vec3 world, const size_t width, const size_t height)
+{
+    if (width == 0 || height == 0)
+    {
+        return {0.0, 0.0};
+    }
+
+    const Mat4& vp = previousVP;
+    const double clip_x = vp.m[0][0] * world.x + vp.m[0][1] * world.y + vp.m[0][2] * world.z + vp.m[0][3];
+    const double clip_y = vp.m[1][0] * world.x + vp.m[1][1] * world.y + vp.m[1][2] * world.z + vp.m[1][3];
+    const double clip_w = vp.m[3][0] * world.x + vp.m[3][1] * world.y + vp.m[3][2] * world.z + vp.m[3][3];
+
+    if (clip_w <= kNearPlane)
+    {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        return {nan, nan};
+    }
+
+    const double inv_w = 1.0 / clip_w;
+    const double ndc_x = clip_x * inv_w;
+    const double ndc_y = clip_y * inv_w;
+    const double screen_x = (ndc_x * 0.5 + 0.5) * static_cast<double>(width);
+    const double screen_y = (ndc_y * 0.5 + 0.5) * static_cast<double>(height);
+    return {screen_x, screen_y};
 }
 
 size_t render_debug_get_terrain_block_count()

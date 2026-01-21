@@ -13,6 +13,11 @@ struct Vec2
     double x, y;
 };
 
+struct Mat4
+{
+    double m[4][4];
+};
+
 void render_update_array(uint32_t* framebuffer, size_t width, size_t height);
 void render_set_paused(bool paused);
 bool render_is_paused();
@@ -52,10 +57,16 @@ void render_set_camera_rotation(Vec2 rot);
 Vec2 render_get_camera_rotation();
 void render_rotate_camera(Vec2 delta);
 Vec2 render_project_point(Vec3 world, size_t width, size_t height);
+Vec3 render_unproject_point(Vec3 screen, size_t width, size_t height);
+Vec2 render_reproject_point(Vec3 world, size_t width, size_t height);
 bool render_debug_depth_at_sample(Vec3 v0, Vec3 v1, Vec3 v2, Vec2 p, float* out_depth);
 double render_debug_eval_specular(double ndoth, double vdoth, double ndotl,
                                   double shininess, double f0);
 Vec3 render_debug_tonemap_reinhard(Vec3 color, double exposure);
+Vec3 render_debug_sample_history_bilinear(const Vec3* buffer, size_t width, size_t height, Vec2 screen_coord);
+Mat4 render_debug_get_current_vp();
+Mat4 render_debug_get_previous_vp();
+Mat4 render_debug_get_inverse_current_vp();
 bool render_debug_shadow_factor_with_frame(Vec3 world, Vec3 normal, Vec3 light_dir,
                                            int pixel_x, int pixel_y, int frame,
                                            float* out_factor);

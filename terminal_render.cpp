@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
