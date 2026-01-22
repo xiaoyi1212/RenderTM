@@ -158,10 +158,12 @@ void render_print()
     const double rad_to_deg = 180.0 / 3.14159265358979323846;
     const double yaw_deg = cam_rot.x * rad_to_deg;
     const double pitch_deg = cam_rot.y * rad_to_deg;
+    const double sharpen = render_debug_get_taa_sharpen_strength();
+    const double sharpen_pct = render_debug_get_taa_sharpen_percent();
     const int len = snprintf(info, sizeof(info),
-                             " RenderTM v0.0.1 Terminal:%lux%lu | Pixel:%lux%lu | FPS:%.2f | Cam(%.2f,%.2f,%.2f) Rot(%.1f,%.1f)",
+                             " RenderTM v0.0.1 Terminal:%lux%lu | Pixel:%lux%lu | FPS:%.2f | Sharpen:%.3f (%.0f%%) | Cam(%.2f,%.2f,%.2f) Rot(%.1f,%.1f)",
                              width, static_cast<size_t>(term_height), width, height, fps,
-                             cam_pos.x, cam_pos.y, cam_pos.z, yaw_deg, pitch_deg);
+                             sharpen, sharpen_pct, cam_pos.x, cam_pos.y, cam_pos.z, yaw_deg, pitch_deg);
     frame_buffer += info;
     if (len < static_cast<int>(width)) frame_buffer.append(width - len, ' ');
     frame_buffer += "\033[0m";

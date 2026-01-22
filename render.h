@@ -70,6 +70,8 @@ void render_debug_set_sky_colors_raw(uint32_t top, uint32_t bottom);
 Mat4 render_debug_get_current_vp();
 Mat4 render_debug_get_previous_vp();
 Mat4 render_debug_get_inverse_current_vp();
+double render_debug_get_taa_sharpen_strength();
+double render_debug_get_taa_sharpen_percent();
 bool render_debug_shadow_factor_with_frame(Vec3 world, Vec3 normal, Vec3 light_dir,
                                            int pixel_x, int pixel_y, int frame,
                                            float* out_factor);

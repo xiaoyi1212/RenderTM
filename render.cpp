@@ -95,6 +95,7 @@ static std::atomic<double> exposure{1.0};
 static std::atomic<bool> taaEnabled{true};
 static std::atomic<double> taaBlend{0.05};
 static std::atomic<bool> taaClampEnabled{true};
+static std::atomic<double> taaSharpenStrength{0.0};
 static std::atomic<uint64_t> renderStateVersion{1};
 static std::atomic<double> camera_x{16.0};
 static std::atomic<double> camera_y{-19.72};
@@ -300,6 +301,13 @@ constexpr double kSkyRayMaxDistance = 6.0;
 constexpr double kSkyRayBias = 0.02;
 constexpr double kSkyRayCenterBias = 0.02;
 constexpr int kTaaJitterSalt = 37;
+constexpr double kTaaSharpenMax = 0.25;
+constexpr double kTaaSharpenRotThreshold = 0.25;
+constexpr double kTaaSharpenMoveThreshold = 0.5;
+constexpr double kTaaSharpenMoveGain = 10.0;
+constexpr double kTaaSharpenRotGain = 20.0;
+constexpr float kTaaSharpenAttack = 0.5f;
+constexpr float kTaaSharpenRelease = 0.2f;
 constexpr float kShadowFilterDepthSigma = 0.6f;
 constexpr float kShadowFilterNormalSigma = 0.35f;
 constexpr float kShadowGaussianWeights[9] = {
@@ -1995,12 +2003,20 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     static std::vector<float> shadow_mask_filtered_moon;
     static std::vector<Vec3> sample_normals;
     static std::vector<ColorRGB> taa_history[2]; 
+    static std::vector<ColorRGB> taa_resolved;
+    static std::vector<uint8_t> taa_history_mask;
     static int taa_ping_pong = 0;
     static size_t taa_width = 0;
     static size_t taa_height = 0;
     static bool taa_history_valid = false;
     static uint64_t taa_state_version = 0;
     static bool taa_was_enabled = false;
+    static Vec3 last_camera_pos{0.0, 0.0, 0.0};
+    static double last_camera_yaw = 0.0;
+    static double last_camera_pitch = 0.0;
+    static bool last_camera_valid = false;
+    static float taa_motion_activity = 0.0f;
+    static uint64_t taa_motion_state_version = 0;
     const size_t sample_count = width * height;
     const float depth_max = std::numeric_limits<float>::max();
 
@@ -2024,6 +2040,8 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         shadow_mask_filtered_sun.assign(sample_count, 1.0f);
         shadow_mask_filtered_moon.assign(sample_count, 1.0f);
         sample_normals.assign(sample_count, {0.0, 0.0, 0.0});
+        taa_resolved.assign(sample_count, {0.0f, 0.0f, 0.0f});
+        taa_history_mask.assign(sample_count, 0);
     }
     else
     {
@@ -2081,6 +2099,59 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     };
     const double yaw_snapshot = camera_yaw.load(std::memory_order_relaxed);
     const double pitch_snapshot = camera_pitch.load(std::memory_order_relaxed);
+
+    float taa_sharpen_strength = 0.0f;
+    if (!taa_on)
+    {
+        taa_motion_activity = 0.0f;
+        last_camera_valid = false;
+    }
+    else
+    {
+        if (taa_motion_state_version != state_version)
+        {
+            taa_motion_state_version = state_version;
+            taa_motion_activity = 0.0f;
+            last_camera_valid = false;
+        }
+        double motion_factor = 0.0;
+        if (last_camera_valid)
+        {
+            const double dx = camera_pos_snapshot.x - last_camera_pos.x;
+            const double dy = camera_pos_snapshot.y - last_camera_pos.y;
+            const double dz = camera_pos_snapshot.z - last_camera_pos.z;
+            const double move_dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const double dyaw = yaw_snapshot - last_camera_yaw;
+            const double dpitch = pitch_snapshot - last_camera_pitch;
+            const double rot_dist = std::sqrt(dyaw * dyaw + dpitch * dpitch);
+            const double move_factor = kTaaSharpenMoveThreshold > 0.0
+                ? (move_dist / kTaaSharpenMoveThreshold) * kTaaSharpenMoveGain
+                : 0.0;
+            const double rot_factor = kTaaSharpenRotThreshold > 0.0
+                ? (rot_dist / kTaaSharpenRotThreshold) * kTaaSharpenRotGain
+                : 0.0;
+            motion_factor = std::sqrt(move_factor * move_factor + rot_factor * rot_factor);
+            motion_factor = std::clamp(motion_factor, 0.0, 1.0);
+        }
+
+        const float target = static_cast<float>(motion_factor);
+        if (!last_camera_valid)
+        {
+            taa_motion_activity = target;
+        }
+        else
+        {
+            const float rate = (target > taa_motion_activity) ? kTaaSharpenAttack : kTaaSharpenRelease;
+            taa_motion_activity = taa_motion_activity + (target - taa_motion_activity) * rate;
+        }
+
+        taa_sharpen_strength = static_cast<float>(taa_motion_activity * kTaaSharpenMax);
+    }
+    taaSharpenStrength.store(static_cast<double>(taa_sharpen_strength), std::memory_order_relaxed);
+    last_camera_pos = camera_pos_snapshot;
+    last_camera_yaw = yaw_snapshot;
+    last_camera_pitch = pitch_snapshot;
+    last_camera_valid = true;
 
     const double fov_y = static_cast<double>(height) * 0.8;
     const double fov_x = fov_y;
@@ -2329,20 +2400,21 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
             }
 
             ColorRGB blended = current_linear;
+            bool history_used = false;
             if (taa_on)
             {
                 bool history_valid = use_history;
                 ColorRGB prev = current_linear;
                 if (history_valid)
                 {
-                    prev = history_read_ptr[pixel]; 
+                    prev = history_read_ptr[pixel];
                     if (!is_sky)
                     {
                         const double screen_x = static_cast<double>(x) + 0.5 + static_cast<double>(jitter_x);
                         const double screen_y = static_cast<double>(y) + 0.5 + static_cast<double>(jitter_y);
 
-                        Vec3 world = unproject_fast(screen_x, screen_y, depth, 
-                                                    inverseCurrentVP, static_cast<double>(width), static_cast<double>(height), 
+                        Vec3 world = unproject_fast(screen_x, screen_y, depth,
+                                                    inverseCurrentVP, static_cast<double>(width), static_cast<double>(height),
                                                     proj_a, proj_b);
 
                         Vec2 prev_screen = render_reproject_point(world, width, height);
@@ -2394,6 +2466,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                     blended.r = prev.r + (current_linear.r - prev.r) * taa_factor;
                     blended.g = prev.g + (current_linear.g - prev.g) * taa_factor;
                     blended.b = prev.b + (current_linear.b - prev.b) * taa_factor;
+                    history_used = true;
                 }
                 else
                 {
@@ -2403,7 +2476,50 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                 history_write_ptr[pixel] = blended;
             }
 
-            const ColorRGB mapped = tonemap_reinhard(blended, exposure_factor);
+            taa_resolved[pixel] = blended;
+            taa_history_mask[pixel] = static_cast<uint8_t>(history_used && !is_sky);
+        }
+    }
+
+    auto resolved_at = [&](int ix, int iy) -> ColorRGB {
+        ix = std::clamp(ix, 0, static_cast<int>(width) - 1);
+        iy = std::clamp(iy, 0, static_cast<int>(height) - 1);
+        const size_t idx = static_cast<size_t>(iy) * width + static_cast<size_t>(ix);
+        return taa_resolved[idx];
+    };
+
+    const bool apply_sharpen = taa_sharpen_strength > 0.0f;
+
+    for (size_t y = 0; y < height; ++y)
+    {
+        for (size_t x = 0; x < width; ++x)
+        {
+            const size_t pixel = y * width + x;
+            const bool is_sky = zbuffer[pixel] >= depth_max;
+            ColorRGB resolved = taa_resolved[pixel];
+
+            if (apply_sharpen && taa_history_mask[pixel])
+            {
+                const ColorRGB center = resolved;
+                const ColorRGB north = resolved_at(static_cast<int>(x), static_cast<int>(y) - 1);
+                const ColorRGB south = resolved_at(static_cast<int>(x), static_cast<int>(y) + 1);
+                const ColorRGB west = resolved_at(static_cast<int>(x) - 1, static_cast<int>(y));
+                const ColorRGB east = resolved_at(static_cast<int>(x) + 1, static_cast<int>(y));
+                const float inv = 1.0f / 8.0f;
+                const ColorRGB blur{
+                    (center.r * 4.0f + north.r + south.r + west.r + east.r) * inv,
+                    (center.g * 4.0f + north.g + south.g + west.g + east.g) * inv,
+                    (center.b * 4.0f + north.b + south.b + west.b + east.b) * inv
+                };
+                resolved.r = center.r + (center.r - blur.r) * taa_sharpen_strength;
+                resolved.g = center.g + (center.g - blur.g) * taa_sharpen_strength;
+                resolved.b = center.b + (center.b - blur.b) * taa_sharpen_strength;
+                resolved.r = std::max(0.0f, resolved.r);
+                resolved.g = std::max(0.0f, resolved.g);
+                resolved.b = std::max(0.0f, resolved.b);
+            }
+
+            const ColorRGB mapped = tonemap_reinhard(resolved, exposure_factor);
             ColorRGB srgb = linear_to_srgb(mapped);
             if (!is_sky)
             {
@@ -2467,6 +2583,23 @@ Mat4 render_debug_get_previous_vp()
 Mat4 render_debug_get_inverse_current_vp()
 {
     return inverseCurrentVP;
+}
+
+double render_debug_get_taa_sharpen_strength()
+{
+    return taaSharpenStrength.load(std::memory_order_relaxed);
+}
+
+double render_debug_get_taa_sharpen_percent()
+{
+    const double max_strength = kTaaSharpenMax;
+    if (max_strength <= 0.0)
+    {
+        return 0.0;
+    }
+    const double strength = render_debug_get_taa_sharpen_strength();
+    const double ratio = std::clamp(strength / max_strength, 0.0, 1.0);
+    return ratio * 100.0;
 }
 
 void render_set_paused(const bool paused)

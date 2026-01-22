@@ -1328,6 +1328,70 @@ TEST_CASE("render_update_array stabilizes jittered pixels when camera is static"
     render_set_paused(false);
 }
 
+TEST_CASE("taa sharpening stays disabled when camera is static")
+{
+    reset_camera();
+    render_set_paused(true);
+    render_set_taa_enabled(true);
+    render_set_taa_blend(0.1);
+    render_set_taa_clamp_enabled(true);
+
+    const size_t width = 120;
+    const size_t height = 90;
+    std::vector<uint32_t> framebuffer(width * height, 0u);
+
+    render_update_array(framebuffer.data(), width, height);
+    render_update_array(framebuffer.data(), width, height);
+
+    const double strength = render_debug_get_taa_sharpen_strength();
+    REQUIRE(strength == Catch::Approx(0.0).margin(1e-6));
+
+    render_set_paused(false);
+}
+
+TEST_CASE("taa sharpening ramps with camera motion")
+{
+    reset_camera();
+    render_set_paused(true);
+    render_set_taa_enabled(true);
+    render_set_taa_blend(0.1);
+    render_set_taa_clamp_enabled(true);
+
+    const size_t width = 120;
+    const size_t height = 90;
+    std::vector<uint32_t> framebuffer(width * height, 0u);
+
+    render_update_array(framebuffer.data(), width, height);
+    render_update_array(framebuffer.data(), width, height);
+
+    render_set_camera_rotation({0.005, 0.0});
+    render_update_array(framebuffer.data(), width, height);
+    const double small = render_debug_get_taa_sharpen_strength();
+    REQUIRE(small > 0.0);
+
+    render_set_camera_rotation({0.02, 0.0});
+    render_update_array(framebuffer.data(), width, height);
+    const double large = render_debug_get_taa_sharpen_strength();
+    REQUIRE(large > small);
+
+    render_set_camera_rotation({0.05, 0.0});
+    render_update_array(framebuffer.data(), width, height);
+    double saturated = render_debug_get_taa_sharpen_strength();
+    REQUIRE(saturated > large);
+
+    for (int i = 0; i < 4; ++i)
+    {
+        render_set_camera_rotation({0.05 * (i + 2), 0.0});
+        render_update_array(framebuffer.data(), width, height);
+        saturated = render_debug_get_taa_sharpen_strength();
+    }
+
+    const double saturated_pct = render_debug_get_taa_sharpen_percent();
+    REQUIRE(saturated_pct > 95.0);
+
+    render_set_paused(false);
+}
+
 TEST_CASE("temporal history clamping prevents ghosting after sudden color changes")
 {
     reset_camera();
