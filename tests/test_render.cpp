@@ -1271,7 +1271,7 @@ TEST_CASE("temporal accumulation reduces frame-to-frame noise")
     REQUIRE(delta_taa < delta_no_taa);
 }
 
-TEST_CASE("UnjitterCheck")
+TEST_CASE("render_update_array stabilizes jittered pixels when camera is static")
 {
     reset_camera();
     render_set_paused(true);
@@ -1328,7 +1328,7 @@ TEST_CASE("UnjitterCheck")
     render_set_paused(false);
 }
 
-TEST_CASE("ClampingCheck")
+TEST_CASE("temporal history clamping prevents ghosting after sudden color changes")
 {
     reset_camera();
     render_set_paused(true);
@@ -2921,7 +2921,7 @@ TEST_CASE("render_reproject_point maps world position into previous frame")
     REQUIRE((current.x - prev.x) == Catch::Approx(expected_delta).margin(1e-6));
 }
 
-TEST_CASE("ReprojectionAlignmentTest")
+TEST_CASE("reprojection alignment maps scene points back to previous screen coordinates")
 {
     reset_camera();
     render_set_taa_enabled(true);
@@ -2966,7 +2966,7 @@ TEST_CASE("ReprojectionAlignmentTest")
     render_set_taa_clamp_enabled(true);
 }
 
-TEST_CASE("BoundaryReject")
+TEST_CASE("temporal accumulation rejects history for pixels reprojected outside the frame")
 {
     reset_camera();
     render_set_paused(true);

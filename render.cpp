@@ -93,7 +93,7 @@ static std::atomic<double> skyLightIntensity{0.32};
 static std::atomic<double> ambientLight{0.13};
 static std::atomic<double> exposure{1.0};
 static std::atomic<bool> taaEnabled{true};
-static std::atomic<double> taaBlend{0.1};
+static std::atomic<double> taaBlend{0.05};
 static std::atomic<bool> taaClampEnabled{true};
 static std::atomic<uint64_t> renderStateVersion{1};
 static std::atomic<double> camera_x{16.0};
@@ -240,6 +240,36 @@ struct ShadingContext
         double angular_radius;
     };
     std::array<DirectionalLightInfo, 2> lights;
+};
+
+struct TaaContext {
+    std::vector<ColorRGB> buffers[2];
+    int write_index = 0;
+    bool valid = false;
+    size_t width = 0, height = 0;
+
+    void ensure_size(size_t w, size_t h) {
+        if (width != w || height != h) {
+            width = w; height = h;
+            buffers[0].assign(w * h, {0,0,0});
+            buffers[1].assign(w * h, {0,0,0});
+            valid = false;
+            write_index = 0;
+        }
+    }
+
+    const ColorRGB* get_read_buffer() const {
+        return buffers[(write_index + 1) % 2].data();
+    }
+
+    ColorRGB* get_write_buffer() {
+        return buffers[write_index].data();
+    }
+
+    void swap() {
+        valid = true;
+        write_index = (write_index + 1) % 2;
+    }
 };
 
 constexpr double kShadowRayBias = 0.05;
@@ -1922,6 +1952,34 @@ static void render_quad(float* zbuffer, ColorRGB* sample_ambient,
     draw_clipped(0, 2, 3);
 }
 
+static Vec3 unproject_fast(double screen_x, double screen_y, double depth, 
+                           const Mat4& inv_vp, double width, double height,
+                           double proj_a, double proj_b)
+{
+    const double ndc_x = (screen_x / width - 0.5) * 2.0;
+    const double ndc_y = (screen_y / height - 0.5) * 2.0;
+    
+    const double view_z = depth;
+    const double ndc_z = proj_a + proj_b / view_z;
+    
+    const double clip_w = view_z;
+    const double clip_x = ndc_x * clip_w;
+    const double clip_y = ndc_y * clip_w;
+    const double clip_z = ndc_z * clip_w;
+
+    double wx = inv_vp.m[0][0]*clip_x + inv_vp.m[0][1]*clip_y + inv_vp.m[0][2]*clip_z + inv_vp.m[0][3]*clip_w;
+    double wy = inv_vp.m[1][0]*clip_x + inv_vp.m[1][1]*clip_y + inv_vp.m[1][2]*clip_z + inv_vp.m[1][3]*clip_w;
+    double wz = inv_vp.m[2][0]*clip_x + inv_vp.m[2][1]*clip_y + inv_vp.m[2][2]*clip_z + inv_vp.m[2][3]*clip_w;
+    double ww = inv_vp.m[3][0]*clip_x + inv_vp.m[3][1]*clip_y + inv_vp.m[3][2]*clip_z + inv_vp.m[3][3]*clip_w;
+
+    if (std::abs(ww) > 1e-6) {
+        const double inv_ww = 1.0 / ww;
+        wx *= inv_ww; wy *= inv_ww; wz *= inv_ww;
+    }
+
+    return {wx, wy, wz};
+}
+
 void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
 {
     static size_t cached_width = 0;
@@ -1936,7 +1994,8 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     static std::vector<float> shadow_mask_filtered_sun;
     static std::vector<float> shadow_mask_filtered_moon;
     static std::vector<Vec3> sample_normals;
-    static std::vector<ColorRGB> taa_history;
+    static std::vector<ColorRGB> taa_history[2]; 
+    static int taa_ping_pong = 0;
     static size_t taa_width = 0;
     static size_t taa_height = 0;
     static bool taa_history_valid = false;
@@ -1986,9 +2045,11 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         {
             taa_width = width;
             taa_height = height;
-            taa_history.assign(sample_count, {0.0f, 0.0f, 0.0f});
+            taa_history[0].assign(sample_count, {0.0f, 0.0f, 0.0f});
+            taa_history[1].assign(sample_count, {0.0f, 0.0f, 0.0f});
             taa_history_valid = false;
             taa_state_version = state_version;
+            taa_ping_pong = 0;
         }
     }
     else
@@ -2000,7 +2061,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     const bool paused = rotationPaused.load(std::memory_order_relaxed);
     const uint32_t frame_index = renderFrameIndex.fetch_add(1u, std::memory_order_relaxed);
     previousVP = currentVP;
-
+    
     if (sunOrbitEnabled.load(std::memory_order_relaxed) && !paused)
     {
         double angle = sunOrbitAngle.load(std::memory_order_relaxed) +
@@ -2013,18 +2074,20 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         sunOrbitAngle.store(angle, std::memory_order_relaxed);
     }
 
-    const double fov_y = static_cast<double>(height) * 0.8;
-    const double fov_x = fov_y;
-    const Vec3 camera_pos{
+    const Vec3 camera_pos_snapshot{
         camera_x.load(std::memory_order_relaxed),
         camera_y.load(std::memory_order_relaxed),
         camera_z.load(std::memory_order_relaxed)
     };
-    const double yaw = camera_yaw.load(std::memory_order_relaxed);
-    const double pitch = camera_pitch.load(std::memory_order_relaxed);
-    const double view_yaw = -yaw;
-    const double view_pitch = -pitch;
-    const Mat4 view = make_view_matrix(camera_pos, view_yaw, view_pitch);
+    const double yaw_snapshot = camera_yaw.load(std::memory_order_relaxed);
+    const double pitch_snapshot = camera_pitch.load(std::memory_order_relaxed);
+
+    const double fov_y = static_cast<double>(height) * 0.8;
+    const double fov_x = fov_y;
+    
+    const double view_yaw = -yaw_snapshot;
+    const double view_pitch = -pitch_snapshot;
+    const Mat4 view = make_view_matrix(camera_pos_snapshot, view_yaw, view_pitch);
     const Mat4 proj = make_projection_matrix(static_cast<double>(width),
                                              static_cast<double>(height),
                                              fov_x, fov_y);
@@ -2033,6 +2096,10 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     {
         inverseCurrentVP = mat4_identity();
     }
+
+    const double inv_dist = 1.0 / (kFarPlane - kNearPlane);
+    const double proj_a = kFarPlane * inv_dist;
+    const double proj_b = -kNearPlane * kFarPlane * inv_dist;
 
     float jitter_x = 0.0f;
     float jitter_y = 0.0f;
@@ -2109,7 +2176,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
             Vec3 right, up, forward;
             build_light_basis(lights[i].dir, right, up, forward);
             const double scale = std::tan(lights[i].angular_radius);
-            
+
             lights_right_scaled[i] = {right.x * scale, right.y * scale, right.z * scale};
             lights_up_scaled[i]    = {up.x * scale, up.y * scale, up.z * scale};
         }
@@ -2154,7 +2221,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
             sky_bottom_linear,
             hemi_ground,
             sky_scale,
-            camera_pos,
+            camera_pos_snapshot,
             ambient_value,
             material,
             direct_lighting_enabled,
@@ -2179,7 +2246,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                     shadow_mask_sun.data(), shadow_mask_moon.data(),
                     sample_normals.data(),
                     width, height, quad, fov_x, fov_y,
-                    camera_pos, view_rot, ctx, frame_index, jitter_x, jitter_y,
+                    camera_pos_snapshot, view_rot, ctx, frame_index, jitter_x, jitter_y,
                     lights_right_scaled, lights_up_scaled); 
     }
 
@@ -2216,9 +2283,13 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     };
     const float dither_strength = 2.0f;
     const float dither_scale = dither_strength / 16.0f;
-
     const float exposure_factor = static_cast<float>(std::max(0.0, exposure.load(std::memory_order_relaxed)));
     const bool use_history = taa_on && taa_history_valid;
+
+    const int read_idx = (taa_ping_pong + 1) % 2;
+    const int write_idx = taa_ping_pong;
+    const ColorRGB* history_read_ptr = taa_history[read_idx].data();
+    ColorRGB* history_write_ptr = taa_history[write_idx].data();
 
     auto current_linear_at = [&](int ix, int iy) -> ColorRGB {
         ix = std::clamp(ix, 0, static_cast<int>(width) - 1);
@@ -2264,18 +2335,28 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                 ColorRGB prev = current_linear;
                 if (history_valid)
                 {
-                    prev = taa_history[pixel];
+                    prev = history_read_ptr[pixel]; 
                     if (!is_sky)
                     {
-                        const double screen_x = static_cast<double>(x) + 0.5;
-                        const double screen_y = static_cast<double>(y) + 0.5;
-                        const Vec3 world = render_unproject_point({screen_x, screen_y, depth}, width, height);
-                        const Vec2 prev_screen = render_reproject_point(world, width, height);
+                        const double screen_x = static_cast<double>(x) + 0.5 + static_cast<double>(jitter_x);
+                        const double screen_y = static_cast<double>(y) + 0.5 + static_cast<double>(jitter_y);
+
+                        Vec3 world = unproject_fast(screen_x, screen_y, depth, 
+                                                    inverseCurrentVP, static_cast<double>(width), static_cast<double>(height), 
+                                                    proj_a, proj_b);
+
+                        Vec2 prev_screen = render_reproject_point(world, width, height);
+
+                        if (std::isfinite(prev_screen.x) && std::isfinite(prev_screen.y))
+                        {
+                            prev_screen.x -= static_cast<double>(jitter_x);
+                            prev_screen.y -= static_cast<double>(jitter_y);
+                        }
                         if (std::isfinite(prev_screen.x) && std::isfinite(prev_screen.y) &&
                             prev_screen.x >= 0.0 && prev_screen.x <= static_cast<double>(width) &&
                             prev_screen.y >= 0.0 && prev_screen.y <= static_cast<double>(height))
                         {
-                            prev = sample_bilinear_history(taa_history.data(), width, height,
+                            prev = sample_bilinear_history(history_read_ptr, width, height,
                                                            prev_screen.x, prev_screen.y);
                         }
                         else
@@ -2319,7 +2400,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                     blended = current_linear;
                 }
 
-                taa_history[pixel] = blended;
+                history_write_ptr[pixel] = blended;
             }
 
             const ColorRGB mapped = tonemap_reinhard(blended, exposure_factor);
@@ -2335,10 +2416,11 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
             framebuffer[pixel] = pack_color(srgb);
         }
     }
-
+    
     if (taa_on)
     {
         taa_history_valid = true;
+        taa_ping_pong = (taa_ping_pong + 1) % 2;
     }
 }
 
