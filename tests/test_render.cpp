@@ -1060,7 +1060,7 @@ TEST_CASE("blue noise sampling responds to salt and frame")
     REQUIRE(same_frame < total);
 }
 
-TEST_CASE("shadow spatial filter applies gaussian blur with bilateral rejection")
+TEST_CASE("shadow spatial filter applies cross blur with bilateral rejection")
 {
     const std::array<float, 9> mask = {1.0f, 1.0f, 1.0f,
                                        1.0f, 0.0f, 1.0f,
@@ -1073,8 +1073,8 @@ TEST_CASE("shadow spatial filter applies gaussian blur with bilateral rejection"
         n = {0.0, 1.0, 0.0};
     }
 
-    const float baseline = render_debug_shadow_filter_3x3(mask.data(), depth_same.data(), normals_same.data());
-    REQUIRE(baseline == Catch::Approx(0.75f).margin(0.02f));
+    const float baseline = render_debug_shadow_filter(mask.data(), depth_same.data(), normals_same.data());
+    REQUIRE(baseline == Catch::Approx(0.5f).margin(0.02f));
 
     std::array<float, 9> depth_far = depth_same;
     for (size_t i = 0; i < depth_far.size(); ++i)
@@ -1084,7 +1084,7 @@ TEST_CASE("shadow spatial filter applies gaussian blur with bilateral rejection"
             depth_far[i] = 50.0f;
         }
     }
-    const float depth_filtered = render_debug_shadow_filter_3x3(mask.data(), depth_far.data(), normals_same.data());
+    const float depth_filtered = render_debug_shadow_filter(mask.data(), depth_far.data(), normals_same.data());
     REQUIRE(depth_filtered < baseline);
     REQUIRE(depth_filtered < 0.2f);
 
@@ -1096,7 +1096,7 @@ TEST_CASE("shadow spatial filter applies gaussian blur with bilateral rejection"
             normals_flipped[i] = {0.0, -1.0, 0.0};
         }
     }
-    const float normal_filtered = render_debug_shadow_filter_3x3(mask.data(), depth_same.data(), normals_flipped.data());
+    const float normal_filtered = render_debug_shadow_filter(mask.data(), depth_same.data(), normals_flipped.data());
     REQUIRE(normal_filtered < baseline);
     REQUIRE(normal_filtered < 0.2f);
 }

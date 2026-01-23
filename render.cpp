@@ -308,13 +308,11 @@ constexpr double kTaaSharpenMoveGain = 10.0;
 constexpr double kTaaSharpenRotGain = 20.0;
 constexpr float kTaaSharpenAttack = 0.5f;
 constexpr float kTaaSharpenRelease = 0.2f;
-constexpr float kShadowFilterDepthSigma = 0.6f;
-constexpr float kShadowFilterNormalSigma = 0.35f;
-constexpr float kShadowGaussianWeights[9] = {
-    1.0f, 2.0f, 1.0f,
-    2.0f, 4.0f, 2.0f,
-    1.0f, 2.0f, 1.0f
-};
+constexpr bool kShadowFilterEnabled = true;
+constexpr float kShadowFilterDepthThreshold = 1.0f;
+constexpr float kShadowFilterNormalThreshold = 0.5f;
+constexpr float kShadowFilterCenterWeight = 4.0f;
+constexpr float kShadowFilterNeighborWeight = 1.0f;
 
 static Vec3 normalize_vec(const Vec3& v);
 static float compute_shadow_factor(const Vec3& light_dir, const Vec3& world, const Vec3& normal);
@@ -326,10 +324,11 @@ static Vec3 jitter_shadow_direction(const Vec3& light_dir,
                                     const Vec3& up_scaled,
                                     const int px, const int py,
                                     const uint32_t frame, const int salt);
-static float shadow_filter_3x3_at(const float* mask, const float* depth, const Vec3* normals,
-                                  size_t width, size_t height, int x, int y, float depth_max);
-static void filter_shadow_mask_3x3(const float* mask, float* out_mask, const float* depth,
-                                   const Vec3* normals, size_t width, size_t height, float depth_max);
+static float shadow_filter_at(const float* mask, const float* depth, const Vec3* normals,
+                              size_t width, size_t height, int x, int y, float depth_max);
+static void filter_shadow_masks(const float* mask_a, const float* mask_b,
+                                float* out_a, float* out_b, const float* depth,
+                                const Vec3* normals, size_t width, size_t height, float depth_max);
 static Vec3 add_vec(const Vec3& a, const Vec3& b);
 static double dot_vec(const Vec3& a, const Vec3& b);
 static Vec3 cross_vec(const Vec3& a, const Vec3& b);
@@ -1457,155 +1456,194 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
     if (area == 0.0f) return;
 
     const bool area_positive = area > 0.0f;
+    const float inv_area = 1.0f / area;
     const float inv_z0 = 1.0f / v0.z;
     const float inv_z1 = 1.0f / v1.z;
     const float inv_z2 = 1.0f / v2.z;
 
+    const float w0_a = v2.y - v1.y;
+    const float w0_b = v1.x - v2.x;
+    const float w0_c = v1.y * v2.x - v1.x * v2.y;
+
+    const float w1_a = v0.y - v2.y;
+    const float w1_b = v2.x - v0.x;
+    const float w1_c = v2.y * v0.x - v2.x * v0.y;
+
+    const float w2_a = v1.y - v0.y;
+    const float w2_b = v0.x - v1.x;
+    const float w2_c = v0.y * v1.x - v0.x * v1.y;
+
+    const float start_x = static_cast<float>(x0) + 0.5f + jitter_x;
+    const float start_y = static_cast<float>(y0) + 0.5f + jitter_y;
+
+    float w0_row = w0_a * start_x + w0_b * start_y + w0_c;
+    float w1_row = w1_a * start_x + w1_b * start_y + w1_c;
+    float w2_row = w2_a * start_x + w2_b * start_y + w2_c;
+
+    const float w0_a_i = w0_a * inv_z0 * inv_area;
+    const float w1_a_i = w1_a * inv_z1 * inv_area;
+    const float w2_a_i = w2_a * inv_z2 * inv_area;
+    const float w0_b_i = w0_b * inv_z0 * inv_area;
+    const float w1_b_i = w1_b * inv_z1 * inv_area;
+    const float w2_b_i = w2_b * inv_z2 * inv_area;
+
+    float w0i_row = w0_row * inv_z0 * inv_area;
+    float w1i_row = w1_row * inv_z1 * inv_area;
+    float w2i_row = w2_row * inv_z2 * inv_area;
+
     for (int y = y0; y <= y1; ++y)
     {
+        float w0 = w0_row;
+        float w1 = w1_row;
+        float w2 = w2_row;
+        float w0i = w0i_row;
+        float w1i = w1i_row;
+        float w2i = w2i_row;
+
         for (int x = x0; x <= x1; ++x)
         {
-            ScreenVertex p{
-                static_cast<float>(x) + 0.5f + jitter_x,
-                static_cast<float>(y) + 0.5f + jitter_y,
-                0.0f
-            };
-            float w0 = edge_function(v1, v2, p);
-            float w1 = edge_function(v2, v0, p);
-            float w2 = edge_function(v0, v1, p);
-
             if ((w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f && area_positive) ||
                 (w0 <= 0.0f && w1 <= 0.0f && w2 <= 0.0f && !area_positive))
             {
-                w0 /= area;
-                w1 /= area;
-                w2 /= area;
-                const float inv_z = w0 * inv_z0 + w1 * inv_z1 + w2 * inv_z2;
-                if (inv_z <= 0.0f)
+                const float inv_z = w0i + w1i + w2i;
+                if (inv_z > 0.0f)
                 {
-                    continue;
-                }
-                const float depth = 1.0f / inv_z;
-                const size_t idx = static_cast<size_t>(y) * width + static_cast<size_t>(x);
-                if (depth < zbuffer[idx])
-                {
-                    zbuffer[idx] = depth;
-                    const float w0p = w0 * inv_z0 / inv_z;
-                    const float w1p = w1 * inv_z1 / inv_z;
-                    const float w2p = w2 * inv_z2 / inv_z;
-                    const float visibility = ctx.ambient_occlusion_enabled
-                                                 ? std::clamp(w0p * vis0 + w1p * vis1 + w2p * vis2, 0.0f, 1.0f)
-                                                 : 1.0f;
-                    Vec3 normal{
-                        w0p * n0.x + w1p * n1.x + w2p * n2.x,
-                        w0p * n0.y + w1p * n1.y + w2p * n2.y,
-                        w0p * n0.z + w1p * n1.z + w2p * n2.z
-                    };
-                    normal = normalize_vec(normal);
-
-                    Vec3 world{
-                        w0p * wp0.x + w1p * wp1.x + w2p * wp2.x,
-                        w0p * wp0.y + w1p * wp1.y + w2p * wp2.y,
-                        w0p * wp0.z + w1p * wp1.z + w2p * wp2.z
-                    };
-
-                    const double ambient = ctx.direct_lighting_enabled ? ctx.ambient_light * ctx.material.ambient : 0.0;
-                    ColorRGB ambient_color{
-                        static_cast<float>(ctx.albedo.r * ambient),
-                        static_cast<float>(ctx.albedo.g * ambient),
-                        static_cast<float>(ctx.albedo.b * ambient)
-                    };
-                    if (ctx.sky_scale > 0.0f)
+                    const float depth = 1.0f / inv_z;
+                    const size_t idx = static_cast<size_t>(y) * width + static_cast<size_t>(x);
+                    if (depth < zbuffer[idx])
                     {
-                        float sky_t = static_cast<float>((-normal.y) * 0.5 + 0.5);
-                        sky_t = std::clamp(sky_t, 0.0f, 1.0f);
-                        const ColorRGB sky = lerp_color(ctx.hemi_ground, ctx.sky_top, sky_t);
-                        ambient_color.r = sky.r * ctx.sky_scale * ctx.albedo.r;
-                        ambient_color.g = sky.g * ctx.sky_scale * ctx.albedo.g;
-                        ambient_color.b = sky.b * ctx.sky_scale * ctx.albedo.b;
-                    }
-                    ambient_color.r *= visibility;
-                    ambient_color.g *= visibility;
-                    ambient_color.b *= visibility;
-
-                    ColorRGB direct_sun{0.0f, 0.0f, 0.0f};
-                    ColorRGB direct_moon{0.0f, 0.0f, 0.0f};
-                    float shadow_sun = 1.0f;
-                    float shadow_moon = 1.0f;
-                    if (ctx.direct_lighting_enabled)
-                    {
-                        const Vec3 view_vec{
-                            ctx.camera_pos.x - world.x,
-                            ctx.camera_pos.y - world.y,
-                            ctx.camera_pos.z - world.z
+                        zbuffer[idx] = depth;
+                        const float w0p = w0i / inv_z;
+                        const float w1p = w1i / inv_z;
+                        const float w2p = w2i / inv_z;
+                        const float visibility = ctx.ambient_occlusion_enabled
+                                                     ? std::clamp(w0p * vis0 + w1p * vis1 + w2p * vis2, 0.0f, 1.0f)
+                                                     : 1.0f;
+                        Vec3 normal{
+                            w0p * n0.x + w1p * n1.x + w2p * n2.x,
+                            w0p * n0.y + w1p * n1.y + w2p * n2.y,
+                            w0p * n0.z + w1p * n1.z + w2p * n2.z
                         };
-                        const Vec3 view_dir = normalize_vec(view_vec);
+                        normal = normalize_vec(normal);
 
-                        auto eval_light = [&](const ShadingContext::DirectionalLightInfo& light,
-                                              const int light_idx, const int shadow_salt,
-                                              ColorRGB& out_direct, float& out_shadow) {
-                            out_direct = {0.0f, 0.0f, 0.0f};
-                            out_shadow = 1.0f;
-                            if (light.intensity <= 0.0)
-                            {
-                                return;
-                            }
-                            const double ndotl = std::max(0.0, dot_vec(normal, light.dir));
-                            if (ndotl <= 0.0)
-                            {
-                                return;
-                            }
-                            if (ctx.shadows_enabled)
-                            {
-                                const Vec3 shadow_dir = jitter_shadow_direction(light.dir,
-                                                        lights_right_scaled[light_idx],
-                                                        lights_up_scaled[light_idx],
-                                                        x, y, frame_index,
-                                                        shadow_salt);
-                                out_shadow = compute_shadow_factor(shadow_dir, world, normal);
-                            }
+                        Vec3 world{
+                            w0p * wp0.x + w1p * wp1.x + w2p * wp2.x,
+                            w0p * wp0.y + w1p * wp1.y + w2p * wp2.y,
+                            w0p * wp0.z + w1p * wp1.z + w2p * wp2.z
+                        };
 
-                            const Vec3 half_vec = normalize_vec(add_vec(light.dir, view_dir));
-                            const double f0 = std::clamp(ctx.material.specular, 0.0, 1.0);
-                            const double vdoth = std::max(0.0, dot_vec(view_dir, half_vec));
-                            const double fresnel = schlick_fresnel(vdoth, f0);
-                            const double diffuse_scale = std::clamp(1.0 - fresnel, 0.0, 1.0);
-                            const double diffuse = ndotl * light.intensity * ctx.material.diffuse * diffuse_scale;
-                            ColorRGB light_color{
-                                static_cast<float>(ctx.albedo.r * diffuse),
-                                static_cast<float>(ctx.albedo.g * diffuse),
-                                static_cast<float>(ctx.albedo.b * diffuse)
+                        const double ambient = ctx.direct_lighting_enabled ? ctx.ambient_light * ctx.material.ambient : 0.0;
+                        ColorRGB ambient_color{
+                            static_cast<float>(ctx.albedo.r * ambient),
+                            static_cast<float>(ctx.albedo.g * ambient),
+                            static_cast<float>(ctx.albedo.b * ambient)
+                        };
+                        if (ctx.sky_scale > 0.0f)
+                        {
+                            float sky_t = static_cast<float>((-normal.y) * 0.5 + 0.5);
+                            sky_t = std::clamp(sky_t, 0.0f, 1.0f);
+                            const ColorRGB sky = lerp_color(ctx.hemi_ground, ctx.sky_top, sky_t);
+                            ambient_color.r = sky.r * ctx.sky_scale * ctx.albedo.r;
+                            ambient_color.g = sky.g * ctx.sky_scale * ctx.albedo.g;
+                            ambient_color.b = sky.b * ctx.sky_scale * ctx.albedo.b;
+                        }
+                        ambient_color.r *= visibility;
+                        ambient_color.g *= visibility;
+                        ambient_color.b *= visibility;
+
+                        ColorRGB direct_sun{0.0f, 0.0f, 0.0f};
+                        ColorRGB direct_moon{0.0f, 0.0f, 0.0f};
+                        float shadow_sun = 1.0f;
+                        float shadow_moon = 1.0f;
+                        if (ctx.direct_lighting_enabled)
+                        {
+                            const Vec3 view_vec{
+                                ctx.camera_pos.x - world.x,
+                                ctx.camera_pos.y - world.y,
+                                ctx.camera_pos.z - world.z
                             };
-                            light_color.r *= light.color.r;
-                            light_color.g *= light.color.g;
-                            light_color.b *= light.color.b;
-                            if (f0 > 0.0)
-                            {
-                                const double spec_dot = std::max(0.0, dot_vec(normal, half_vec));
-                                double spec = eval_specular_term(spec_dot, vdoth, ndotl,
-                                                                 ctx.material.shininess, f0);
-                                spec *= light.intensity;
-                                spec = std::clamp(spec, 0.0, 1.0);
-                                light_color.r += light.color.r * static_cast<float>(spec);
-                                light_color.g += light.color.g * static_cast<float>(spec);
-                                light_color.b += light.color.b * static_cast<float>(spec);
-                            }
-                            out_direct = light_color;
-                        };
+                            const Vec3 view_dir = normalize_vec(view_vec);
 
-                        eval_light(ctx.lights[0], 0, kSunShadowSalt, direct_sun, shadow_sun);
-                        eval_light(ctx.lights[1], 1, kMoonShadowSalt, direct_moon, shadow_moon);
+                            auto eval_light = [&](const ShadingContext::DirectionalLightInfo& light,
+                                                  const int light_idx, const int shadow_salt,
+                                                  ColorRGB& out_direct, float& out_shadow) {
+                                out_direct = {0.0f, 0.0f, 0.0f};
+                                out_shadow = 1.0f;
+                                if (light.intensity <= 0.0)
+                                {
+                                    return;
+                                }
+                                const double ndotl = std::max(0.0, dot_vec(normal, light.dir));
+                                if (ndotl <= 0.0)
+                                {
+                                    return;
+                                }
+                                if (ctx.shadows_enabled)
+                                {
+                                    const Vec3 shadow_dir = jitter_shadow_direction(light.dir,
+                                                            lights_right_scaled[light_idx],
+                                                            lights_up_scaled[light_idx],
+                                                            x, y, frame_index,
+                                                            shadow_salt);
+                                    out_shadow = compute_shadow_factor(shadow_dir, world, normal);
+                                }
+
+                                const Vec3 half_vec = normalize_vec(add_vec(light.dir, view_dir));
+                                const double f0 = std::clamp(ctx.material.specular, 0.0, 1.0);
+                                const double vdoth = std::max(0.0, dot_vec(view_dir, half_vec));
+                                const double fresnel = schlick_fresnel(vdoth, f0);
+                                const double diffuse_scale = std::clamp(1.0 - fresnel, 0.0, 1.0);
+                                const double diffuse = ndotl * light.intensity * ctx.material.diffuse * diffuse_scale;
+                                ColorRGB light_color{
+                                    static_cast<float>(ctx.albedo.r * diffuse),
+                                    static_cast<float>(ctx.albedo.g * diffuse),
+                                    static_cast<float>(ctx.albedo.b * diffuse)
+                                };
+                                light_color.r *= light.color.r;
+                                light_color.g *= light.color.g;
+                                light_color.b *= light.color.b;
+                                if (f0 > 0.0)
+                                {
+                                    const double spec_dot = std::max(0.0, dot_vec(normal, half_vec));
+                                    double spec = eval_specular_term(spec_dot, vdoth, ndotl,
+                                                                     ctx.material.shininess, f0);
+                                    spec *= light.intensity;
+                                    spec = std::clamp(spec, 0.0, 1.0);
+                                    light_color.r += light.color.r * static_cast<float>(spec);
+                                    light_color.g += light.color.g * static_cast<float>(spec);
+                                    light_color.b += light.color.b * static_cast<float>(spec);
+                                }
+                                out_direct = light_color;
+                            };
+
+                            eval_light(ctx.lights[0], 0, kSunShadowSalt, direct_sun, shadow_sun);
+                            eval_light(ctx.lights[1], 1, kMoonShadowSalt, direct_moon, shadow_moon);
+                        }
+
+                        sample_ambient[idx] = ambient_color;
+                        sample_direct_sun[idx] = direct_sun;
+                        sample_direct_moon[idx] = direct_moon;
+                        shadow_mask_sun[idx] = shadow_sun;
+                        shadow_mask_moon[idx] = shadow_moon;
+                        sample_normals[idx] = normal;
                     }
-
-                    sample_ambient[idx] = ambient_color;
-                    sample_direct_sun[idx] = direct_sun;
-                    sample_direct_moon[idx] = direct_moon;
-                    shadow_mask_sun[idx] = shadow_sun;
-                    shadow_mask_moon[idx] = shadow_moon;
-                    sample_normals[idx] = normal;
                 }
             }
+
+            w0 += w0_a;
+            w1 += w1_a;
+            w2 += w2_a;
+            w0i += w0_a_i;
+            w1i += w1_a_i;
+            w2i += w2_a_i;
         }
+
+        w0_row += w0_b;
+        w1_row += w1_b;
+        w2_row += w2_b;
+        w0i_row += w0_b_i;
+        w1i_row += w1_b_i;
+        w2i_row += w2_b_i;
     }
 }
 
@@ -1764,9 +1802,9 @@ static float compute_shadow_factor(const Vec3& light_dir, const Vec3& world, con
     return shadow_raymarch_hit(world, normal, light_dir) ? 0.0f : 1.0f;
 }
 
-static float shadow_filter_3x3_at(const float* mask, const float* depth, const Vec3* normals,
-                                  const size_t width, const size_t height,
-                                  const int x, const int y, const float depth_max)
+static float shadow_filter_at(const float* mask, const float* depth, const Vec3* normals,
+                              const size_t width, const size_t height,
+                              const int x, const int y, const float depth_max)
 {
     const int ix = std::clamp(x, 0, static_cast<int>(width) - 1);
     const int iy = std::clamp(y, 0, static_cast<int>(height) - 1);
@@ -1785,46 +1823,49 @@ static float shadow_filter_3x3_at(const float* mask, const float* depth, const V
         return mask[center_idx];
     }
 
-    const float inv_depth_sigma2 = 1.0f / (2.0f * kShadowFilterDepthSigma * kShadowFilterDepthSigma);
-    const float inv_normal_sigma2 = 1.0f / (2.0f * kShadowFilterNormalSigma * kShadowFilterNormalSigma);
-    float sum = 0.0f;
-    float weight_sum = 0.0f;
-    int k = 0;
-    for (int dy = -1; dy <= 1; ++dy)
-    {
-        const int sy = std::clamp(iy + dy, 0, static_cast<int>(height) - 1);
-        for (int dx = -1; dx <= 1; ++dx, ++k)
-        {
-            const int sx = std::clamp(ix + dx, 0, static_cast<int>(width) - 1);
-            const size_t idx = static_cast<size_t>(sy) * width + static_cast<size_t>(sx);
-            const float neighbor_depth = depth[idx];
-            if (neighbor_depth >= depth_max)
-            {
-                continue;
-            }
-            const Vec3 neighbor_normal = normals[idx];
-            const double neighbor_len_sq = neighbor_normal.x * neighbor_normal.x +
-                                           neighbor_normal.y * neighbor_normal.y +
-                                           neighbor_normal.z * neighbor_normal.z;
-            if (neighbor_len_sq <= 1e-6)
-            {
-                continue;
-            }
+    float sum = mask[center_idx] * kShadowFilterCenterWeight;
+    float weight_sum = kShadowFilterCenterWeight;
 
-            float weight = kShadowGaussianWeights[k];
-            const float depth_diff = neighbor_depth - center_depth;
-            const float depth_w = std::exp(-(depth_diff * depth_diff) * inv_depth_sigma2);
-            const float dot = static_cast<float>(center_normal.x * neighbor_normal.x +
-                                                 center_normal.y * neighbor_normal.y +
-                                                 center_normal.z * neighbor_normal.z);
-            const float clamped_dot = std::clamp(dot, -1.0f, 1.0f);
-            const float normal_diff = 1.0f - clamped_dot;
-            const float normal_w = std::exp(-(normal_diff * normal_diff) * inv_normal_sigma2);
-            weight *= depth_w * normal_w;
-            sum += mask[idx] * weight;
-            weight_sum += weight;
+    auto try_neighbor = [&](const int nx, const int ny) {
+        if (nx < 0 || ny < 0 || nx >= static_cast<int>(width) || ny >= static_cast<int>(height))
+        {
+            return;
         }
-    }
+        const size_t idx = static_cast<size_t>(ny) * width + static_cast<size_t>(nx);
+        const float neighbor_depth = depth[idx];
+        if (neighbor_depth >= depth_max)
+        {
+            return;
+        }
+        const Vec3 neighbor_normal = normals[idx];
+        const double neighbor_len_sq = neighbor_normal.x * neighbor_normal.x +
+                                       neighbor_normal.y * neighbor_normal.y +
+                                       neighbor_normal.z * neighbor_normal.z;
+        if (neighbor_len_sq <= 1e-6)
+        {
+            return;
+        }
+        const float depth_diff = std::fabs(neighbor_depth - center_depth);
+        if (depth_diff > kShadowFilterDepthThreshold)
+        {
+            return;
+        }
+        const float dot = static_cast<float>(center_normal.x * neighbor_normal.x +
+                                             center_normal.y * neighbor_normal.y +
+                                             center_normal.z * neighbor_normal.z);
+        const float clamped_dot = std::clamp(dot, -1.0f, 1.0f);
+        if (clamped_dot < kShadowFilterNormalThreshold)
+        {
+            return;
+        }
+        sum += mask[idx] * kShadowFilterNeighborWeight;
+        weight_sum += kShadowFilterNeighborWeight;
+    };
+
+    try_neighbor(ix - 1, iy);
+    try_neighbor(ix + 1, iy);
+    try_neighbor(ix, iy - 1);
+    try_neighbor(ix, iy + 1);
 
     if (weight_sum <= 0.0f)
     {
@@ -1835,20 +1876,100 @@ static float shadow_filter_3x3_at(const float* mask, const float* depth, const V
     return filtered;
 }
 
-static void filter_shadow_mask_3x3(const float* mask, float* out_mask, const float* depth,
-                                   const Vec3* normals, const size_t width, const size_t height,
-                                   const float depth_max)
+static void filter_shadow_masks(const float* mask_a, const float* mask_b,
+                                float* out_a, float* out_b, const float* depth,
+                                const Vec3* normals, const size_t width, const size_t height,
+                                const float depth_max)
 {
     for (size_t y = 0; y < height; ++y)
     {
         for (size_t x = 0; x < width; ++x)
         {
-            const size_t idx = y * width + x;
-            out_mask[idx] = shadow_filter_3x3_at(mask, depth, normals,
-                                                 width, height,
-                                                 static_cast<int>(x),
-                                                 static_cast<int>(y),
-                                                 depth_max);
+            const size_t center_idx = y * width + x;
+            const float center_depth = depth[center_idx];
+            if (center_depth >= depth_max)
+            {
+                out_a[center_idx] = mask_a[center_idx];
+                out_b[center_idx] = mask_b[center_idx];
+                continue;
+            }
+            const Vec3 center_normal = normals[center_idx];
+            const double normal_len_sq = center_normal.x * center_normal.x +
+                                         center_normal.y * center_normal.y +
+                                         center_normal.z * center_normal.z;
+            if (normal_len_sq <= 1e-6)
+            {
+                out_a[center_idx] = mask_a[center_idx];
+                out_b[center_idx] = mask_b[center_idx];
+                continue;
+            }
+
+            float sum_a = mask_a[center_idx] * kShadowFilterCenterWeight;
+            float sum_b = mask_b[center_idx] * kShadowFilterCenterWeight;
+            float weight_sum = kShadowFilterCenterWeight;
+
+            auto try_neighbor = [&](const size_t idx) {
+                const float neighbor_depth = depth[idx];
+                if (neighbor_depth >= depth_max)
+                {
+                    return;
+                }
+                const Vec3 neighbor_normal = normals[idx];
+                const double neighbor_len_sq = neighbor_normal.x * neighbor_normal.x +
+                                               neighbor_normal.y * neighbor_normal.y +
+                                               neighbor_normal.z * neighbor_normal.z;
+                if (neighbor_len_sq <= 1e-6)
+                {
+                    return;
+                }
+                const float depth_diff = std::fabs(neighbor_depth - center_depth);
+                if (depth_diff > kShadowFilterDepthThreshold)
+                {
+                    return;
+                }
+                const float dot = static_cast<float>(center_normal.x * neighbor_normal.x +
+                                                     center_normal.y * neighbor_normal.y +
+                                                     center_normal.z * neighbor_normal.z);
+                const float clamped_dot = std::clamp(dot, -1.0f, 1.0f);
+                if (clamped_dot < kShadowFilterNormalThreshold)
+                {
+                    return;
+                }
+                sum_a += mask_a[idx] * kShadowFilterNeighborWeight;
+                sum_b += mask_b[idx] * kShadowFilterNeighborWeight;
+                weight_sum += kShadowFilterNeighborWeight;
+            };
+
+            if (x > 0)
+            {
+                try_neighbor(center_idx - 1);
+            }
+            if (x + 1 < width)
+            {
+                try_neighbor(center_idx + 1);
+            }
+            if (y > 0)
+            {
+                try_neighbor(center_idx - width);
+            }
+            if (y + 1 < height)
+            {
+                try_neighbor(center_idx + width);
+            }
+
+            if (weight_sum <= 0.0f)
+            {
+                out_a[center_idx] = mask_a[center_idx];
+                out_b[center_idx] = mask_b[center_idx];
+                continue;
+            }
+
+            float filtered_a = sum_a / weight_sum;
+            float filtered_b = sum_b / weight_sum;
+            filtered_a = std::clamp(filtered_a, 0.0f, 1.0f);
+            filtered_b = std::clamp(filtered_b, 0.0f, 1.0f);
+            out_a[center_idx] = filtered_a;
+            out_b[center_idx] = filtered_b;
         }
     }
 }
@@ -2323,18 +2444,23 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
 
     if (shadows_on)
     {
-        filter_shadow_mask_3x3(shadow_mask_sun.data(), shadow_mask_filtered_sun.data(),
-                               zbuffer.data(), sample_normals.data(),
-                               width, height, depth_max);
-        filter_shadow_mask_3x3(shadow_mask_moon.data(), shadow_mask_filtered_moon.data(),
-                               zbuffer.data(), sample_normals.data(),
-                               width, height, depth_max);
+        const float* shadow_sun = shadow_mask_sun.data();
+        const float* shadow_moon = shadow_mask_moon.data();
+        if (kShadowFilterEnabled)
+        {
+            filter_shadow_masks(shadow_mask_sun.data(), shadow_mask_moon.data(),
+                                shadow_mask_filtered_sun.data(), shadow_mask_filtered_moon.data(),
+                                zbuffer.data(), sample_normals.data(),
+                                width, height, depth_max);
+            shadow_sun = shadow_mask_filtered_sun.data();
+            shadow_moon = shadow_mask_filtered_moon.data();
+        }
         for (size_t i = 0; i < sample_count; ++i)
         {
             const ColorRGB sun = sample_direct_sun[i];
             const ColorRGB moon = sample_direct_moon[i];
-            const ColorRGB sun_shadowed = scale_color(sun, shadow_mask_filtered_sun[i]);
-            const ColorRGB moon_shadowed = scale_color(moon, shadow_mask_filtered_moon[i]);
+            const ColorRGB sun_shadowed = scale_color(sun, shadow_sun[i]);
+            const ColorRGB moon_shadowed = scale_color(moon, shadow_moon[i]);
             sample_direct[i] = add_color(sun_shadowed, moon_shadowed);
         }
     }
@@ -2873,14 +2999,14 @@ bool render_debug_shadow_factor_with_frame(const Vec3 world, const Vec3 normal, 
     return true;
 }
 
-float render_debug_shadow_filter_3x3(const float* mask, const float* depth, const Vec3* normals)
+float render_debug_shadow_filter(const float* mask, const float* depth, const Vec3* normals)
 {
     if (!mask || !depth || !normals)
     {
         return 0.0f;
     }
     const float depth_max = std::numeric_limits<float>::max();
-    return shadow_filter_3x3_at(mask, depth, normals, 3, 3, 1, 1, depth_max);
+    return shadow_filter_at(mask, depth, normals, 3, 3, 1, 1, depth_max);
 }
 
 static bool camera_intersects_block(const Vec3& pos)

@@ -75,7 +75,7 @@ double render_debug_get_taa_sharpen_percent();
 bool render_debug_shadow_factor_with_frame(Vec3 world, Vec3 normal, Vec3 light_dir,
                                            int pixel_x, int pixel_y, int frame,
                                            float* out_factor);
-float render_debug_shadow_filter_3x3(const float* mask, const float* depth, const Vec3* normals);
+float render_debug_shadow_filter(const float* mask, const float* depth, const Vec3* normals);
 size_t render_debug_get_terrain_block_count();
 size_t render_debug_get_terrain_visible_face_count();
 size_t render_debug_get_terrain_triangle_count();

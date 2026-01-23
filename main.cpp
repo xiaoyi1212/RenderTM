@@ -16,9 +16,15 @@
 
 static std::atomic<bool> running{true};
 static volatile std::sig_atomic_t shutdownRequested = 0;
+static volatile std::sig_atomic_t resizeRequested = 0;
 
-static void handle_signal(int)
+static void handle_signal(int sig)
 {
+    if (sig == SIGWINCH)
+    {
+        resizeRequested = 1;
+        return;
+    }
     shutdownRequested = 1;
 }
 
@@ -41,6 +47,7 @@ int main()
 {
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
+    std::signal(SIGWINCH, handle_signal);
     keyboard_setup();
     render_init();
     const double move_step = 0.2;
@@ -64,6 +71,11 @@ int main()
         {
             running.store(false, std::memory_order_relaxed);
             break;
+        }
+        if (resizeRequested)
+        {
+            resizeRequested = 0;
+            render_update_size(0);
         }
         int ch = keyboard_read_char();
         while (ch != -1)

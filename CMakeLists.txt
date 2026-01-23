@@ -18,6 +18,7 @@ add_executable(untitled main.cpp
         controls.h
         keyboard.h
         keyboard.cpp)
+target_compile_options(untitled PRIVATE -fno-omit-frame-pointer)
 
 FetchContent_Declare(
         Catch2
@@ -38,6 +39,7 @@ add_executable(untitled_tests
 target_link_libraries(untitled_tests PRIVATE Catch2::Catch2WithMain)
 target_include_directories(untitled_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(untitled_tests PRIVATE cxx_std_20)
+target_compile_options(untitled_tests PRIVATE -fno-omit-frame-pointer)
 
 include(${Catch2_SOURCE_DIR}/extras/Catch.cmake)
 catch_discover_tests(untitled_tests)

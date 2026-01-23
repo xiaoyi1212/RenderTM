@@ -4,6 +4,7 @@
 #include <string>
 
 void render_init();
+void render_update_size(int sig);
 void render_print();
 void render_output_run();
 void render_output_request_stop();
