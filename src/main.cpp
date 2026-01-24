@@ -1,16 +1,10 @@
-#include <algorithm>
-#include <chrono>
-#include <csignal>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <thread>
+#include "prelude.hpp"
 
-#include "controls.h"
-#include "input.h"
-#include "keyboard.h"
-#include "render.h"
-#include "terminal_render.h"
+import controls;
+import input;
+import keyboard;
+import render;
+import terminal;
 
 namespace {
 

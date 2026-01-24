@@ -1,9 +1,74 @@
-#include "input.h"
+module;
 
-#include <algorithm>
-#include <charconv>
-#include <cctype>
-#include <cmath>
+#include "prelude.hpp"
+
+export module input;
+
+export enum class InputAction
+{
+    None,
+    Quit,
+    TogglePause,
+    ToggleGI,
+    MoveForward,
+    MoveBackward,
+    MoveLeft,
+    MoveRight,
+    MoveUp,
+    MoveDown
+};
+
+export enum class MouseParseResult
+{
+    Parsed,
+    NeedMore,
+    Invalid
+};
+
+export enum class InputParseResult
+{
+    Parsed,
+    NeedMore,
+    Invalid
+};
+
+export struct MouseEvent
+{
+    int button;
+    int x;
+    int y;
+    bool motion;
+    bool pressed;
+};
+
+export struct MouseParse
+{
+    MouseParseResult result = MouseParseResult::Invalid;
+    size_t consumed = 0;
+    MouseEvent event{};
+};
+
+export struct InputParse
+{
+    InputParseResult result = InputParseResult::Invalid;
+    size_t consumed = 0;
+    InputAction action = InputAction::None;
+};
+
+export struct MouseLookDelta
+{
+    double yaw;
+    double pitch;
+};
+
+export struct InputParser
+{
+    static InputAction key_to_action(int ch);
+    static MouseParse parse_sgr_mouse(std::string_view buffer);
+    static InputParse parse_csi_key(std::string_view buffer);
+    static MouseLookDelta mouse_look_velocity(int mouse_x, int mouse_y, int width, int height,
+                                              int deadzone_radius, double max_speed);
+};
 
 InputAction InputParser::key_to_action(const int ch)
 {

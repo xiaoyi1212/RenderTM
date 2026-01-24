@@ -9,7 +9,7 @@ Install CMake v4.0+ and your prefer C++ compiler.
 ## Compile & Run
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="-O3 -ffast-math"
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-./build/untitled
+./build/render_tm
 ```

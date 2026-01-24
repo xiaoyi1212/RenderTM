@@ -1,23 +1,7 @@
-#include <catch2/catch_approx.hpp>
-#include <catch2/catch_test_macros.hpp>
+#include "test_prelude.hpp"
 
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <bit>
-#include <cmath>
-#include <cstdint>
-#include <iomanip>
-#include <limits>
-#include <numeric>
-#include <random>
-#include <sstream>
-#include <thread>
-#include <unordered_set>
-#include <vector>
-
-#include "render.h"
-#include "blue_noise.h"
+import render;
+import noise;
 
 static void reset_camera()
 {
@@ -518,9 +502,6 @@ static size_t count_blocks(const std::vector<int>& heights, const int chunk_size
 
 static bool terrain_has_block(const std::vector<int>& heights, const int chunk_size,
                               const int gx, const int gy, const int gz);
-
-extern double render_debug_eval_specular(double ndoth, double vdoth, double ndotl,
-                                         double shininess, double f0);
 
 constexpr int kFaceTop = 0;
 constexpr int kFaceBottom = 1;

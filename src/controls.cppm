@@ -1,6 +1,25 @@
-#include "controls.h"
+module;
 
-#include <cmath>
+#include "prelude.hpp"
+
+export module controls;
+
+export import input;
+export import render;
+
+export enum class MoveSpace
+{
+    None,
+    Local,
+    World
+};
+
+export struct MoveIntent
+{
+    MoveSpace space;
+    Vec3 delta;
+    static MoveIntent from_action(InputAction action, double step, double yaw);
+};
 
 MoveIntent MoveIntent::from_action(const InputAction action, const double step, const double yaw)
 {

@@ -1,22 +1,26 @@
-#include "terminal_render.h"
-#include "render.h"
+module;
 
-#include <array>
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <cstring>
-#include <fcntl.h>
-#include <mutex>
-#include <optional>
-#include <stop_token>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
+#include "prelude.hpp"
 
-#include <sys/ioctl.h>
-#include <unistd.h>
+export module terminal;
+
+import render;
+
+export struct TerminalSize
+{
+    size_t width = 0;
+    size_t height = 0;
+};
+
+export struct TerminalRender
+{
+    static void init();
+    static void shutdown();
+    static void update_size(int sig);
+    static void submit_frame();
+    static void output_loop(std::stop_token token);
+    static TerminalSize size();
+};
 
 namespace {
 
@@ -180,36 +184,54 @@ std::string render_format_frame(const RenderFrame& frame, const RenderFrame* pre
     frame_buffer.reserve(width * display_rows * 20);
 
     frame_buffer += "\033[0m\033[H\033[7m";
-    char info[256];
     const double rad_to_deg = 180.0 / 3.14159265358979323846;
     const double yaw_deg = frame.cam_rot.x * rad_to_deg;
     const double pitch_deg = frame.cam_rot.y * rad_to_deg;
     const double out_fps = output_fps.load(std::memory_order_relaxed);
-    const int len = snprintf(info, sizeof(info),
-                             " RenderTM v0.0.1 | Terminal:%lux%lu Pixel:%lux%lu | Render:%.2f Output:%.2f | Sharpen:%.3f (%.0f%%) | Cam(%.2f,%.2f,%.2f) Rot(%.1f,%.1f)",
-                             width, static_cast<size_t>(term_height), width, height, frame.render_fps,
-                             out_fps, frame.sharpen, frame.sharpen_pct,
-                             frame.cam_pos.x, frame.cam_pos.y, frame.cam_pos.z, yaw_deg, pitch_deg);
-    frame_buffer += info;
-    if (len < static_cast<int>(width)) frame_buffer.append(width - len, ' ');
+    const size_t info_start = frame_buffer.size();
+    std::format_to(std::back_inserter(frame_buffer),
+                   " RenderTM v0.0.1 | Terminal:{}x{} Pixel:{}x{} | "
+                   "Render:{:.2f} Output:{:.2f} | Sharpen:{:.3f} ({:.0f}%) | "
+                   "Cam({:.2f},{:.2f},{:.2f}) Rot({:.1f},{:.1f})",
+                   width, term_height, width, height, frame.render_fps, out_fps,
+                   frame.sharpen, frame.sharpen_pct, frame.cam_pos.x, frame.cam_pos.y,
+                   frame.cam_pos.z, yaw_deg, pitch_deg);
+    const size_t len = frame_buffer.size() - info_start;
+    if (len < width) frame_buffer.append(width - len, ' ');
     frame_buffer += "\033[0m";
 
     const bool have_prev = prev && prev->width == width && prev->height == height &&
                            prev->pixels.size() == frame.pixels.size();
     uint32_t last_fg = 0xFFFFFFFF;
     uint32_t last_bg = 0xFFFFFFFF;
-    char color_buf[64];
 
-    auto append_fg = [&](uint32_t color) {
-        const int n = snprintf(color_buf, sizeof(color_buf), "\033[38;2;%d;%d;%dm",
-                               (color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
-        frame_buffer.append(color_buf, n);
+    auto append_ansi_rgb = [&](bool fg, uint32_t color) {
+        char buf[40];
+        char* it = buf;
+        char* const buf_end = buf + sizeof(buf) - 1;
+        *it++ = '\033';
+        *it++ = '[';
+        *it++ = fg ? '3' : '4';
+        *it++ = '8';
+        *it++ = ';';
+        *it++ = '2';
+        *it++ = ';';
+
+        auto append_u8 = [&](uint32_t v, char end) {
+            auto result = std::to_chars(it, buf_end, v);
+            it = result.ptr;
+            *it++ = end;
+        };
+
+        append_u8((color >> 16) & 0xFF, ';');
+        append_u8((color >> 8) & 0xFF, ';');
+        auto result = std::to_chars(it, buf_end, color & 0xFF);
+        it = result.ptr;
+        *it++ = 'm';
+
+        frame_buffer.append(buf, static_cast<size_t>(it - buf));
     };
-    auto append_bg = [&](uint32_t color) {
-        const int n = snprintf(color_buf, sizeof(color_buf), "\033[48;2;%d;%d;%dm",
-                               (color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
-        frame_buffer.append(color_buf, n);
-    };
+
     auto append_cursor = [&](size_t row, size_t col) {
         frame_buffer += "\033[";
         frame_buffer += std::to_string(row);
@@ -229,11 +251,11 @@ std::string render_format_frame(const RenderFrame& frame, const RenderFrame* pre
                 const uint32_t bot = frame.pixels[(y + 1) * width + x];
 
                 if (top != last_fg) {
-                    append_fg(top);
+                    append_ansi_rgb(true, top);
                     last_fg = top;
                 }
                 if (bot != last_bg) {
-                    append_bg(bot);
+                    append_ansi_rgb(false, bot);
                     last_bg = bot;
                 }
                 frame_buffer += kRenderChar;
@@ -270,8 +292,8 @@ std::string render_format_frame(const RenderFrame& frame, const RenderFrame* pre
                     const uint32_t rtop = frame.pixels[ridx];
                     const uint32_t rbot = frame.pixels[ridx + width];
                     if (last_fg != rtop || last_bg != rbot) {
-                        append_fg(rtop);
-                        append_bg(rbot);
+                        append_ansi_rgb(true, rtop);
+                        append_ansi_rgb(false, rbot);
                         last_fg = rtop;
                         last_bg = rbot;
                     }
@@ -290,8 +312,8 @@ std::string render_format_frame(const RenderFrame& frame, const RenderFrame* pre
                 const uint32_t rtop = frame.pixels[ridx];
                 const uint32_t rbot = frame.pixels[ridx + width];
                 if (last_fg != rtop || last_bg != rbot) {
-                    append_fg(rtop);
-                    append_bg(rbot);
+                    append_ansi_rgb(true, rtop);
+                    append_ansi_rgb(false, rbot);
                     last_fg = rtop;
                     last_bg = rbot;
                 }

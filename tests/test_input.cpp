@@ -1,10 +1,6 @@
-#include <catch2/catch_approx.hpp>
-#include <catch2/catch_test_macros.hpp>
+#include "test_prelude.hpp"
 
-#include <cmath>
-#include <string_view>
-
-#include "input.h"
+import input;
 
 TEST_CASE("key_to_action maps quit keys")
 {

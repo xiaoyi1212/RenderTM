@@ -1,7 +1,6 @@
-#include <catch2/catch_approx.hpp>
-#include <catch2/catch_test_macros.hpp>
+#include "test_prelude.hpp"
 
-#include "controls.h"
+import controls;
 
 TEST_CASE("MoveIntent::from_action maps vertical movement directions")
 {

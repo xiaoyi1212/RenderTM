@@ -1,0 +1,33 @@
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cctype>
+#include <cerrno>
+#include <charconv>
+#include <chrono>
+#include <csignal>
+#include <cmath>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <format>
+#include <iterator>
+#include <limits>
+#include <mutex>
+#include <numeric>
+#include <optional>
+#include <random>
+#include <stop_token>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <unistd.h>

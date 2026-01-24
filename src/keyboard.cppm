@@ -1,9 +1,23 @@
-#include "keyboard.h"
+module;
 
-#include <cerrno>
-#include <fcntl.h>
-#include <termios.h>
-#include <unistd.h>
+#include "prelude.hpp"
+
+export module keyboard;
+
+export struct KeyboardMode
+{
+    KeyboardMode();
+    ~KeyboardMode();
+
+    KeyboardMode(const KeyboardMode&) = delete;
+    KeyboardMode& operator=(const KeyboardMode&) = delete;
+
+    std::optional<unsigned char> read_char() const;
+
+    struct termios original_termios_{};
+    int original_flags_ = -1;
+    bool configured_ = false;
+};
 
 KeyboardMode::KeyboardMode()
 {

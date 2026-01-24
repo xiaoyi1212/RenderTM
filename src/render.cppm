@@ -1,15 +1,98 @@
-#include "render.h"
-#include "blue_noise.h"
-#include "cmath"
-#include "cstring"
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <limits>
-#include <mutex>
-#include <numeric>
-#include <random>
-#include <vector>
+module;
+
+#include "prelude.hpp"
+
+export module render;
+
+import noise;
+
+export struct Vec3
+{
+    double x, y, z;
+};
+
+export struct Vec2
+{
+    double x, y;
+};
+
+export struct Mat4
+{
+    double m[4][4];
+};
+
+export void render_update_array(uint32_t* framebuffer, size_t width, size_t height);
+export void render_set_paused(bool paused);
+export bool render_is_paused();
+export void render_toggle_pause();
+export void render_set_light_direction(Vec3 dir);
+export Vec3 render_get_light_direction();
+export void render_set_light_intensity(double intensity);
+export double render_get_light_intensity();
+export void render_set_sun_orbit_enabled(bool enabled);
+export bool render_get_sun_orbit_enabled();
+export void render_set_sun_orbit_angle(double angle);
+export double render_get_sun_orbit_angle();
+export void render_set_moon_direction(Vec3 dir);
+export void render_set_moon_intensity(double intensity);
+export void render_set_sky_top_color(uint32_t color);
+export uint32_t render_get_sky_top_color();
+export void render_set_sky_bottom_color(uint32_t color);
+export uint32_t render_get_sky_bottom_color();
+export void render_set_sky_light_intensity(double intensity);
+export double render_get_sky_light_intensity();
+export void render_set_exposure(double exposure);
+export double render_get_exposure();
+export void render_set_taa_enabled(bool enabled);
+export bool render_get_taa_enabled();
+export void render_set_taa_blend(double blend);
+export double render_get_taa_blend();
+export void render_set_taa_clamp_enabled(bool enabled);
+export bool render_get_taa_clamp_enabled();
+export void render_set_gi_enabled(bool enabled);
+export bool render_get_gi_enabled();
+export void render_set_gi_strength(double strength);
+export double render_get_gi_strength();
+export void render_set_gi_bounce_count(int count);
+export int render_get_gi_bounce_count();
+export void render_reset_taa_history();
+export void render_set_ambient_occlusion_enabled(bool enabled);
+export void render_set_shadow_enabled(bool enabled);
+export bool render_get_shadow_factor_at_point(Vec3 world, Vec3 normal, float* out_factor);
+export bool render_get_terrain_vertex_sky_visibility(int x, int y, int z, int face, int corner, float* out_visibility);
+export void render_set_camera_position(Vec3 pos);
+export Vec3 render_get_camera_position();
+export void render_move_camera(Vec3 delta);
+export void render_move_camera_local(Vec3 delta);
+export void render_set_camera_rotation(Vec2 rot);
+export Vec2 render_get_camera_rotation();
+export void render_rotate_camera(Vec2 delta);
+export Vec2 render_project_point(Vec3 world, size_t width, size_t height);
+export Vec3 render_unproject_point(Vec3 screen, size_t width, size_t height);
+export Vec2 render_reproject_point(Vec3 world, size_t width, size_t height);
+export bool render_debug_depth_at_sample(Vec3 v0, Vec3 v1, Vec3 v2, Vec2 p, float* out_depth);
+export double render_debug_eval_specular(double ndoth, double vdoth, double ndotl,
+                                         double shininess, double f0);
+export Vec3 render_debug_tonemap_reinhard(Vec3 color, double exposure);
+export Vec3 render_debug_sample_history_bilinear(const Vec3* buffer, size_t width, size_t height, Vec2 screen_coord);
+export void render_debug_set_sky_colors_raw(uint32_t top, uint32_t bottom);
+export Mat4 render_debug_get_current_vp();
+export Mat4 render_debug_get_previous_vp();
+export Mat4 render_debug_get_inverse_current_vp();
+export double render_debug_get_taa_sharpen_strength();
+export double render_debug_get_taa_sharpen_percent();
+export void render_debug_set_frame_index(uint32_t frame_index);
+export uint32_t render_debug_get_frame_index();
+export bool render_debug_shadow_factor_with_frame(Vec3 world, Vec3 normal, Vec3 light_dir,
+                                                  int pixel_x, int pixel_y, int frame,
+                                                  float* out_factor);
+export float render_debug_shadow_filter(const float* mask, const float* depth, const Vec3* normals);
+export size_t render_debug_get_terrain_block_count();
+export size_t render_debug_get_terrain_visible_face_count();
+export size_t render_debug_get_terrain_triangle_count();
+export bool render_should_rasterize_triangle(Vec3 v0, Vec3 v1, Vec3 v2);
+export double render_get_near_plane();
+export size_t render_clip_triangle_to_near_plane(Vec3 v0, Vec3 v1, Vec3 v2, Vec3* out_vertices, size_t max_vertices);
 
 const Vec3 cubeVertices[8] = {
     {-1, -1, -1}, {1, -1, -1}, {1,  1, -1}, {-1,  1, -1},
