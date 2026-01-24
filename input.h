@@ -17,8 +17,6 @@ enum class InputAction
     MoveDown
 };
 
-InputAction input_map_key(int ch);
-
 enum class MouseParseResult
 {
     Parsed,
@@ -42,13 +40,31 @@ struct MouseEvent
     bool pressed;
 };
 
+struct MouseParse
+{
+    MouseParseResult result = MouseParseResult::Invalid;
+    size_t consumed = 0;
+    MouseEvent event{};
+};
+
+struct InputParse
+{
+    InputParseResult result = InputParseResult::Invalid;
+    size_t consumed = 0;
+    InputAction action = InputAction::None;
+};
+
 struct MouseLookDelta
 {
     double yaw;
     double pitch;
 };
 
-MouseParseResult input_parse_sgr_mouse(std::string_view buffer, size_t* consumed, MouseEvent* out_event);
-InputParseResult input_parse_csi_key(std::string_view buffer, size_t* consumed, InputAction* out_action);
-MouseLookDelta input_mouse_look_velocity(int mouse_x, int mouse_y, int width, int height,
-                                         int deadzone_radius, double max_speed);
+struct InputParser
+{
+    static InputAction key_to_action(int ch);
+    static MouseParse parse_sgr_mouse(std::string_view buffer);
+    static InputParse parse_csi_key(std::string_view buffer);
+    static MouseLookDelta mouse_look_velocity(int mouse_x, int mouse_y, int width, int height,
+                                              int deadzone_radius, double max_speed);
+};

@@ -1,148 +1,167 @@
 #include "input.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <cmath>
 
-InputAction input_map_key(const int ch)
+InputAction InputParser::key_to_action(const int ch)
 {
-    if (ch == 'q' || ch == 'Q') return InputAction::Quit;
-    if (ch == 'p' || ch == 'P') return InputAction::TogglePause;
-    if (ch == 'g' || ch == 'G') return InputAction::ToggleGI;
-    if (ch == 'w' || ch == 'W') return InputAction::MoveForward;
-    if (ch == 's' || ch == 'S') return InputAction::MoveBackward;
-    if (ch == 'a' || ch == 'A') return InputAction::MoveLeft;
-    if (ch == 'd' || ch == 'D') return InputAction::MoveRight;
-    if (ch == 'r' || ch == 'R') return InputAction::MoveUp;
-    if (ch == 'f' || ch == 'F') return InputAction::MoveDown;
-    return InputAction::None;
+    if (ch < 0)
+    {
+        return InputAction::None;
+    }
+    switch (std::tolower(static_cast<unsigned char>(ch)))
+    {
+        case 'q': return InputAction::Quit;
+        case 'p': return InputAction::TogglePause;
+        case 'g': return InputAction::ToggleGI;
+        case 'w': return InputAction::MoveForward;
+        case 's': return InputAction::MoveBackward;
+        case 'a': return InputAction::MoveLeft;
+        case 'd': return InputAction::MoveRight;
+        case 'r': return InputAction::MoveUp;
+        case 'f': return InputAction::MoveDown;
+        default: return InputAction::None;
+    }
 }
 
-MouseParseResult input_parse_sgr_mouse(const std::string_view buffer, size_t* consumed, MouseEvent* out_event)
+namespace {
+
+struct ParseCursor
 {
-    if (consumed)
+    std::string_view buffer;
+    size_t idx = 0;
+
+    bool has(size_t count = 1) const
     {
-        *consumed = 0;
-    }
-    if (buffer.size() < 3)
-    {
-        return MouseParseResult::NeedMore;
-    }
-    if (buffer[0] != '\x1b' || buffer[1] != '[' || buffer[2] != '<')
-    {
-        return MouseParseResult::Invalid;
+        return idx + count <= buffer.size();
     }
 
-    size_t idx = 3;
-    auto parse_number = [&](int& value) -> MouseParseResult {
-        if (idx >= buffer.size())
+    MouseParseResult parse_int(int& value)
+    {
+        if (!has())
         {
             return MouseParseResult::NeedMore;
         }
-        int parsed = 0;
-        bool has_digit = false;
-        while (idx < buffer.size())
-        {
-            const unsigned char c = static_cast<unsigned char>(buffer[idx]);
-            if (!std::isdigit(c))
-            {
-                break;
-            }
-            parsed = parsed * 10 + (c - '0');
-            idx++;
-            has_digit = true;
-        }
-        if (!has_digit)
+        const char* begin = buffer.data() + idx;
+        const char* end = buffer.data() + buffer.size();
+        const auto result = std::from_chars(begin, end, value);
+        if (result.ptr == begin)
         {
             return MouseParseResult::Invalid;
         }
-        value = parsed;
+        idx = static_cast<size_t>(result.ptr - buffer.data());
         return MouseParseResult::Parsed;
-    };
+    }
 
+    MouseParseResult expect(char ch)
+    {
+        if (!has())
+        {
+            return MouseParseResult::NeedMore;
+        }
+        if (buffer[idx] != ch)
+        {
+            return MouseParseResult::Invalid;
+        }
+        ++idx;
+        return MouseParseResult::Parsed;
+    }
+};
+
+} // namespace
+
+MouseParse InputParser::parse_sgr_mouse(const std::string_view buffer)
+{
+    MouseParse parsed{};
+    if (buffer.size() < 3)
+    {
+        parsed.result = MouseParseResult::NeedMore;
+        return parsed;
+    }
+    if (buffer[0] != '\x1b' || buffer[1] != '[' || buffer[2] != '<')
+    {
+        parsed.result = MouseParseResult::Invalid;
+        return parsed;
+    }
+
+    ParseCursor cursor{buffer, 3};
     int button = 0;
     int x = 0;
     int y = 0;
 
-    MouseParseResult result = parse_number(button);
+    MouseParseResult result = cursor.parse_int(button);
     if (result != MouseParseResult::Parsed)
     {
-        return result;
+        parsed.result = result;
+        return parsed;
     }
-    if (idx >= buffer.size())
-    {
-        return MouseParseResult::NeedMore;
-    }
-    if (buffer[idx] != ';')
-    {
-        return MouseParseResult::Invalid;
-    }
-    idx++;
-
-    result = parse_number(x);
+    result = cursor.expect(';');
     if (result != MouseParseResult::Parsed)
     {
-        return result;
+        parsed.result = result;
+        return parsed;
     }
-    if (idx >= buffer.size())
-    {
-        return MouseParseResult::NeedMore;
-    }
-    if (buffer[idx] != ';')
-    {
-        return MouseParseResult::Invalid;
-    }
-    idx++;
-
-    result = parse_number(y);
+    result = cursor.parse_int(x);
     if (result != MouseParseResult::Parsed)
     {
-        return result;
+        parsed.result = result;
+        return parsed;
     }
-    if (idx >= buffer.size())
+    result = cursor.expect(';');
+    if (result != MouseParseResult::Parsed)
     {
-        return MouseParseResult::NeedMore;
+        parsed.result = result;
+        return parsed;
+    }
+    result = cursor.parse_int(y);
+    if (result != MouseParseResult::Parsed)
+    {
+        parsed.result = result;
+        return parsed;
+    }
+    if (!cursor.has())
+    {
+        parsed.result = MouseParseResult::NeedMore;
+        return parsed;
     }
 
-    const char terminator = buffer[idx];
+    const char terminator = buffer[cursor.idx];
     if (terminator != 'M' && terminator != 'm')
     {
-        return MouseParseResult::Invalid;
+        parsed.result = MouseParseResult::Invalid;
+        return parsed;
     }
-    idx++;
+    ++cursor.idx;
 
-    if (consumed)
-    {
-        *consumed = idx;
-    }
-    if (out_event)
-    {
-        out_event->button = button;
-        out_event->x = x;
-        out_event->y = y;
-        out_event->motion = (button & 32) != 0;
-        out_event->pressed = (terminator == 'M');
-    }
-    return MouseParseResult::Parsed;
+    parsed.result = MouseParseResult::Parsed;
+    parsed.consumed = cursor.idx;
+    parsed.event.button = button;
+    parsed.event.x = x;
+    parsed.event.y = y;
+    parsed.event.motion = (button & 32) != 0;
+    parsed.event.pressed = (terminator == 'M');
+    return parsed;
 }
 
-InputParseResult input_parse_csi_key(const std::string_view buffer, size_t* consumed, InputAction* out_action)
+InputParse InputParser::parse_csi_key(const std::string_view buffer)
 {
-    if (consumed)
-    {
-        *consumed = 0;
-    }
+    InputParse parsed{};
     if (buffer.size() < 2)
     {
-        return InputParseResult::NeedMore;
+        parsed.result = InputParseResult::NeedMore;
+        return parsed;
     }
     if (buffer[0] != '\x1b' || buffer[1] != '[')
     {
-        return InputParseResult::Invalid;
+        parsed.result = InputParseResult::Invalid;
+        return parsed;
     }
     if (buffer.size() < 3)
     {
-        return InputParseResult::NeedMore;
+        parsed.result = InputParseResult::NeedMore;
+        return parsed;
     }
     InputAction action = InputAction::None;
     switch (buffer[2])
@@ -160,22 +179,18 @@ InputParseResult input_parse_csi_key(const std::string_view buffer, size_t* cons
             action = InputAction::MoveLeft;
             break;
         default:
-            return InputParseResult::Invalid;
+            parsed.result = InputParseResult::Invalid;
+            return parsed;
     }
-    if (consumed)
-    {
-        *consumed = 3;
-    }
-    if (out_action)
-    {
-        *out_action = action;
-    }
-    return InputParseResult::Parsed;
+    parsed.result = InputParseResult::Parsed;
+    parsed.consumed = 3;
+    parsed.action = action;
+    return parsed;
 }
 
-MouseLookDelta input_mouse_look_velocity(const int mouse_x, const int mouse_y,
-                                         const int width, const int height,
-                                         const int deadzone_radius, const double max_speed)
+MouseLookDelta InputParser::mouse_look_velocity(const int mouse_x, const int mouse_y,
+                                                const int width, const int height,
+                                                const int deadzone_radius, const double max_speed)
 {
     if (width <= 0 || height <= 0 || max_speed <= 0.0)
     {

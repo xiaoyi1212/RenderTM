@@ -3,11 +3,11 @@
 
 #include "controls.h"
 
-TEST_CASE("controls_action_to_move maps vertical movement directions")
+TEST_CASE("MoveIntent::from_action maps vertical movement directions")
 {
     constexpr double step = 0.25;
-    const MoveIntent up = controls_action_to_move(InputAction::MoveUp, step, 0.0);
-    const MoveIntent down = controls_action_to_move(InputAction::MoveDown, step, 0.0);
+    const MoveIntent up = MoveIntent::from_action(InputAction::MoveUp, step, 0.0);
+    const MoveIntent down = MoveIntent::from_action(InputAction::MoveDown, step, 0.0);
 
     REQUIRE(up.space == MoveSpace::World);
     REQUIRE(up.delta.y == Catch::Approx(-step));
@@ -15,11 +15,11 @@ TEST_CASE("controls_action_to_move maps vertical movement directions")
     REQUIRE(down.delta.y == Catch::Approx(step));
 }
 
-TEST_CASE("controls_action_to_move maps forward and backward in local space")
+TEST_CASE("MoveIntent::from_action maps forward and backward in local space")
 {
     constexpr double step = 0.3;
-    const MoveIntent forward = controls_action_to_move(InputAction::MoveForward, step, 0.0);
-    const MoveIntent backward = controls_action_to_move(InputAction::MoveBackward, step, 0.0);
+    const MoveIntent forward = MoveIntent::from_action(InputAction::MoveForward, step, 0.0);
+    const MoveIntent backward = MoveIntent::from_action(InputAction::MoveBackward, step, 0.0);
 
     REQUIRE(forward.space == MoveSpace::Local);
     REQUIRE(forward.delta.z == Catch::Approx(step));
@@ -27,12 +27,12 @@ TEST_CASE("controls_action_to_move maps forward and backward in local space")
     REQUIRE(backward.delta.z == Catch::Approx(-step));
 }
 
-TEST_CASE("controls_action_to_move strafes using yaw only")
+TEST_CASE("MoveIntent::from_action strafes using yaw only")
 {
     constexpr double step = 0.4;
     constexpr double half_pi = 1.5707963267948966;
-    const MoveIntent right = controls_action_to_move(InputAction::MoveRight, step, half_pi);
-    const MoveIntent left = controls_action_to_move(InputAction::MoveLeft, step, half_pi);
+    const MoveIntent right = MoveIntent::from_action(InputAction::MoveRight, step, half_pi);
+    const MoveIntent left = MoveIntent::from_action(InputAction::MoveLeft, step, half_pi);
 
     REQUIRE(right.space == MoveSpace::World);
     REQUIRE(right.delta.x == Catch::Approx(0.0).margin(1e-6));

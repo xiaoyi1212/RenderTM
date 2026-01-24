@@ -14,6 +14,6 @@ struct MoveIntent
 {
     MoveSpace space;
     Vec3 delta;
-};
 
-MoveIntent controls_action_to_move(InputAction action, double step, double yaw);
+    static MoveIntent from_action(InputAction action, double step, double yaw);
+};
