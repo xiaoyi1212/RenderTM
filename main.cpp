@@ -65,6 +65,14 @@ int main()
         bool has_position = false;
     } mouse_state;
     auto last_look_time = std::chrono::steady_clock::now();
+    auto toggle_gi = []() {
+        const bool enabled = render_get_gi_enabled();
+        render_set_gi_enabled(!enabled);
+        if (!enabled && render_get_gi_strength() <= 0.0)
+        {
+            render_set_gi_strength(1.0);
+        }
+    };
     while (running.load(std::memory_order_relaxed))
     {
         if (shutdownRequested)
@@ -121,6 +129,10 @@ int main()
                     {
                         render_toggle_pause();
                     }
+                    else if (action == InputAction::ToggleGI)
+                    {
+                        toggle_gi();
+                    }
                     else
                     {
                         const Vec2 rot = render_get_camera_rotation();
@@ -148,6 +160,10 @@ int main()
             else if (action == InputAction::TogglePause)
             {
                 render_toggle_pause();
+            }
+            else if (action == InputAction::ToggleGI)
+            {
+                toggle_gi();
             }
             else
             {

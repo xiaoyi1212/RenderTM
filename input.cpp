@@ -8,6 +8,7 @@ InputAction input_map_key(const int ch)
 {
     if (ch == 'q' || ch == 'Q') return InputAction::Quit;
     if (ch == 'p' || ch == 'P') return InputAction::TogglePause;
+    if (ch == 'g' || ch == 'G') return InputAction::ToggleGI;
     if (ch == 'w' || ch == 'W') return InputAction::MoveForward;
     if (ch == 's' || ch == 'S') return InputAction::MoveBackward;
     if (ch == 'a' || ch == 'A') return InputAction::MoveLeft;

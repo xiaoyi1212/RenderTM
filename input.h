@@ -8,6 +8,7 @@ enum class InputAction
     None,
     Quit,
     TogglePause,
+    ToggleGI,
     MoveForward,
     MoveBackward,
     MoveLeft,

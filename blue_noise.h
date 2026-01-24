@@ -273,14 +273,31 @@ static inline uint32_t hash32(uint32_t value)
     return value;
 }
 
-static inline float sample_noise(int x, int y, int frame, int salt)
+struct BlueNoiseShift
+{
+    uint32_t x;
+    uint32_t y;
+};
+
+static inline BlueNoiseShift blue_noise_shift(int frame, int salt)
 {
     const uint32_t seed = static_cast<uint32_t>(frame) ^
                           (static_cast<uint32_t>(salt) * 0x9e3779b9u);
-    const uint32_t shift_x = hash32(seed) & static_cast<uint32_t>(kBlueNoiseMask);
-    const uint32_t shift_y = hash32(seed ^ 0x85ebca6bu) & static_cast<uint32_t>(kBlueNoiseMask);
-    const int nx = (x + static_cast<int>(shift_x)) & kBlueNoiseMask;
-    const int ny = (y + static_cast<int>(shift_y)) & kBlueNoiseMask;
+    return {
+        hash32(seed) & static_cast<uint32_t>(kBlueNoiseMask),
+        hash32(seed ^ 0x85ebca6bu) & static_cast<uint32_t>(kBlueNoiseMask)
+    };
+}
+
+static inline float sample_noise_shifted(int x, int y, const BlueNoiseShift& shift)
+{
+    const int nx = (x + static_cast<int>(shift.x)) & kBlueNoiseMask;
+    const int ny = (y + static_cast<int>(shift.y)) & kBlueNoiseMask;
     const int idx = ny * kBlueNoiseSize + nx;
     return (static_cast<float>(c_BlueNoise[idx]) + 0.5f) / 256.0f;
+}
+
+static inline float sample_noise(int x, int y, int frame, int salt)
+{
+    return sample_noise_shifted(x, y, blue_noise_shift(frame, salt));
 }

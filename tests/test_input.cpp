@@ -20,6 +20,12 @@ TEST_CASE("input_map_key maps pause keys")
     REQUIRE(input_map_key('P') == InputAction::TogglePause);
 }
 
+TEST_CASE("input_map_key maps GI toggle keys")
+{
+    REQUIRE(input_map_key('g') == InputAction::ToggleGI);
+    REQUIRE(input_map_key('G') == InputAction::ToggleGI);
+}
+
 TEST_CASE("input_map_key maps camera movement keys")
 {
     REQUIRE(input_map_key('w') == InputAction::MoveForward);

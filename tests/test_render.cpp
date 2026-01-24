@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
@@ -35,6 +36,8 @@ static void reset_camera()
     render_set_taa_enabled(true);
     render_set_taa_blend(0.2);
     render_set_taa_clamp_enabled(true);
+    render_set_gi_enabled(false);
+    render_set_gi_strength(0.0);
 }
 
 static Mat4 mat4_multiply(const Mat4& a, const Mat4& b)
@@ -147,6 +150,21 @@ static Vec3 rotate_yaw_pitch(const Vec3& v, const double yaw, const double pitch
     const double y2 = y1 * cp - z1 * sp;
     const double z2 = y1 * sp + z1 * cp;
     return {x1, y2, z2};
+}
+
+static bool is_nan_double(const double value)
+{
+    const uint64_t bits = std::bit_cast<uint64_t>(value);
+    const uint64_t exp = bits & 0x7ff0000000000000ULL;
+    const uint64_t mantissa = bits & 0x000fffffffffffffULL;
+    return exp == 0x7ff0000000000000ULL && mantissa != 0ULL;
+}
+
+static bool is_finite_double(const double value)
+{
+    const uint64_t bits = std::bit_cast<uint64_t>(value);
+    const uint64_t exp = bits & 0x7ff0000000000000ULL;
+    return exp != 0x7ff0000000000000ULL;
 }
 
 static float srgb_channel_to_linear(float channel);
@@ -1527,6 +1545,33 @@ TEST_CASE("render_update_array applies lighting as multiple shades")
     REQUIRE(colors.size() >= 2);
 }
 
+TEST_CASE("light direction magnitude does not affect lighting")
+{
+    reset_camera();
+    render_set_sun_orbit_enabled(false);
+    render_set_shadow_enabled(false);
+    render_set_taa_enabled(false);
+    render_set_gi_enabled(false);
+    render_set_gi_strength(0.0);
+    render_set_sky_light_intensity(0.0);
+    render_set_ambient_occlusion_enabled(false);
+    render_set_paused(true);
+    render_set_light_intensity(1.0);
+
+    const size_t width = 120;
+    const size_t height = 80;
+    std::vector<uint32_t> frame_a(width * height, 0u);
+    std::vector<uint32_t> frame_b(width * height, 0u);
+
+    render_set_light_direction({0.3, -0.7, 0.2});
+    render_update_array(frame_a.data(), width, height);
+
+    render_set_light_direction({0.6, -1.4, 0.4});
+    render_update_array(frame_b.data(), width, height);
+
+    REQUIRE(frame_a == frame_b);
+}
+
 TEST_CASE("render state setters and getters")
 {
     reset_camera();
@@ -1566,6 +1611,14 @@ TEST_CASE("render state setters and getters")
 
     render_set_taa_blend(0.25);
     REQUIRE(render_get_taa_blend() == Catch::Approx(0.25));
+
+    render_set_gi_enabled(true);
+    REQUIRE(render_get_gi_enabled());
+    render_set_gi_enabled(false);
+    REQUIRE_FALSE(render_get_gi_enabled());
+
+    render_set_gi_strength(0.6);
+    REQUIRE(render_get_gi_strength() == Catch::Approx(0.6));
 
     render_set_paused(false);
     REQUIRE_FALSE(render_is_paused());
@@ -2155,6 +2208,75 @@ TEST_CASE("directional shadowing darkens terrain")
     REQUIRE(found_shadow);
 }
 
+TEST_CASE("one-bounce GI lifts shadowed terrain")
+{
+    reset_camera();
+    render_set_paused(true);
+    render_set_sun_orbit_enabled(false);
+    render_set_light_intensity(0.0);
+    render_set_moon_intensity(1.0);
+    const Vec3 light_dir = normalize_vec3({0.6, -0.3, 0.8});
+    render_set_moon_direction(light_dir);
+    render_set_shadow_enabled(true);
+    render_set_sky_light_intensity(0.0);
+    render_set_ambient_occlusion_enabled(false);
+    render_set_taa_enabled(false);
+    render_set_gi_enabled(false);
+    render_set_gi_strength(0.0);
+
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+
+    Vec3 shadow_point{0.0, 0.0, 0.0};
+    REQUIRE(find_shadow_sample(heights, light_dir, {0.0, -1.0, 0.0}, true, &shadow_point));
+
+    const Vec3 eye{shadow_point.x, shadow_point.y - 18.0, shadow_point.z - 14.0};
+    const Vec3 to_target{shadow_point.x - eye.x, shadow_point.y - eye.y, shadow_point.z - eye.z};
+    const double yaw = std::atan2(to_target.x, to_target.z);
+    const double dist_xz = std::sqrt(to_target.x * to_target.x + to_target.z * to_target.z);
+    const double pitch = std::atan2(-to_target.y, dist_xz);
+    render_set_camera_position(eye);
+    render_set_camera_rotation({yaw, pitch});
+
+    const size_t width = 200;
+    const size_t height = 160;
+    std::vector<uint32_t> framebuffer(width * height, 0u);
+
+    const Vec2 projected = render_project_point(shadow_point, width, height);
+    const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
+    const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
+    const uint32_t sky_top = render_get_sky_top_color();
+    const uint32_t sky_bottom = render_get_sky_bottom_color();
+
+    auto measure_avg = [&](int frames, double& out_avg) {
+        double sum = 0.0;
+        for (int i = 0; i < frames; ++i)
+        {
+            render_update_array(framebuffer.data(), width, height);
+            double avg = 0.0;
+            REQUIRE(sample_average_luminance(framebuffer, width, height, px, py, sky_top, sky_bottom, avg));
+            sum += avg;
+        }
+        out_avg = sum / static_cast<double>(frames);
+    };
+
+    double avg_off = 0.0;
+    measure_avg(8, avg_off);
+
+    render_set_gi_enabled(true);
+    render_set_gi_strength(1.5);
+
+    double avg_on = 0.0;
+    measure_avg(8, avg_on);
+
+    render_set_gi_enabled(false);
+    render_set_gi_strength(0.0);
+    render_set_paused(false);
+
+    REQUIRE(avg_on > avg_off + 5.0);
+}
+
 TEST_CASE("light direction reads stay coherent under concurrent updates")
 {
     reset_camera();
@@ -2466,10 +2588,10 @@ TEST_CASE("sky lighting is consistent across a terrain side face")
     const Vec2 top_proj = render_project_point({face_x, center_y - inset, center_z}, width, height);
     const Vec2 bottom_proj = render_project_point({face_x, center_y + inset, center_z}, width, height);
 
-    REQUIRE(std::isfinite(top_proj.x));
-    REQUIRE(std::isfinite(top_proj.y));
-    REQUIRE(std::isfinite(bottom_proj.x));
-    REQUIRE(std::isfinite(bottom_proj.y));
+    REQUIRE(is_finite_double(top_proj.x));
+    REQUIRE(is_finite_double(top_proj.y));
+    REQUIRE(is_finite_double(bottom_proj.x));
+    REQUIRE(is_finite_double(bottom_proj.y));
 
     const int top_x = std::clamp(static_cast<int>(std::lround(top_proj.x)), 0, static_cast<int>(width) - 1);
     const int top_y = std::clamp(static_cast<int>(std::lround(top_proj.y)), 0, static_cast<int>(height) - 1);
@@ -2933,8 +3055,8 @@ TEST_CASE("render_unproject_point reconstructs world position")
 
     const Vec3 target{10.0, 0.0, 5.0};
     const Vec2 projected = render_project_point(target, width, height);
-    REQUIRE_FALSE(std::isnan(projected.x));
-    REQUIRE_FALSE(std::isnan(projected.y));
+    REQUIRE_FALSE(is_nan_double(projected.x));
+    REQUIRE_FALSE(is_nan_double(projected.y));
 
     const Vec3 view = rotate_yaw_pitch({target.x - camera_pos.x,
                                         target.y - camera_pos.y,
@@ -3001,8 +3123,8 @@ TEST_CASE("reprojection alignment maps scene points back to previous screen coor
 
     const Vec3 point{0.0, 0.0, 12.0};
     const Vec2 p1 = render_project_point(point, width, height);
-    REQUIRE(std::isfinite(p1.x));
-    REQUIRE(std::isfinite(p1.y));
+    REQUIRE(is_finite_double(p1.x));
+    REQUIRE(is_finite_double(p1.y));
 
     Vec3 cam_pos = render_get_camera_position();
     render_set_camera_position({cam_pos.x + 2.0, cam_pos.y, cam_pos.z});
@@ -3010,8 +3132,8 @@ TEST_CASE("reprojection alignment maps scene points back to previous screen coor
     render_update_array(framebuffer.data(), width, height);
 
     const Vec2 p2 = render_project_point(point, width, height);
-    REQUIRE(std::isfinite(p2.x));
-    REQUIRE(std::isfinite(p2.y));
+    REQUIRE(is_finite_double(p2.x));
+    REQUIRE(is_finite_double(p2.y));
 
     cam_pos = render_get_camera_position();
     const Vec2 cam_rot = render_get_camera_rotation();
@@ -3108,7 +3230,7 @@ TEST_CASE("temporal accumulation rejects history for pixels reprojected outside 
                     const Vec3 world{block_x, block_y - half, block_z};
 
                     const Vec2 projected = render_project_point(world, width, height);
-                    if (!std::isfinite(projected.x) || !std::isfinite(projected.y))
+                    if (!is_finite_double(projected.x) || !is_finite_double(projected.y))
                     {
                         continue;
                     }
@@ -3141,7 +3263,7 @@ TEST_CASE("temporal accumulation rejects history for pixels reprojected outside 
                     }
 
                     const Vec2 prev = reproject_with_vp(prev_vp, world, width, height);
-                    if (!std::isfinite(prev.x) || !std::isfinite(prev.y))
+                    if (!is_finite_double(prev.x) || !is_finite_double(prev.y))
                     {
                         continue;
                     }
@@ -3229,8 +3351,8 @@ TEST_CASE("render_project_point returns NaN for points behind camera")
     const size_t height = 90;
 
     const Vec2 projected = render_project_point({0.0, 0.0, -1.0}, width, height);
-    REQUIRE(std::isnan(projected.x));
-    REQUIRE(std::isnan(projected.y));
+    REQUIRE(is_nan_double(projected.x));
+    REQUIRE(is_nan_double(projected.y));
 }
 
 TEST_CASE("render_debug_depth_at_sample uses perspective-correct interpolation")

@@ -96,6 +96,8 @@ static std::atomic<bool> taaEnabled{true};
 static std::atomic<double> taaBlend{0.05};
 static std::atomic<bool> taaClampEnabled{true};
 static std::atomic<double> taaSharpenStrength{0.0};
+static std::atomic<bool> giEnabled{false};
+static std::atomic<double> giStrength{0.0};
 static std::atomic<uint64_t> renderStateVersion{1};
 static std::atomic<double> camera_x{16.0};
 static std::atomic<double> camera_y{-19.72};
@@ -116,6 +118,7 @@ static Mat4 inverseCurrentVP{{{1.0, 0.0, 0.0, 0.0},
                               {0.0, 1.0, 0.0, 0.0},
                               {0.0, 0.0, 1.0, 0.0},
                               {0.0, 0.0, 0.0, 1.0}}};
+
 
 static void mark_render_state_dirty()
 {
@@ -215,6 +218,9 @@ struct ColorRGB
     float b;
 };
 
+static ColorRGB unpack_color(uint32_t color);
+static ColorRGB srgb_to_linear(const ColorRGB& color);
+
 struct TopFaceLighting
 {
     std::array<Vec3, 4> normals;
@@ -274,6 +280,12 @@ struct TaaContext {
 };
 
 constexpr double kShadowRayBias = 0.05;
+constexpr double kGiRayBias = 0.04;
+constexpr double kGiMaxDistance = 12.0;
+constexpr int kGiNoiseSalt = 73;
+constexpr float kGiClamp = 4.0f;
+constexpr int kGiSampleCount = 1;
+constexpr float kGiAoLift = 0.15f;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kSunLatitudeDeg = 30.0;
 constexpr double kSunLatitudeRad = kPi * kSunLatitudeDeg / 180.0;
@@ -323,7 +335,8 @@ static Vec3 jitter_shadow_direction(const Vec3& light_dir,
                                     const Vec3& right_scaled,
                                     const Vec3& up_scaled,
                                     const int px, const int py,
-                                    const uint32_t frame, const int salt);
+                                    const BlueNoiseShift& shift_u,
+                                    const BlueNoiseShift& shift_v);
 static float shadow_filter_at(const float* mask, const float* depth, const Vec3* normals,
                               size_t width, size_t height, int x, int y, float depth_max);
 static void filter_shadow_masks(const float* mask_a, const float* mask_b,
@@ -412,6 +425,7 @@ struct VoxelBlock
 {
     Vec3 position;
     uint32_t color;
+    ColorRGB albedo_linear;
     TopFaceLighting topFace;
     std::array<std::array<Vec3, 4>, 6> face_normals;
     std::array<std::array<float, 4>, 6> face_sky_visibility;
@@ -734,9 +748,11 @@ static void build_terrain_chunk()
                         }
                     }
                 }
+                const ColorRGB albedo_linear = srgb_to_linear(unpack_color(color));
                 terrainBlocks.push_back({
                     {start_x + x * block_size, base_y - y * block_size, start_z + z * block_size},
                     color,
+                    albedo_linear,
                     empty_top,
                     face_normals,
                     face_sky_visibility
@@ -933,6 +949,11 @@ static ColorRGB scale_color(const ColorRGB& color, float scale)
     return {color.r * scale, color.g * scale, color.b * scale};
 }
 
+static ColorRGB mul_color(const ColorRGB& a, const ColorRGB& b)
+{
+    return {a.r * b.r, a.g * b.g, a.b * b.b};
+}
+
 static ColorRGB add_color(const ColorRGB& a, const ColorRGB& b)
 {
     return {a.r + b.r, a.g + b.g, a.b + b.b};
@@ -980,6 +1001,16 @@ static double schlick_fresnel(double vdoth, double f0)
 static double blinn_phong_normalization(const double shininess)
 {
     return (shininess + 8.0) / (8.0 * kPi);
+}
+
+static inline void sincos_double(const double angle, double* out_sin, double* out_cos)
+{
+#if defined(__GNUC__)
+    __builtin_sincos(angle, out_sin, out_cos);
+#else
+    *out_sin = std::sin(angle);
+    *out_cos = std::cos(angle);
+#endif
 }
 
 static double eval_specular_term(const double ndoth, const double vdoth, const double ndotl,
@@ -1432,15 +1463,18 @@ static inline float edge_function(const ScreenVertex& a, const ScreenVertex& b, 
 static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                                  ColorRGB* sample_direct_sun, ColorRGB* sample_direct_moon,
                                  float* shadow_mask_sun, float* shadow_mask_moon,
-                                 Vec3* sample_normals, size_t width, size_t height,
+                                 Vec3* sample_normals, ColorRGB* sample_albedo, float* sample_ao,
+                                 size_t width, size_t height,
                                  const ScreenVertex& v0, const ScreenVertex& v1, const ScreenVertex& v2,
                                  const Vec3& wp0, const Vec3& wp1, const Vec3& wp2,
                                  const Vec3& n0, const Vec3& n1, const Vec3& n2,
                                  const float vis0, const float vis1, const float vis2,
-                                 const ShadingContext& ctx, const uint32_t frame_index,
+                                 const ShadingContext& ctx,
                                  const float jitter_x, const float jitter_y,
                                  const std::array<Vec3, 2>& lights_right_scaled,
-                                 const std::array<Vec3, 2>& lights_up_scaled)
+                                 const std::array<Vec3, 2>& lights_up_scaled,
+                                 const std::array<BlueNoiseShift, 2>& shadow_shift_u,
+                                 const std::array<BlueNoiseShift, 2>& shadow_shift_v)
 {
     float min_x = std::min({v0.x, v1.x, v2.x});
     float max_x = std::max({v0.x, v1.x, v2.x});
@@ -1583,8 +1617,9 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                                     const Vec3 shadow_dir = jitter_shadow_direction(light.dir,
                                                             lights_right_scaled[light_idx],
                                                             lights_up_scaled[light_idx],
-                                                            x, y, frame_index,
-                                                            shadow_salt);
+                                                            x, y,
+                                                            shadow_shift_u[light_idx],
+                                                            shadow_shift_v[light_idx]);
                                     out_shadow = compute_shadow_factor(shadow_dir, world, normal);
                                 }
 
@@ -1626,6 +1661,14 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                         shadow_mask_sun[idx] = shadow_sun;
                         shadow_mask_moon[idx] = shadow_moon;
                         sample_normals[idx] = normal;
+                        if (sample_albedo)
+                        {
+                            sample_albedo[idx] = ctx.albedo;
+                        }
+                        if (sample_ao)
+                        {
+                            sample_ao[idx] = visibility;
+                        }
                     }
                 }
             }
@@ -1649,7 +1692,7 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
 
 static void build_light_basis(const Vec3& light_dir, Vec3& right, Vec3& up, Vec3& forward)
 {
-    forward = normalize_vec(light_dir);
+    forward = light_dir;
     Vec3 up_guess{0.0, 1.0, 0.0};
     if (std::abs(dot_vec(forward, up_guess)) > 0.99)
     {
@@ -1663,15 +1706,16 @@ static Vec3 jitter_shadow_direction(const Vec3& light_dir,
                                     const Vec3& right_scaled,
                                     const Vec3& up_scaled,
                                     const int px, const int py,
-                                    const uint32_t frame, const int salt)
+                                    const BlueNoiseShift& shift_u,
+                                    const BlueNoiseShift& shift_v)
 {
     if (right_scaled.x == 0.0 && right_scaled.y == 0.0 && right_scaled.z == 0.0)
     {
         return light_dir;
     }
 
-    const float u1 = sample_noise(px, py, static_cast<int>(frame), salt);
-    const float u2 = sample_noise(px, py, static_cast<int>(frame), salt + 1);
+    const float u1 = sample_noise_shifted(px, py, shift_u);
+    const float u2 = sample_noise_shifted(px, py, shift_v);
     const int ix = static_cast<int>(u1 * 8.0f);
     const int iy = static_cast<int>(u2 * 8.0f);
     const size_t idx = static_cast<size_t>((iy & 7) * 8 + (ix & 7));
@@ -1684,6 +1728,188 @@ static Vec3 jitter_shadow_direction(const Vec3& light_dir,
         light_dir.y + right_scaled.y * dx + up_scaled.y * dy,
         light_dir.z + right_scaled.z * dx + up_scaled.z * dy
     };
+}
+
+struct GiHit
+{
+    Vec3 normal;
+    ColorRGB albedo;
+    float sky_visibility;
+};
+
+static bool gi_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec3& dir,
+                            const double max_distance, GiHit* out_hit)
+{
+    if (!out_hit)
+    {
+        return false;
+    }
+    if (terrainSize <= 0 || terrainMaxHeight <= 0)
+    {
+        return false;
+    }
+
+    const size_t terrain_size = static_cast<size_t>(terrainSize);
+    const size_t terrain_height = static_cast<size_t>(terrainMaxHeight);
+    const size_t terrain_stride = terrain_size * terrain_height;
+
+    const double block_size = kTerrainBlockSize;
+    const double half = block_size * 0.5;
+    const double start_x = -(terrainSize - 1) * block_size * 0.5;
+    const double start_z = kTerrainStartZ;
+    const double base_y = kTerrainBaseY;
+    const double inv_block = 1.0 / block_size;
+
+    const Vec3 origin_world{
+        world.x + normal.x * kGiRayBias,
+        world.y + normal.y * kGiRayBias,
+        world.z + normal.z * kGiRayBias
+    };
+    const Vec3 origin{
+        (origin_world.x - start_x + half) * inv_block,
+        (base_y - origin_world.y + half) * inv_block,
+        (origin_world.z - start_z + half) * inv_block
+    };
+    const Vec3 dir_grid{
+        dir.x * inv_block,
+        -dir.y * inv_block,
+        dir.z * inv_block
+    };
+    if (dir_grid.x == 0.0 && dir_grid.y == 0.0 && dir_grid.z == 0.0)
+    {
+        return false;
+    }
+
+    const double origin_x_floor = std::floor(origin.x);
+    const double origin_y_floor = std::floor(origin.y);
+    const double origin_z_floor = std::floor(origin.z);
+
+    int x = static_cast<int>(origin_x_floor);
+    int y = static_cast<int>(origin_y_floor);
+    int z = static_cast<int>(origin_z_floor);
+
+    if (x < 0 || x >= terrainSize || z < 0 || z >= terrainSize || y < 0 || y >= terrainMaxHeight)
+    {
+        return false;
+    }
+
+    const double inf = std::numeric_limits<double>::infinity();
+    const int step_x = dir_grid.x > 0.0 ? 1 : (dir_grid.x < 0.0 ? -1 : 0);
+    const int step_y = dir_grid.y > 0.0 ? 1 : (dir_grid.y < 0.0 ? -1 : 0);
+    const int step_z = dir_grid.z > 0.0 ? 1 : (dir_grid.z < 0.0 ? -1 : 0);
+
+    const double t_delta_x = step_x != 0 ? 1.0 / std::abs(dir_grid.x) : inf;
+    const double t_delta_y = step_y != 0 ? 1.0 / std::abs(dir_grid.y) : inf;
+    const double t_delta_z = step_z != 0 ? 1.0 / std::abs(dir_grid.z) : inf;
+
+    const double next_x = step_x > 0 ? (origin_x_floor + 1.0) : origin_x_floor;
+    const double next_y = step_y > 0 ? (origin_y_floor + 1.0) : origin_y_floor;
+    const double next_z = step_z > 0 ? (origin_z_floor + 1.0) : origin_z_floor;
+
+    double t_max_x = step_x != 0 ? (next_x - origin.x) / dir_grid.x : inf;
+    double t_max_y = step_y != 0 ? (next_y - origin.y) / dir_grid.y : inf;
+    double t_max_z = step_z != 0 ? (next_z - origin.z) / dir_grid.z : inf;
+
+    const double max_t = max_distance * inv_block;
+    const int max_steps = (terrainSize + terrainSize + terrainMaxHeight) * 4;
+    bool skip_first = true;
+    double traveled = 0.0;
+    int last_axis = -1;
+
+    for (int i = 0; i < max_steps; ++i)
+    {
+        if (!skip_first)
+        {
+            const size_t slot = static_cast<size_t>(z) * terrain_stride +
+                                static_cast<size_t>(y) * terrain_size +
+                                static_cast<size_t>(x);
+            const int block_index = terrainBlockIndex[slot];
+            if (block_index >= 0)
+            {
+                const VoxelBlock* block = &terrainBlocks[static_cast<size_t>(block_index)];
+
+                Vec3 hit_normal{0.0, 0.0, 0.0};
+                int face = FaceTop;
+                if (last_axis == 0)
+                {
+                    hit_normal = {-static_cast<double>(step_x), 0.0, 0.0};
+                    face = (step_x > 0) ? FaceLeft : FaceRight;
+                }
+                else if (last_axis == 1)
+                {
+                    hit_normal = {0.0, static_cast<double>(step_y), 0.0};
+                    face = (step_y > 0) ? FaceBottom : FaceTop;
+                }
+                else if (last_axis == 2)
+                {
+                    hit_normal = {0.0, 0.0, -static_cast<double>(step_z)};
+                    face = (step_z > 0) ? FaceBack : FaceFront;
+                }
+
+                float visibility = 1.0f;
+                if (face >= 0 && face < 6)
+                {
+                    float sum = 0.0f;
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        sum += block->face_sky_visibility[static_cast<size_t>(face)][static_cast<size_t>(c)];
+                    }
+                    visibility = sum * 0.25f;
+                }
+
+                out_hit->normal = hit_normal;
+                out_hit->albedo = block->albedo_linear;
+                out_hit->sky_visibility = std::clamp(visibility, 0.0f, 1.0f);
+                return true;
+            }
+        }
+        skip_first = false;
+
+        if (t_max_x < t_max_y)
+        {
+            if (t_max_x < t_max_z)
+            {
+                x += step_x;
+                traveled = t_max_x;
+                t_max_x += t_delta_x;
+                last_axis = 0;
+            }
+            else
+            {
+                z += step_z;
+                traveled = t_max_z;
+                t_max_z += t_delta_z;
+                last_axis = 2;
+            }
+        }
+        else
+        {
+            if (t_max_y < t_max_z)
+            {
+                y += step_y;
+                traveled = t_max_y;
+                t_max_y += t_delta_y;
+                last_axis = 1;
+            }
+            else
+            {
+                z += step_z;
+                traveled = t_max_z;
+                t_max_z += t_delta_z;
+                last_axis = 2;
+            }
+        }
+
+        if (traveled > max_t)
+        {
+            return false;
+        }
+        if (x < 0 || x >= terrainSize || z < 0 || z >= terrainSize || y < 0 || y >= terrainMaxHeight)
+        {
+            return false;
+        }
+    }
+    return false;
 }
 
 static bool shadow_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec3& light_dir)
@@ -1977,12 +2203,14 @@ static void filter_shadow_masks(const float* mask_a, const float* mask_b,
 static void render_quad(float* zbuffer, ColorRGB* sample_ambient,
                         ColorRGB* sample_direct_sun, ColorRGB* sample_direct_moon,
                         float* shadow_mask_sun, float* shadow_mask_moon, Vec3* sample_normals,
-                        size_t width, size_t height,
+                        ColorRGB* sample_albedo, float* sample_ao, size_t width, size_t height,
                         const RenderQuad& quad, const double fov_x, const double fov_y,
                         const Vec3& camera_pos, const ViewRotation& view_rot, const ShadingContext& ctx,
-                        const uint32_t frame_index, const float jitter_x, const float jitter_y,
+                        const float jitter_x, const float jitter_y,
                         const std::array<Vec3, 2>& lights_right_scaled,
-                        const std::array<Vec3, 2>& lights_up_scaled)
+                        const std::array<Vec3, 2>& lights_up_scaled,
+                        const std::array<BlueNoiseShift, 2>& shadow_shift_u,
+                        const std::array<BlueNoiseShift, 2>& shadow_shift_v)
 
 {
     Vec3 view_space[4];
@@ -2043,15 +2271,16 @@ static void render_quad(float* zbuffer, ColorRGB* sample_ambient,
         const ScreenVertex sv2 = project_vertex(c.view);
         draw_shaded_triangle(zbuffer, sample_ambient,
                              sample_direct_sun, sample_direct_moon,
-                             shadow_mask_sun, shadow_mask_moon, sample_normals,
+                             shadow_mask_sun, shadow_mask_moon, sample_normals, sample_albedo, sample_ao,
                              width, height,
                              sv0, sv1, sv2,
                              a.world, b.world, c.world,
                              a.normal, b.normal, c.normal,
                              a.sky_visibility, b.sky_visibility, c.sky_visibility,
-                             ctx, frame_index,
+                             ctx,
                              jitter_x, jitter_y,
-                             lights_right_scaled, lights_up_scaled);
+                             lights_right_scaled, lights_up_scaled,
+                             shadow_shift_u, shadow_shift_v);
     };
 
     auto draw_clipped = [&](int i0, int i1, int i2) {
@@ -2123,6 +2352,11 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     static std::vector<float> shadow_mask_filtered_sun;
     static std::vector<float> shadow_mask_filtered_moon;
     static std::vector<Vec3> sample_normals;
+    static std::vector<ColorRGB> sample_albedo;
+    static std::vector<ColorRGB> sample_indirect;
+    static std::vector<float> sample_ao;
+    static std::vector<Vec3> world_positions;
+    static std::vector<uint32_t> world_stamp;
     static std::vector<ColorRGB> taa_history[2]; 
     static std::vector<ColorRGB> taa_resolved;
     static std::vector<uint8_t> taa_history_mask;
@@ -2139,12 +2373,16 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     static float taa_motion_activity = 0.0f;
     static uint64_t taa_motion_state_version = 0;
     const size_t sample_count = width * height;
+    const double width_d = static_cast<double>(width);
+    const double height_d = static_cast<double>(height);
     const float depth_max = std::numeric_limits<float>::max();
 
     const bool taa_on = taaEnabled.load(std::memory_order_relaxed);
     const float base_blend = static_cast<float>(std::clamp(taaBlend.load(std::memory_order_relaxed), 0.0, 1.0));
     const float taa_factor = base_blend;
     const bool clamp_history = taaClampEnabled.load(std::memory_order_relaxed);
+    const bool gi_on = giEnabled.load(std::memory_order_relaxed);
+    const float gi_scale = static_cast<float>(std::max(0.0, giStrength.load(std::memory_order_relaxed)));
     const uint64_t state_version = renderStateVersion.load(std::memory_order_relaxed);
 
     if (width != cached_width || height != cached_height)
@@ -2161,6 +2399,11 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         shadow_mask_filtered_sun.assign(sample_count, 1.0f);
         shadow_mask_filtered_moon.assign(sample_count, 1.0f);
         sample_normals.assign(sample_count, {0.0, 0.0, 0.0});
+        sample_albedo.assign(sample_count, {0.0f, 0.0f, 0.0f});
+        sample_indirect.assign(sample_count, {0.0f, 0.0f, 0.0f});
+        sample_ao.assign(sample_count, 1.0f);
+        world_positions.assign(sample_count, {0.0, 0.0, 0.0});
+        world_stamp.assign(sample_count, 0);
         taa_resolved.assign(sample_count, {0.0f, 0.0f, 0.0f});
         taa_history_mask.assign(sample_count, 0);
     }
@@ -2176,6 +2419,9 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         std::fill(shadow_mask_filtered_sun.begin(), shadow_mask_filtered_sun.end(), 1.0f);
         std::fill(shadow_mask_filtered_moon.begin(), shadow_mask_filtered_moon.end(), 1.0f);
         std::fill(sample_normals.begin(), sample_normals.end(), Vec3{0.0, 0.0, 0.0});
+        std::fill(sample_albedo.begin(), sample_albedo.end(), ColorRGB{0.0f, 0.0f, 0.0f});
+        std::fill(sample_indirect.begin(), sample_indirect.end(), ColorRGB{0.0f, 0.0f, 0.0f});
+        std::fill(sample_ao.begin(), sample_ao.end(), 1.0f);
     }
 
     if (taa_on)
@@ -2303,6 +2549,8 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         jitter_x = (u - 0.5f) * jitter_scale;
         jitter_y = (v - 0.5f) * jitter_scale;
     }
+    const double jitter_x_d = static_cast<double>(jitter_x);
+    const double jitter_y_d = static_cast<double>(jitter_y);
     const ViewRotation view_rot = make_view_rotation(view_yaw, view_pitch);
 
     const double mat_ambient = 0.25;
@@ -2379,6 +2627,15 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         }
     }
 
+    const std::array<BlueNoiseShift, 2> shadow_shift_u{
+        blue_noise_shift(static_cast<int>(frame_index), kSunShadowSalt),
+        blue_noise_shift(static_cast<int>(frame_index), kMoonShadowSalt)
+    };
+    const std::array<BlueNoiseShift, 2> shadow_shift_v{
+        blue_noise_shift(static_cast<int>(frame_index), kSunShadowSalt + 1),
+        blue_noise_shift(static_cast<int>(frame_index), kMoonShadowSalt + 1)
+    };
+
     const bool direct_lighting_enabled = (lights[0].intensity > 0.0) || (lights[1].intensity > 0.0);
     const bool ao_enabled = ambientOcclusionEnabled.load(std::memory_order_relaxed);
     const float sky_scale = static_cast<float>(std::clamp(effective_sky_intensity, 0.0, 1.0));
@@ -2436,10 +2693,11 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         render_quad(zbuffer.data(), sample_colors.data(),
                     sample_direct_sun.data(), sample_direct_moon.data(),
                     shadow_mask_sun.data(), shadow_mask_moon.data(),
-                    sample_normals.data(),
+                    sample_normals.data(), sample_albedo.data(), sample_ao.data(),
                     width, height, quad, fov_x, fov_y,
-                    camera_pos_snapshot, view_rot, ctx, frame_index, jitter_x, jitter_y,
-                    lights_right_scaled, lights_up_scaled); 
+                    camera_pos_snapshot, view_rot, ctx, jitter_x, jitter_y,
+                    lights_right_scaled, lights_up_scaled,
+                    shadow_shift_u, shadow_shift_v); 
     }
 
     if (shadows_on)
@@ -2472,6 +2730,165 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         }
     }
 
+    if (gi_on && gi_scale > 0.0f)
+    {
+        std::array<BlueNoiseShift, kGiSampleCount * 4> gi_shifts{};
+        for (int sample_idx = 0; sample_idx < kGiSampleCount; ++sample_idx)
+        {
+            const int base_salt = kGiNoiseSalt + sample_idx * 4;
+            const size_t base_idx = static_cast<size_t>(sample_idx) * 4;
+            gi_shifts[base_idx + 0] = blue_noise_shift(static_cast<int>(frame_index), base_salt);
+            gi_shifts[base_idx + 1] = blue_noise_shift(static_cast<int>(frame_index), base_salt + 1);
+            gi_shifts[base_idx + 2] = blue_noise_shift(static_cast<int>(frame_index), base_salt + 2);
+            gi_shifts[base_idx + 3] = blue_noise_shift(static_cast<int>(frame_index), base_salt + 3);
+        }
+        for (size_t y = 0; y < height; ++y)
+        {
+            const double screen_y = static_cast<double>(y) + 0.5 + jitter_y_d;
+            for (size_t x = 0; x < width; ++x)
+            {
+                const size_t idx = y * width + x;
+                if (zbuffer[idx] >= depth_max)
+                {
+                    continue;
+                }
+                Vec3 normal = sample_normals[idx];
+                const double normal_len_sq = normal.x * normal.x + normal.y * normal.y + normal.z * normal.z;
+                if (normal_len_sq <= 1e-6)
+                {
+                    continue;
+                }
+                const ColorRGB origin_albedo = sample_albedo[idx];
+
+                const double screen_x = static_cast<double>(x) + 0.5 + jitter_x_d;
+                const Vec3 world = unproject_fast(screen_x, screen_y, zbuffer[idx],
+                                                  inverseCurrentVP, width_d, height_d,
+                                                  proj_a, proj_b);
+                world_positions[idx] = world;
+                world_stamp[idx] = frame_index;
+
+                auto trace_gi = [&](const Vec3& hemi_normal,
+                                    const BlueNoiseShift& shift_u,
+                                    const BlueNoiseShift& shift_v,
+                                    ColorRGB& out) -> bool {
+                    out = {0.0f, 0.0f, 0.0f};
+                    const Vec3& hn = hemi_normal;
+
+                    const float u1 = sample_noise_shifted(static_cast<int>(x), static_cast<int>(y), shift_u);
+                    const float u2 = sample_noise_shifted(static_cast<int>(x), static_cast<int>(y), shift_v);
+                    const double r = std::sqrt(static_cast<double>(u1));
+                    const double theta = 2.0 * kPi * static_cast<double>(u2);
+                    double sin_theta_angle = 0.0;
+                    double cos_theta_angle = 0.0;
+                    sincos_double(theta, &sin_theta_angle, &cos_theta_angle);
+                    const double x = r * cos_theta_angle;
+                    const double y = r * sin_theta_angle;
+                    const double z = std::sqrt(std::max(0.0, 1.0 - r * r));
+                    const Vec3 local{x, y, z};
+
+                    Vec3 tangent, bitangent, forward;
+                    build_light_basis(hn, tangent, bitangent, forward);
+                    Vec3 dir{
+                        tangent.x * local.x + bitangent.x * local.y + forward.x * local.z,
+                        tangent.y * local.x + bitangent.y * local.y + forward.y * local.z,
+                        tangent.z * local.x + bitangent.z * local.y + forward.z * local.z
+                    };
+
+                    GiHit hit{};
+                    if (!gi_raymarch_hit(world, normal, dir, kGiMaxDistance, &hit))
+                    {
+                        return false;
+                    }
+
+                    const double cos_theta = local.z;
+                    if (cos_theta <= 0.0)
+                    {
+                        return false;
+                    }
+
+                    ColorRGB incoming{0.0f, 0.0f, 0.0f};
+                    for (const auto& light : lights)
+                    {
+                        if (light.intensity <= 0.0)
+                        {
+                            continue;
+                        }
+                        const double ndotl = std::max(0.0, dot_vec(hit.normal, light.dir));
+                        if (ndotl <= 0.0)
+                        {
+                            continue;
+                        }
+                        const float scale = static_cast<float>(light.intensity * ndotl);
+                        incoming.r += light.color.r * scale;
+                        incoming.g += light.color.g * scale;
+                        incoming.b += light.color.b * scale;
+                    }
+
+                    if (sky_scale > 0.0f)
+                    {
+                        float sky_t = static_cast<float>((-hit.normal.y) * 0.5 + 0.5);
+                        sky_t = std::clamp(sky_t, 0.0f, 1.0f);
+                        const ColorRGB sky = lerp_color(hemi_ground, sky_top_linear, sky_t);
+                        const float vis = hit.sky_visibility;
+                        incoming.r += sky.r * sky_scale * vis;
+                        incoming.g += sky.g * sky_scale * vis;
+                        incoming.b += sky.b * sky_scale * vis;
+                    }
+
+                    if (incoming.r <= 0.0f && incoming.g <= 0.0f && incoming.b <= 0.0f)
+                    {
+                        return false;
+                    }
+
+                    ColorRGB bounced = mul_color(incoming, hit.albedo);
+                    bounced = mul_color(bounced, origin_albedo);
+                    out = scale_color(bounced, static_cast<float>(cos_theta));
+                    return out.r > 0.0f || out.g > 0.0f || out.b > 0.0f;
+                };
+
+                ColorRGB gi_sum{0.0f, 0.0f, 0.0f};
+                for (int sample_idx = 0; sample_idx < kGiSampleCount; ++sample_idx)
+                {
+                    const size_t base_idx = static_cast<size_t>(sample_idx) * 4;
+                    ColorRGB gi_sample{0.0f, 0.0f, 0.0f};
+                    bool hit = trace_gi(normal,
+                                        gi_shifts[base_idx + 0],
+                                        gi_shifts[base_idx + 1],
+                                        gi_sample);
+                    if (!hit)
+                    {
+                        const Vec3 opposite{-normal.x, -normal.y, -normal.z};
+                        hit = trace_gi(opposite,
+                                       gi_shifts[base_idx + 2],
+                                       gi_shifts[base_idx + 3],
+                                       gi_sample);
+                    }
+                    if (hit)
+                    {
+                        gi_sum.r += gi_sample.r;
+                        gi_sum.g += gi_sample.g;
+                        gi_sum.b += gi_sample.b;
+                    }
+                }
+
+                if (gi_sum.r > 0.0f || gi_sum.g > 0.0f || gi_sum.b > 0.0f)
+                {
+                    const float inv_samples = 1.0f / static_cast<float>(kGiSampleCount);
+                    ColorRGB gi_sample{
+                        gi_sum.r * inv_samples,
+                        gi_sum.g * inv_samples,
+                        gi_sum.b * inv_samples
+                    };
+                    gi_sample = scale_color(gi_sample, gi_scale);
+                    gi_sample.r = std::clamp(gi_sample.r, 0.0f, kGiClamp);
+                    gi_sample.g = std::clamp(gi_sample.g, 0.0f, kGiClamp);
+                    gi_sample.b = std::clamp(gi_sample.b, 0.0f, kGiClamp);
+                    sample_indirect[idx] = gi_sample;
+                }
+            }
+        }
+    }
+
     static constexpr int bayer4[4][4] = {
         {0, 8, 2, 10},
         {12, 4, 14, 6},
@@ -2499,9 +2916,15 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         }
         ColorRGB accum = sample_colors[idx];
         const ColorRGB direct = sample_direct[idx];
+        const ColorRGB indirect = sample_indirect[idx];
+        const float gi_ao = std::min(1.0f, sample_ao[idx] + kGiAoLift);
+        const ColorRGB indirect_scaled = scale_color(indirect, gi_ao);
         accum.r += direct.r;
         accum.g += direct.g;
         accum.b += direct.b;
+        accum.r += indirect_scaled.r;
+        accum.g += indirect_scaled.g;
+        accum.b += indirect_scaled.b;
         return accum;
     };
 
@@ -2509,6 +2932,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     {
         const float sky_t = height > 1 ? static_cast<float>(y) / static_cast<float>(height - 1) : 0.0f;
         const ColorRGB sky_row_linear = lerp_color(sky_top_linear, sky_bottom_linear, sky_t);
+        const double screen_y = static_cast<double>(y) + 0.5 + jitter_y_d;
         for (size_t x = 0; x < width; ++x)
         {
             const size_t pixel = y * width + x;
@@ -2519,9 +2943,15 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
             {
                 ColorRGB accum = sample_colors[pixel];
                 const ColorRGB direct = sample_direct[pixel];
+                const ColorRGB indirect = sample_indirect[pixel];
+                const float gi_ao = std::min(1.0f, sample_ao[pixel] + kGiAoLift);
+                const ColorRGB indirect_scaled = scale_color(indirect, gi_ao);
                 accum.r += direct.r;
                 accum.g += direct.g;
                 accum.b += direct.b;
+                accum.r += indirect_scaled.r;
+                accum.g += indirect_scaled.g;
+                accum.b += indirect_scaled.b;
                 current_linear = accum;
             }
 
@@ -2536,12 +2966,18 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                     prev = history_read_ptr[pixel];
                     if (!is_sky)
                     {
-                        const double screen_x = static_cast<double>(x) + 0.5 + static_cast<double>(jitter_x);
-                        const double screen_y = static_cast<double>(y) + 0.5 + static_cast<double>(jitter_y);
-
-                        Vec3 world = unproject_fast(screen_x, screen_y, depth,
-                                                    inverseCurrentVP, static_cast<double>(width), static_cast<double>(height),
-                                                    proj_a, proj_b);
+                        const double screen_x = static_cast<double>(x) + 0.5 + jitter_x_d;
+                        Vec3 world;
+                        if (world_stamp[pixel] == frame_index)
+                        {
+                            world = world_positions[pixel];
+                        }
+                        else
+                        {
+                            world = unproject_fast(screen_x, screen_y, depth,
+                                                   inverseCurrentVP, width_d, height_d,
+                                                   proj_a, proj_b);
+                        }
 
                         Vec2 prev_screen = render_reproject_point(world, width, height);
 
@@ -2876,6 +3312,28 @@ bool render_get_taa_clamp_enabled()
     return taaClampEnabled.load(std::memory_order_relaxed);
 }
 
+void render_set_gi_enabled(const bool enabled)
+{
+    giEnabled.store(enabled, std::memory_order_relaxed);
+    mark_render_state_dirty();
+}
+
+bool render_get_gi_enabled()
+{
+    return giEnabled.load(std::memory_order_relaxed);
+}
+
+void render_set_gi_strength(const double strength)
+{
+    giStrength.store(std::max(0.0, strength), std::memory_order_relaxed);
+    mark_render_state_dirty();
+}
+
+double render_get_gi_strength()
+{
+    return giStrength.load(std::memory_order_relaxed);
+}
+
 void render_reset_taa_history()
 {
     mark_render_state_dirty();
@@ -2989,11 +3447,12 @@ bool render_debug_shadow_factor_with_frame(const Vec3 world, const Vec3 normal, 
     const Vec3 right_scaled = {right.x * scale, right.y * scale, right.z * scale};
     const Vec3 up_scaled    = {up.x * scale, up.y * scale, up.z * scale};
 
+    const BlueNoiseShift shift_u = blue_noise_shift(frame, kSunShadowSalt);
+    const BlueNoiseShift shift_v = blue_noise_shift(frame, kSunShadowSalt + 1);
     const Vec3 shadow_dir = jitter_shadow_direction(dir, 
                                                     right_scaled, up_scaled,
-                                                    pixel_x, pixel_y, 
-                                                    static_cast<uint32_t>(frame),
-                                                    kSunShadowSalt);
+                                                    pixel_x, pixel_y,
+                                                    shift_u, shift_v);
                                                     
     *out_factor = compute_shadow_factor(shadow_dir, world, normalize_vec(normal));
     return true;
