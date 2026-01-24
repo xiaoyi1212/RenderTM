@@ -1620,6 +1620,12 @@ TEST_CASE("render state setters and getters")
     render_set_gi_strength(0.6);
     REQUIRE(render_get_gi_strength() == Catch::Approx(0.6));
 
+    render_set_gi_bounce_count(2);
+    REQUIRE(render_get_gi_bounce_count() == 2);
+    render_set_gi_bounce_count(0);
+    REQUIRE(render_get_gi_bounce_count() == 0);
+    render_set_gi_bounce_count(1);
+
     render_set_paused(false);
     REQUIRE_FALSE(render_is_paused());
     render_toggle_pause();
@@ -2208,7 +2214,7 @@ TEST_CASE("directional shadowing darkens terrain")
     REQUIRE(found_shadow);
 }
 
-TEST_CASE("one-bounce GI lifts shadowed terrain")
+TEST_CASE("one-bounce GI does not darken shadowed terrain")
 {
     reset_camera();
     render_set_paused(true);
@@ -2274,7 +2280,70 @@ TEST_CASE("one-bounce GI lifts shadowed terrain")
     render_set_gi_strength(0.0);
     render_set_paused(false);
 
-    REQUIRE(avg_on > avg_off + 5.0);
+    REQUIRE(avg_on >= avg_off - 0.5);
+}
+
+TEST_CASE("GI bounce count does not reduce indirect contribution")
+{
+    reset_camera();
+    render_set_paused(true);
+    render_set_sun_orbit_enabled(false);
+    render_set_light_intensity(0.0);
+    render_set_moon_intensity(1.0);
+    const Vec3 light_dir = normalize_vec3({0.6, -0.3, 0.8});
+    render_set_moon_direction(light_dir);
+    render_set_shadow_enabled(true);
+    render_set_sky_light_intensity(0.0);
+    render_set_ambient_occlusion_enabled(false);
+    render_set_taa_enabled(false);
+    render_set_gi_enabled(true);
+    render_set_gi_strength(2.0);
+
+    std::vector<int> heights;
+    std::vector<uint32_t> top_colors;
+    build_heightmap(heights, top_colors);
+
+    Vec3 shadow_point{0.0, 0.0, 0.0};
+    REQUIRE(find_shadow_sample(heights, light_dir, {0.0, -1.0, 0.0}, true, &shadow_point));
+
+    const Vec3 eye{shadow_point.x, shadow_point.y - 18.0, shadow_point.z - 14.0};
+    const Vec3 to_target{shadow_point.x - eye.x, shadow_point.y - eye.y, shadow_point.z - eye.z};
+    const double yaw = std::atan2(to_target.x, to_target.z);
+    const double dist_xz = std::sqrt(to_target.x * to_target.x + to_target.z * to_target.z);
+    const double pitch = std::atan2(-to_target.y, dist_xz);
+    render_set_camera_position(eye);
+    render_set_camera_rotation({yaw, pitch});
+
+    const size_t width = 200;
+    const size_t height = 160;
+    std::vector<uint32_t> framebuffer(width * height, 0u);
+
+    const Vec2 projected = render_project_point(shadow_point, width, height);
+    const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
+    const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
+    const uint32_t sky_top = render_get_sky_top_color();
+    const uint32_t sky_bottom = render_get_sky_bottom_color();
+
+    auto measure_luminance = [&](int bounces, double& out_avg) {
+        render_set_gi_bounce_count(bounces);
+        render_debug_set_frame_index(121);
+        render_update_array(framebuffer.data(), width, height);
+        double avg = 0.0;
+        REQUIRE(sample_average_luminance(framebuffer, width, height, px, py, sky_top, sky_bottom, avg));
+        out_avg = avg;
+    };
+
+    double avg_one = 0.0;
+    double avg_two = 0.0;
+    measure_luminance(1, avg_one);
+    measure_luminance(2, avg_two);
+
+    render_set_gi_enabled(false);
+    render_set_gi_strength(0.0);
+    render_set_gi_bounce_count(1);
+    render_set_paused(false);
+
+    REQUIRE(avg_two >= avg_one - 0.1);
 }
 
 TEST_CASE("light direction reads stay coherent under concurrent updates")

@@ -50,6 +50,8 @@ void render_set_gi_enabled(bool enabled);
 bool render_get_gi_enabled();
 void render_set_gi_strength(double strength);
 double render_get_gi_strength();
+void render_set_gi_bounce_count(int count);
+int render_get_gi_bounce_count();
 void render_reset_taa_history();
 void render_set_ambient_occlusion_enabled(bool enabled);
 void render_set_shadow_enabled(bool enabled);
@@ -76,6 +78,8 @@ Mat4 render_debug_get_previous_vp();
 Mat4 render_debug_get_inverse_current_vp();
 double render_debug_get_taa_sharpen_strength();
 double render_debug_get_taa_sharpen_percent();
+void render_debug_set_frame_index(uint32_t frame_index);
+uint32_t render_debug_get_frame_index();
 bool render_debug_shadow_factor_with_frame(Vec3 world, Vec3 normal, Vec3 light_dir,
                                            int pixel_x, int pixel_y, int frame,
                                            float* out_factor);

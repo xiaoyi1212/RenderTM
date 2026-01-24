@@ -98,6 +98,7 @@ static std::atomic<bool> taaClampEnabled{true};
 static std::atomic<double> taaSharpenStrength{0.0};
 static std::atomic<bool> giEnabled{false};
 static std::atomic<double> giStrength{0.0};
+static std::atomic<int> giBounceCount{2};
 static std::atomic<uint64_t> renderStateVersion{1};
 static std::atomic<double> camera_x{16.0};
 static std::atomic<double> camera_y{-19.72};
@@ -1464,6 +1465,7 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                                  ColorRGB* sample_direct_sun, ColorRGB* sample_direct_moon,
                                  float* shadow_mask_sun, float* shadow_mask_moon,
                                  Vec3* sample_normals, ColorRGB* sample_albedo, float* sample_ao,
+                                 Vec3* world_positions, uint32_t* world_stamp, uint32_t frame_index,
                                  size_t width, size_t height,
                                  const ScreenVertex& v0, const ScreenVertex& v1, const ScreenVertex& v2,
                                  const Vec3& wp0, const Vec3& wp1, const Vec3& wp2,
@@ -1525,6 +1527,21 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
     float w1i_row = w1_row * inv_z1 * inv_area;
     float w2i_row = w2_row * inv_z2 * inv_area;
 
+    const bool ao_enabled = ctx.ambient_occlusion_enabled;
+    const bool direct_lighting_enabled = ctx.direct_lighting_enabled;
+    const bool shadows_enabled = ctx.shadows_enabled;
+    const double ambient = direct_lighting_enabled ? ctx.ambient_light * ctx.material.ambient : 0.0;
+    const bool use_sky = ctx.sky_scale > 0.0f;
+    const float sky_scale = ctx.sky_scale;
+    const ColorRGB albedo = ctx.albedo;
+    const ColorRGB hemi_ground = ctx.hemi_ground;
+    const ColorRGB sky_top = ctx.sky_top;
+    const Vec3 camera_pos = ctx.camera_pos;
+    const double f0 = std::clamp(ctx.material.specular, 0.0, 1.0);
+    const bool has_specular = f0 > 0.0;
+    const double diffuse_coeff = ctx.material.diffuse;
+    const double shininess = ctx.material.shininess;
+
     for (int y = y0; y <= y1; ++y)
     {
         float w0 = w0_row;
@@ -1550,7 +1567,7 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                         const float w0p = w0i / inv_z;
                         const float w1p = w1i / inv_z;
                         const float w2p = w2i / inv_z;
-                        const float visibility = ctx.ambient_occlusion_enabled
+                        const float visibility = ao_enabled
                                                      ? std::clamp(w0p * vis0 + w1p * vis1 + w2p * vis2, 0.0f, 1.0f)
                                                      : 1.0f;
                         Vec3 normal{
@@ -1565,21 +1582,25 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                             w0p * wp0.y + w1p * wp1.y + w2p * wp2.y,
                             w0p * wp0.z + w1p * wp1.z + w2p * wp2.z
                         };
+                        if (world_positions && world_stamp)
+                        {
+                            world_positions[idx] = world;
+                            world_stamp[idx] = frame_index;
+                        }
 
-                        const double ambient = ctx.direct_lighting_enabled ? ctx.ambient_light * ctx.material.ambient : 0.0;
                         ColorRGB ambient_color{
-                            static_cast<float>(ctx.albedo.r * ambient),
-                            static_cast<float>(ctx.albedo.g * ambient),
-                            static_cast<float>(ctx.albedo.b * ambient)
+                            static_cast<float>(albedo.r * ambient),
+                            static_cast<float>(albedo.g * ambient),
+                            static_cast<float>(albedo.b * ambient)
                         };
-                        if (ctx.sky_scale > 0.0f)
+                        if (use_sky)
                         {
                             float sky_t = static_cast<float>((-normal.y) * 0.5 + 0.5);
                             sky_t = std::clamp(sky_t, 0.0f, 1.0f);
-                            const ColorRGB sky = lerp_color(ctx.hemi_ground, ctx.sky_top, sky_t);
-                            ambient_color.r = sky.r * ctx.sky_scale * ctx.albedo.r;
-                            ambient_color.g = sky.g * ctx.sky_scale * ctx.albedo.g;
-                            ambient_color.b = sky.b * ctx.sky_scale * ctx.albedo.b;
+                            const ColorRGB sky = lerp_color(hemi_ground, sky_top, sky_t);
+                            ambient_color.r = sky.r * sky_scale * albedo.r;
+                            ambient_color.g = sky.g * sky_scale * albedo.g;
+                            ambient_color.b = sky.b * sky_scale * albedo.b;
                         }
                         ambient_color.r *= visibility;
                         ambient_color.g *= visibility;
@@ -1589,12 +1610,12 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                         ColorRGB direct_moon{0.0f, 0.0f, 0.0f};
                         float shadow_sun = 1.0f;
                         float shadow_moon = 1.0f;
-                        if (ctx.direct_lighting_enabled)
+                        if (direct_lighting_enabled)
                         {
                             const Vec3 view_vec{
-                                ctx.camera_pos.x - world.x,
-                                ctx.camera_pos.y - world.y,
-                                ctx.camera_pos.z - world.z
+                                camera_pos.x - world.x,
+                                camera_pos.y - world.y,
+                                camera_pos.z - world.z
                             };
                             const Vec3 view_dir = normalize_vec(view_vec);
 
@@ -1612,7 +1633,7 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                                 {
                                     return;
                                 }
-                                if (ctx.shadows_enabled)
+                                if (shadows_enabled)
                                 {
                                     const Vec3 shadow_dir = jitter_shadow_direction(light.dir,
                                                             lights_right_scaled[light_idx],
@@ -1624,24 +1645,23 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                                 }
 
                                 const Vec3 half_vec = normalize_vec(add_vec(light.dir, view_dir));
-                                const double f0 = std::clamp(ctx.material.specular, 0.0, 1.0);
                                 const double vdoth = std::max(0.0, dot_vec(view_dir, half_vec));
                                 const double fresnel = schlick_fresnel(vdoth, f0);
                                 const double diffuse_scale = std::clamp(1.0 - fresnel, 0.0, 1.0);
-                                const double diffuse = ndotl * light.intensity * ctx.material.diffuse * diffuse_scale;
+                                const double diffuse = ndotl * light.intensity * diffuse_coeff * diffuse_scale;
                                 ColorRGB light_color{
-                                    static_cast<float>(ctx.albedo.r * diffuse),
-                                    static_cast<float>(ctx.albedo.g * diffuse),
-                                    static_cast<float>(ctx.albedo.b * diffuse)
+                                    static_cast<float>(albedo.r * diffuse),
+                                    static_cast<float>(albedo.g * diffuse),
+                                    static_cast<float>(albedo.b * diffuse)
                                 };
                                 light_color.r *= light.color.r;
                                 light_color.g *= light.color.g;
                                 light_color.b *= light.color.b;
-                                if (f0 > 0.0)
+                                if (has_specular)
                                 {
                                     const double spec_dot = std::max(0.0, dot_vec(normal, half_vec));
                                     double spec = eval_specular_term(spec_dot, vdoth, ndotl,
-                                                                     ctx.material.shininess, f0);
+                                                                     shininess, f0);
                                     spec *= light.intensity;
                                     spec = std::clamp(spec, 0.0, 1.0);
                                     light_color.r += light.color.r * static_cast<float>(spec);
@@ -1732,6 +1752,7 @@ static Vec3 jitter_shadow_direction(const Vec3& light_dir,
 
 struct GiHit
 {
+    Vec3 position;
     Vec3 normal;
     ColorRGB albedo;
     float sky_visibility;
@@ -1857,6 +1878,12 @@ static bool gi_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec3& d
                     visibility = sum * 0.25f;
                 }
 
+                const double hit_dist = traveled * block_size;
+                out_hit->position = {
+                    origin_world.x + dir.x * hit_dist,
+                    origin_world.y + dir.y * hit_dist,
+                    origin_world.z + dir.z * hit_dist
+                };
                 out_hit->normal = hit_normal;
                 out_hit->albedo = block->albedo_linear;
                 out_hit->sky_visibility = std::clamp(visibility, 0.0f, 1.0f);
@@ -2203,7 +2230,9 @@ static void filter_shadow_masks(const float* mask_a, const float* mask_b,
 static void render_quad(float* zbuffer, ColorRGB* sample_ambient,
                         ColorRGB* sample_direct_sun, ColorRGB* sample_direct_moon,
                         float* shadow_mask_sun, float* shadow_mask_moon, Vec3* sample_normals,
-                        ColorRGB* sample_albedo, float* sample_ao, size_t width, size_t height,
+                        ColorRGB* sample_albedo, float* sample_ao,
+                        Vec3* world_positions, uint32_t* world_stamp, uint32_t frame_index,
+                        size_t width, size_t height,
                         const RenderQuad& quad, const double fov_x, const double fov_y,
                         const Vec3& camera_pos, const ViewRotation& view_rot, const ShadingContext& ctx,
                         const float jitter_x, const float jitter_y,
@@ -2272,6 +2301,7 @@ static void render_quad(float* zbuffer, ColorRGB* sample_ambient,
         draw_shaded_triangle(zbuffer, sample_ambient,
                              sample_direct_sun, sample_direct_moon,
                              shadow_mask_sun, shadow_mask_moon, sample_normals, sample_albedo, sample_ao,
+                             world_positions, world_stamp, frame_index,
                              width, height,
                              sv0, sv1, sv2,
                              a.world, b.world, c.world,
@@ -2359,6 +2389,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     static std::vector<uint32_t> world_stamp;
     static std::vector<ColorRGB> taa_history[2]; 
     static std::vector<ColorRGB> taa_resolved;
+    static std::vector<ColorRGB> current_linear_buffer;
     static std::vector<uint8_t> taa_history_mask;
     static int taa_ping_pong = 0;
     static size_t taa_width = 0;
@@ -2405,23 +2436,12 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         world_positions.assign(sample_count, {0.0, 0.0, 0.0});
         world_stamp.assign(sample_count, 0);
         taa_resolved.assign(sample_count, {0.0f, 0.0f, 0.0f});
+        current_linear_buffer.assign(sample_count, {0.0f, 0.0f, 0.0f});
         taa_history_mask.assign(sample_count, 0);
     }
     else
     {
         std::fill(zbuffer.begin(), zbuffer.end(), depth_max);
-        std::fill(sample_colors.begin(), sample_colors.end(), ColorRGB{0.0f, 0.0f, 0.0f});
-        std::fill(sample_direct.begin(), sample_direct.end(), ColorRGB{0.0f, 0.0f, 0.0f});
-        std::fill(sample_direct_sun.begin(), sample_direct_sun.end(), ColorRGB{0.0f, 0.0f, 0.0f});
-        std::fill(sample_direct_moon.begin(), sample_direct_moon.end(), ColorRGB{0.0f, 0.0f, 0.0f});
-        std::fill(shadow_mask_sun.begin(), shadow_mask_sun.end(), 1.0f);
-        std::fill(shadow_mask_moon.begin(), shadow_mask_moon.end(), 1.0f);
-        std::fill(shadow_mask_filtered_sun.begin(), shadow_mask_filtered_sun.end(), 1.0f);
-        std::fill(shadow_mask_filtered_moon.begin(), shadow_mask_filtered_moon.end(), 1.0f);
-        std::fill(sample_normals.begin(), sample_normals.end(), Vec3{0.0, 0.0, 0.0});
-        std::fill(sample_albedo.begin(), sample_albedo.end(), ColorRGB{0.0f, 0.0f, 0.0f});
-        std::fill(sample_indirect.begin(), sample_indirect.end(), ColorRGB{0.0f, 0.0f, 0.0f});
-        std::fill(sample_ao.begin(), sample_ao.end(), 1.0f);
     }
 
     if (taa_on)
@@ -2694,6 +2714,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                     sample_direct_sun.data(), sample_direct_moon.data(),
                     shadow_mask_sun.data(), shadow_mask_moon.data(),
                     sample_normals.data(), sample_albedo.data(), sample_ao.data(),
+                    world_positions.data(), world_stamp.data(), frame_index,
                     width, height, quad, fov_x, fov_y,
                     camera_pos_snapshot, view_rot, ctx, jitter_x, jitter_y,
                     lights_right_scaled, lights_up_scaled,
@@ -2730,17 +2751,23 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         }
     }
 
-    if (gi_on && gi_scale > 0.0f)
+    const int raw_bounce_count = giBounceCount.load(std::memory_order_relaxed);
+    const int gi_bounce_count = raw_bounce_count > 0 ? raw_bounce_count : 0;
+    const bool gi_active = gi_on && gi_scale > 0.0f && gi_bounce_count > 0;
+    if (gi_active)
     {
-        std::array<BlueNoiseShift, kGiSampleCount * 4> gi_shifts{};
-        for (int sample_idx = 0; sample_idx < kGiSampleCount; ++sample_idx)
+        const size_t gi_shift_count = static_cast<size_t>(gi_bounce_count) * kGiSampleCount * 2;
+        std::vector<BlueNoiseShift> gi_shifts(gi_shift_count);
+        for (int bounce = 0; bounce < gi_bounce_count; ++bounce)
         {
-            const int base_salt = kGiNoiseSalt + sample_idx * 4;
-            const size_t base_idx = static_cast<size_t>(sample_idx) * 4;
-            gi_shifts[base_idx + 0] = blue_noise_shift(static_cast<int>(frame_index), base_salt);
-            gi_shifts[base_idx + 1] = blue_noise_shift(static_cast<int>(frame_index), base_salt + 1);
-            gi_shifts[base_idx + 2] = blue_noise_shift(static_cast<int>(frame_index), base_salt + 2);
-            gi_shifts[base_idx + 3] = blue_noise_shift(static_cast<int>(frame_index), base_salt + 3);
+            for (int sample_idx = 0; sample_idx < kGiSampleCount; ++sample_idx)
+            {
+                const int salt_index = bounce * kGiSampleCount + sample_idx;
+                const int base_salt = kGiNoiseSalt + salt_index * 2;
+                const size_t base_idx = static_cast<size_t>(salt_index) * 2;
+                gi_shifts[base_idx + 0] = blue_noise_shift(static_cast<int>(frame_index), base_salt);
+                gi_shifts[base_idx + 1] = blue_noise_shift(static_cast<int>(frame_index), base_salt + 1);
+            }
         }
         for (size_t y = 0; y < height; ++y)
         {
@@ -2752,6 +2779,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                 {
                     continue;
                 }
+                sample_indirect[idx] = {0.0f, 0.0f, 0.0f};
                 Vec3 normal = sample_normals[idx];
                 const double normal_len_sq = normal.x * normal.x + normal.y * normal.y + normal.z * normal.z;
                 if (normal_len_sq <= 1e-6)
@@ -2767,13 +2795,11 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                 world_positions[idx] = world;
                 world_stamp[idx] = frame_index;
 
-                auto trace_gi = [&](const Vec3& hemi_normal,
-                                    const BlueNoiseShift& shift_u,
-                                    const BlueNoiseShift& shift_v,
-                                    ColorRGB& out) -> bool {
-                    out = {0.0f, 0.0f, 0.0f};
-                    const Vec3& hn = hemi_normal;
-
+                auto sample_gi_dir = [&](const Vec3& hemi_normal,
+                                         const BlueNoiseShift& shift_u,
+                                         const BlueNoiseShift& shift_v,
+                                         Vec3& out_dir,
+                                         double& out_cos_theta) -> bool {
                     const float u1 = sample_noise_shifted(static_cast<int>(x), static_cast<int>(y), shift_u);
                     const float u2 = sample_noise_shifted(static_cast<int>(x), static_cast<int>(y), shift_v);
                     const double r = std::sqrt(static_cast<double>(u1));
@@ -2781,31 +2807,22 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                     double sin_theta_angle = 0.0;
                     double cos_theta_angle = 0.0;
                     sincos_double(theta, &sin_theta_angle, &cos_theta_angle);
-                    const double x = r * cos_theta_angle;
-                    const double y = r * sin_theta_angle;
-                    const double z = std::sqrt(std::max(0.0, 1.0 - r * r));
-                    const Vec3 local{x, y, z};
+                    const double local_x = r * cos_theta_angle;
+                    const double local_y = r * sin_theta_angle;
+                    const double local_z = std::sqrt(std::max(0.0, 1.0 - r * r));
 
                     Vec3 tangent, bitangent, forward;
-                    build_light_basis(hn, tangent, bitangent, forward);
-                    Vec3 dir{
-                        tangent.x * local.x + bitangent.x * local.y + forward.x * local.z,
-                        tangent.y * local.x + bitangent.y * local.y + forward.y * local.z,
-                        tangent.z * local.x + bitangent.z * local.y + forward.z * local.z
+                    build_light_basis(hemi_normal, tangent, bitangent, forward);
+                    out_dir = {
+                        tangent.x * local_x + bitangent.x * local_y + forward.x * local_z,
+                        tangent.y * local_x + bitangent.y * local_y + forward.y * local_z,
+                        tangent.z * local_x + bitangent.z * local_y + forward.z * local_z
                     };
+                    out_cos_theta = local_z;
+                    return out_cos_theta > 0.0;
+                };
 
-                    GiHit hit{};
-                    if (!gi_raymarch_hit(world, normal, dir, kGiMaxDistance, &hit))
-                    {
-                        return false;
-                    }
-
-                    const double cos_theta = local.z;
-                    if (cos_theta <= 0.0)
-                    {
-                        return false;
-                    }
-
+                auto eval_gi_incoming = [&](const GiHit& hit) -> ColorRGB {
                     ColorRGB incoming{0.0f, 0.0f, 0.0f};
                     for (const auto& light : lights)
                     {
@@ -2835,35 +2852,74 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                         incoming.b += sky.b * sky_scale * vis;
                     }
 
-                    if (incoming.r <= 0.0f && incoming.g <= 0.0f && incoming.b <= 0.0f)
+                    return incoming;
+                };
+
+                auto trace_gi_bounce = [&](const Vec3& world_origin,
+                                           const Vec3& surface_normal,
+                                           const Vec3& hemi_normal,
+                                           const BlueNoiseShift& shift_u,
+                                           const BlueNoiseShift& shift_v,
+                                           GiHit& out_hit,
+                                           double& out_cos_theta) -> bool {
+                    Vec3 dir;
+                    if (!sample_gi_dir(hemi_normal, shift_u, shift_v, dir, out_cos_theta))
                     {
                         return false;
                     }
-
-                    ColorRGB bounced = mul_color(incoming, hit.albedo);
-                    bounced = mul_color(bounced, origin_albedo);
-                    out = scale_color(bounced, static_cast<float>(cos_theta));
-                    return out.r > 0.0f || out.g > 0.0f || out.b > 0.0f;
+                    return gi_raymarch_hit(world_origin, surface_normal, dir, kGiMaxDistance, &out_hit);
                 };
 
                 ColorRGB gi_sum{0.0f, 0.0f, 0.0f};
                 for (int sample_idx = 0; sample_idx < kGiSampleCount; ++sample_idx)
                 {
-                    const size_t base_idx = static_cast<size_t>(sample_idx) * 4;
                     ColorRGB gi_sample{0.0f, 0.0f, 0.0f};
-                    bool hit = trace_gi(normal,
-                                        gi_shifts[base_idx + 0],
-                                        gi_shifts[base_idx + 1],
-                                        gi_sample);
-                    if (!hit)
+                    Vec3 current_world = world;
+                    Vec3 current_normal = normal;
+                    ColorRGB throughput = origin_albedo;
+                    bool hit_any = false;
+
+                    for (int bounce = 0; bounce < gi_bounce_count; ++bounce)
                     {
-                        const Vec3 opposite{-normal.x, -normal.y, -normal.z};
-                        hit = trace_gi(opposite,
-                                       gi_shifts[base_idx + 2],
-                                       gi_shifts[base_idx + 3],
-                                       gi_sample);
+                        const int salt_index = bounce * kGiSampleCount + sample_idx;
+                        const size_t base_idx = static_cast<size_t>(salt_index) * 2;
+                        GiHit hit{};
+                        double cos_theta = 0.0;
+                        bool hit_found = trace_gi_bounce(current_world,
+                                                         current_normal,
+                                                         current_normal,
+                                                         gi_shifts[base_idx + 0],
+                                                         gi_shifts[base_idx + 1],
+                                                         hit,
+                                                         cos_theta);
+                        if (!hit_found)
+                        {
+                            break;
+                        }
+
+                        const ColorRGB incoming = eval_gi_incoming(hit);
+                        if (incoming.r > 0.0f || incoming.g > 0.0f || incoming.b > 0.0f)
+                        {
+                            ColorRGB bounced = mul_color(incoming, hit.albedo);
+                            bounced = mul_color(bounced, throughput);
+                            bounced = scale_color(bounced, static_cast<float>(cos_theta));
+                            gi_sample = add_color(gi_sample, bounced);
+                            hit_any = true;
+                        }
+
+                        ColorRGB next_throughput = mul_color(throughput, hit.albedo);
+                        next_throughput = scale_color(next_throughput, static_cast<float>(cos_theta));
+                        if (next_throughput.r <= 0.0f && next_throughput.g <= 0.0f && next_throughput.b <= 0.0f)
+                        {
+                            break;
+                        }
+
+                        throughput = next_throughput;
+                        current_world = hit.position;
+                        current_normal = hit.normal;
                     }
-                    if (hit)
+
+                    if (hit_any)
                     {
                         gi_sum.r += gi_sample.r;
                         gi_sum.g += gi_sample.g;
@@ -2905,55 +2961,52 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     const ColorRGB* history_read_ptr = taa_history[read_idx].data();
     ColorRGB* history_write_ptr = taa_history[write_idx].data();
 
-    auto current_linear_at = [&](int ix, int iy) -> ColorRGB {
-        ix = std::clamp(ix, 0, static_cast<int>(width) - 1);
-        iy = std::clamp(iy, 0, static_cast<int>(height) - 1);
-        const size_t idx = static_cast<size_t>(iy) * width + static_cast<size_t>(ix);
-        if (zbuffer[idx] >= depth_max)
-        {
-            const float t = height > 1 ? static_cast<float>(iy) / static_cast<float>(height - 1) : 0.0f;
-            return lerp_color(sky_top_linear, sky_bottom_linear, t);
-        }
-        ColorRGB accum = sample_colors[idx];
-        const ColorRGB direct = sample_direct[idx];
-        const ColorRGB indirect = sample_indirect[idx];
-        const float gi_ao = std::min(1.0f, sample_ao[idx] + kGiAoLift);
-        const ColorRGB indirect_scaled = scale_color(indirect, gi_ao);
-        accum.r += direct.r;
-        accum.g += direct.g;
-        accum.b += direct.b;
-        accum.r += indirect_scaled.r;
-        accum.g += indirect_scaled.g;
-        accum.b += indirect_scaled.b;
-        return accum;
-    };
-
     for (size_t y = 0; y < height; ++y)
     {
         const float sky_t = height > 1 ? static_cast<float>(y) / static_cast<float>(height - 1) : 0.0f;
         const ColorRGB sky_row_linear = lerp_color(sky_top_linear, sky_bottom_linear, sky_t);
+        for (size_t x = 0; x < width; ++x)
+        {
+            const size_t idx = y * width + x;
+            if (zbuffer[idx] >= depth_max)
+            {
+                current_linear_buffer[idx] = sky_row_linear;
+                continue;
+            }
+            ColorRGB accum = sample_colors[idx];
+            const ColorRGB direct = sample_direct[idx];
+            accum.r += direct.r;
+            accum.g += direct.g;
+            accum.b += direct.b;
+            if (gi_active)
+            {
+                const ColorRGB indirect = sample_indirect[idx];
+                const float gi_ao = std::min(1.0f, sample_ao[idx] + kGiAoLift);
+                const ColorRGB indirect_scaled = scale_color(indirect, gi_ao);
+                accum.r += indirect_scaled.r;
+                accum.g += indirect_scaled.g;
+                accum.b += indirect_scaled.b;
+            }
+            current_linear_buffer[idx] = accum;
+        }
+    }
+
+    auto current_linear_at = [&](int ix, int iy) -> ColorRGB {
+        ix = std::clamp(ix, 0, static_cast<int>(width) - 1);
+        iy = std::clamp(iy, 0, static_cast<int>(height) - 1);
+        const size_t idx = static_cast<size_t>(iy) * width + static_cast<size_t>(ix);
+        return current_linear_buffer[idx];
+    };
+
+    for (size_t y = 0; y < height; ++y)
+    {
         const double screen_y = static_cast<double>(y) + 0.5 + jitter_y_d;
         for (size_t x = 0; x < width; ++x)
         {
             const size_t pixel = y * width + x;
             const float depth = zbuffer[pixel];
             const bool is_sky = depth >= depth_max;
-            ColorRGB current_linear = sky_row_linear;
-            if (!is_sky)
-            {
-                ColorRGB accum = sample_colors[pixel];
-                const ColorRGB direct = sample_direct[pixel];
-                const ColorRGB indirect = sample_indirect[pixel];
-                const float gi_ao = std::min(1.0f, sample_ao[pixel] + kGiAoLift);
-                const ColorRGB indirect_scaled = scale_color(indirect, gi_ao);
-                accum.r += direct.r;
-                accum.g += direct.g;
-                accum.b += direct.b;
-                accum.r += indirect_scaled.r;
-                accum.g += indirect_scaled.g;
-                accum.b += indirect_scaled.b;
-                current_linear = accum;
-            }
+            const ColorRGB current_linear = current_linear_buffer[pixel];
 
             ColorRGB blended = current_linear;
             bool history_used = false;
@@ -3130,6 +3183,16 @@ Vec3 render_debug_sample_history_bilinear(const Vec3* buffer, const size_t width
                                           const Vec2 screen_coord)
 {
     return sample_bilinear_history_vec3(buffer, width, height, screen_coord.x, screen_coord.y);
+}
+
+void render_debug_set_frame_index(const uint32_t frame_index)
+{
+    renderFrameIndex.store(frame_index, std::memory_order_relaxed);
+}
+
+uint32_t render_debug_get_frame_index()
+{
+    return renderFrameIndex.load(std::memory_order_relaxed);
 }
 
 Mat4 render_debug_get_current_vp()
@@ -3332,6 +3395,17 @@ void render_set_gi_strength(const double strength)
 double render_get_gi_strength()
 {
     return giStrength.load(std::memory_order_relaxed);
+}
+
+void render_set_gi_bounce_count(const int count)
+{
+    giBounceCount.store(count, std::memory_order_relaxed);
+    mark_render_state_dirty();
+}
+
+int render_get_gi_bounce_count()
+{
+    return giBounceCount.load(std::memory_order_relaxed);
 }
 
 void render_reset_taa_history()
