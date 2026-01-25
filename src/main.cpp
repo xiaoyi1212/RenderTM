@@ -10,19 +10,21 @@ namespace {
 
 struct SignalState
 {
-    static void install()
+    static auto install() -> void
     {
         std::signal(SIGINT, &SignalState::handle);
         std::signal(SIGTERM, &SignalState::handle);
         std::signal(SIGWINCH, &SignalState::handle);
     }
 
-    static bool shutdown()
+    [[nodiscard]]
+    static auto shutdown() -> bool
     {
         return shutdown_req != 0;
     }
 
-    static bool take_resize()
+    [[nodiscard]]
+    static auto take_resize() -> bool
     {
         if (resize_req == 0)
         {
@@ -33,7 +35,7 @@ struct SignalState
     }
 
 private:
-    static void handle(int sig)
+    static auto handle(int sig) -> void
     {
         if (sig == SIGWINCH)
         {
@@ -60,9 +62,10 @@ struct TerminalSession
     }
 
     TerminalSession(const TerminalSession&) = delete;
-    TerminalSession& operator=(const TerminalSession&) = delete;
+    auto operator=(const TerminalSession&) -> TerminalSession& = delete;
 
-    std::optional<unsigned char> read_char() const
+    [[nodiscard]]
+    auto read_char() const -> std::optional<unsigned char>
     {
         return keyboard.read_char();
     }
@@ -89,7 +92,7 @@ struct RenderThreads
     }
 
     RenderThreads(const RenderThreads&) = delete;
-    RenderThreads& operator=(const RenderThreads&) = delete;
+    auto operator=(const RenderThreads&) -> RenderThreads& = delete;
 
 private:
     std::jthread output_thread;
@@ -104,8 +107,18 @@ struct MousePos
 
 struct App
 {
-    int run()
+    auto run() -> int
     {
+        auto read_keyboard = [&]() -> void
+        {
+            auto ch = session.read_char();
+            while (ch.has_value())
+            {
+                input_buffer.push_back(static_cast<char>(*ch));
+                ch = session.read_char();
+            }
+        };
+
         bool running = true;
         while (running)
         {
@@ -134,15 +147,8 @@ private:
     static constexpr double kMouseMaxSpeed = 1.2;
     static constexpr int kMouseDeadzone = 8;
 
-    void read_keyboard()
-    {
-        for (auto ch = session.read_char(); ch.has_value(); ch = session.read_char())
-        {
-            input_buffer.push_back(static_cast<char>(*ch));
-        }
-    }
-
-    bool process_input()
+    [[nodiscard]]
+    auto process_input() -> bool
     {
         size_t offset = 0;
         while (offset < input_buffer.size())
@@ -184,38 +190,32 @@ private:
         return true;
     }
 
-    bool handle_action(InputAction action)
+    [[nodiscard]]
+    auto handle_action(InputAction action) -> bool
     {
+        auto perform_movement = [&](const MoveIntent& move)
+        {
+            if (move.space == MoveSpace::Local)
+                render_move_camera_local(move.delta);
+            else if (move.space == MoveSpace::World)
+                render_move_camera(move.delta);
+        };
+
         switch (action)
         {
-            case InputAction::None:
-                return true;
-            case InputAction::Quit:
-                return false;
-            case InputAction::TogglePause:
-                render_toggle_pause();
-                return true;
-            case InputAction::ToggleGI:
-                toggle_gi();
-                return true;
-            default:
-                break;
+            case InputAction::Quit: return false;
+            case InputAction::None: return true;
+            case InputAction::TogglePause: render_toggle_pause(); return true;
+            case InputAction::ToggleGI: toggle_gi(); return true;
+            default: break;
         }
 
         const Vec2 rot = render_get_camera_rotation();
-        const MoveIntent move = MoveIntent::from_action(action, kMoveStep, rot.x);
-        if (move.space == MoveSpace::Local)
-        {
-            render_move_camera_local(move.delta);
-        }
-        else if (move.space == MoveSpace::World)
-        {
-            render_move_camera(move.delta);
-        }
+        perform_movement(MoveIntent::from_action(action, kMoveStep, rot.x));
         return true;
     }
 
-    double sample_dt()
+    auto sample_dt() -> double
     {
         const auto now = std::chrono::steady_clock::now();
         double dt = std::chrono::duration<double>(now - last_look_time).count();
@@ -223,20 +223,22 @@ private:
         return std::clamp(dt, 0.0, 0.1);
     }
 
-    void update_mouse_look(double dt)
+    auto update_mouse_look(double dt) -> void
     {
         if (!mouse_pos) return;
 
         const TerminalSize term_size = TerminalRender::size();
-        const size_t term_width = term_size.width;
-        const size_t term_height = term_size.height;
-        if (term_width == 0 || term_height <= 1) return;
+        if (term_size.width == 0 || term_size.height <= 1) return;
 
-        const size_t view_height = term_height - 1;
-        const int max_x = static_cast<int>(term_width);
-        const int max_y = static_cast<int>(view_height);
-        const int mouse_x = std::clamp(mouse_pos->x, 1, max_x);
-        const int mouse_y = std::clamp(mouse_pos->y - 1, 1, max_y);
+        auto clamp_pos = [](int val, int min_v, int max_v) -> int {
+            return std::clamp(val, min_v, max_v);
+        };
+
+        const int max_x = static_cast<int>(term_size.width);
+        const int max_y = static_cast<int>(term_size.height - 1);
+        
+        const int mouse_x = clamp_pos(mouse_pos->x, 1, max_x);
+        const int mouse_y = clamp_pos(mouse_pos->y - 1, 1, max_y);
 
         const MouseLookDelta velocity = InputParser::mouse_look_velocity(
             mouse_x, mouse_y,
@@ -252,7 +254,7 @@ private:
         }
     }
 
-    void toggle_gi() const
+    auto toggle_gi() const -> void
     {
         const bool enabled = render_get_gi_enabled();
         render_set_gi_enabled(!enabled);
@@ -271,10 +273,9 @@ private:
 
 } // namespace
 
-int main()
+auto main() -> int
 {
     SignalState::install();
-
     App app;
     return app.run();
 }

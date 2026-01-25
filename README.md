@@ -4,7 +4,7 @@ A stupid Minecraft-like game (just a render currently) running in terminal.
 
 ## Prepare
 
-Install CMake v4.0+ and your prefer C++ compiler.
+Install CMake v4.0+, Ninja, and your favorite C++ compiler.
 
 ## Compile & Run
 

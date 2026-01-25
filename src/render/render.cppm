@@ -1,25 +1,12 @@
 module;
 
-#include "prelude.hpp"
+#include "../prelude.hpp"
 
 export module render;
 
-import noise;
-
-export struct Vec3
-{
-    double x, y, z;
-};
-
-export struct Vec2
-{
-    double x, y;
-};
-
-export struct Mat4
-{
-    double m[4][4];
-};
+export import :math;
+export import :noise;
+export import :terrain;
 
 export void render_update_array(uint32_t* framebuffer, size_t width, size_t height);
 export void render_set_paused(bool paused);
@@ -94,67 +81,6 @@ export bool render_should_rasterize_triangle(Vec3 v0, Vec3 v1, Vec3 v2);
 export double render_get_near_plane();
 export size_t render_clip_triangle_to_near_plane(Vec3 v0, Vec3 v1, Vec3 v2, Vec3* out_vertices, size_t max_vertices);
 
-const Vec3 cubeVertices[8] = {
-    {-1, -1, -1}, {1, -1, -1}, {1,  1, -1}, {-1,  1, -1},
-    {-1, -1,  1}, {1, -1,  1}, {1,  1,  1}, {-1,  1,  1}
-};
-
-enum FaceIndex
-{
-    FaceTop = 0,    // normal -Y
-    FaceBottom = 1, // normal +Y
-    FaceLeft = 2,   // normal -X
-    FaceRight = 3,  // normal +X
-    FaceBack = 4,   // normal -Z
-    FaceFront = 5   // normal +Z
-};
-
-const int cubeFaceVertices[6][4] = {
-    {0, 1, 5, 4}, // top (-y)
-    {3, 2, 6, 7}, // bottom (+y)
-    {0, 3, 7, 4}, // left (-x)
-    {1, 2, 6, 5}, // right (+x)
-    {0, 1, 2, 3}, // back (-z)
-    {4, 5, 6, 7}  // front (+z)
-};
-
-const int cubeFaceQuadOrder[6][4] = {
-    {0, 1, 5, 4}, // top (-y)
-    {3, 7, 6, 2}, // bottom (+y)
-    {0, 4, 7, 3}, // left (-x)
-    {1, 2, 6, 5}, // right (+x)
-    {0, 3, 2, 1}, // back (-z)
-    {4, 5, 6, 7}  // front (+z)
-};
-
-const int cubeFaceNormal[6][3] = {
-    {0, 1, 0},   // top (-y world, +y grid)
-    {0, -1, 0},  // bottom (+y world, -y grid)
-    {-1, 0, 0},  // left (-x)
-    {1, 0, 0},   // right (+x)
-    {0, 0, -1},  // back (-z)
-    {0, 0, 1}    // front (+z)
-};
-
-const Vec3 cubeVerticesGrid[8] = {
-    {0.0, 1.0, 0.0},
-    {1.0, 1.0, 0.0},
-    {1.0, 0.0, 0.0},
-    {0.0, 0.0, 0.0},
-    {0.0, 1.0, 1.0},
-    {1.0, 1.0, 1.0},
-    {1.0, 0.0, 1.0},
-    {0.0, 0.0, 1.0}
-};
-
-static Vec3 face_normal_world(const int face)
-{
-    const double x = static_cast<double>(cubeFaceNormal[face][0]);
-    const double y = static_cast<double>(-cubeFaceNormal[face][1]);
-    const double z = static_cast<double>(cubeFaceNormal[face][2]);
-    return {x, y, z};
-}
-
 static std::atomic<bool> rotationPaused{false};
 static std::atomic<uint32_t> renderFrameIndex{0};
 static std::atomic<double> lightDirectionX{0.0};
@@ -190,18 +116,25 @@ static std::atomic<double> camera_yaw{-0.6911503837897546};
 static std::atomic<double> camera_pitch{-0.6003932626860493};
 static std::atomic<bool> ambientOcclusionEnabled{true};
 static std::atomic<bool> shadowEnabled{true};
-static Mat4 currentVP{{{1.0, 0.0, 0.0, 0.0},
-                       {0.0, 1.0, 0.0, 0.0},
-                       {0.0, 0.0, 1.0, 0.0},
-                       {0.0, 0.0, 0.0, 1.0}}};
-static Mat4 previousVP{{{1.0, 0.0, 0.0, 0.0},
-                        {0.0, 1.0, 0.0, 0.0},
-                        {0.0, 0.0, 1.0, 0.0},
-                        {0.0, 0.0, 0.0, 1.0}}};
-static Mat4 inverseCurrentVP{{{1.0, 0.0, 0.0, 0.0},
-                              {0.0, 1.0, 0.0, 0.0},
-                              {0.0, 0.0, 1.0, 0.0},
-                              {0.0, 0.0, 0.0, 1.0}}};
+static Mat4 currentVP{{{
+    {1.0, 0.0, 0.0, 0.0},
+    {0.0, 1.0, 0.0, 0.0},
+    {0.0, 0.0, 1.0, 0.0},
+    {0.0, 0.0, 0.0, 1.0}
+}}};
+static Mat4 previousVP{{{
+    {1.0, 0.0, 0.0, 0.0},
+    {0.0, 1.0, 0.0, 0.0},
+    {0.0, 0.0, 1.0, 0.0},
+    {0.0, 0.0, 0.0, 1.0}
+}}};
+static Mat4 inverseCurrentVP{{{
+    {1.0, 0.0, 0.0, 0.0},
+    {0.0, 1.0, 0.0, 0.0},
+    {0.0, 0.0, 1.0, 0.0},
+    {0.0, 0.0, 0.0, 1.0}
+}}};
+static Terrain terrain{};
 
 
 static void mark_render_state_dirty()
@@ -295,27 +228,12 @@ struct Material
     double shininess;
 };
 
-struct ColorRGB
-{
-    float r;
-    float g;
-    float b;
-};
-
-static ColorRGB unpack_color(uint32_t color);
-static ColorRGB srgb_to_linear(const ColorRGB& color);
-
-struct TopFaceLighting
-{
-    std::array<Vec3, 4> normals;
-};
-
 struct ShadingContext
 {
-    ColorRGB albedo;
-    ColorRGB sky_top;
-    ColorRGB sky_bottom;
-    ColorRGB hemi_ground;
+    LinearColor albedo;
+    LinearColor sky_top;
+    LinearColor sky_bottom;
+    LinearColor hemi_ground;
     float sky_scale;
     Vec3 camera_pos;
     double ambient_light;
@@ -327,14 +245,14 @@ struct ShadingContext
     {
         Vec3 dir;
         double intensity;
-        ColorRGB color;
+        LinearColor color;
         double angular_radius;
     };
     std::array<DirectionalLightInfo, 2> lights;
 };
 
 struct TaaContext {
-    std::vector<ColorRGB> buffers[2];
+    std::array<std::vector<LinearColor>, 2> buffers;
     int write_index = 0;
     bool valid = false;
     size_t width = 0, height = 0;
@@ -349,11 +267,11 @@ struct TaaContext {
         }
     }
 
-    const ColorRGB* get_read_buffer() const {
+    const LinearColor* get_read_buffer() const {
         return buffers[(write_index + 1) % 2].data();
     }
 
-    ColorRGB* get_write_buffer() {
+    LinearColor* get_write_buffer() {
         return buffers[write_index].data();
     }
 
@@ -370,7 +288,7 @@ constexpr int kGiNoiseSalt = 73;
 constexpr float kGiClamp = 4.0f;
 constexpr int kGiSampleCount = 1;
 constexpr float kGiAoLift = 0.15f;
-constexpr double kPi = 3.14159265358979323846;
+constexpr double kPi = std::numbers::pi_v<double>;
 constexpr double kSunLatitudeDeg = 30.0;
 constexpr double kSunLatitudeRad = kPi * kSunLatitudeDeg / 180.0;
 constexpr double kSunDiskRadius = 0.03;
@@ -379,23 +297,14 @@ constexpr int kMoonShadowSalt = 19;
 constexpr uint32_t kSkySunriseTopColor = 0xFFB55A1A;
 constexpr uint32_t kSkySunriseBottomColor = 0xFF4A200A;
 constexpr double kHemisphereBounceStrength = 0.35;
-constexpr ColorRGB kHemisphereBounceColorLinear{1.0f, 0.9046612f, 0.7758222f};
+constexpr LinearColor kHemisphereBounceColorLinear{1.0f, 0.9046612f, 0.7758222f};
 constexpr double kSkyLightHeightPower = 0.5;
-constexpr ColorRGB kSunLightColorLinear{1.0f, 0.94f, 0.88f};
-constexpr ColorRGB kMoonLightColorLinear{1.0f, 1.0f, 1.0f};
+constexpr LinearColor kSunLightColorLinear{1.0f, 0.94f, 0.88f};
+constexpr LinearColor kMoonLightColorLinear{1.0f, 1.0f, 1.0f};
 constexpr double kSunIntensityBoost = 1.2;
 constexpr double kMoonSkyLightFloor = 0.22;
 constexpr double kNearPlane = 0.05;
 constexpr double kFarPlane = 1000.0;
-constexpr int kTerrainChunkSize = 16;
-constexpr double kTerrainBlockSize = 2.0;
-constexpr double kTerrainStartZ = 4.0;
-constexpr double kTerrainBaseY = 2.0;
-constexpr size_t kSkyRayCount = 128;
-constexpr double kSkyRayStep = 0.25;
-constexpr double kSkyRayMaxDistance = 6.0;
-constexpr double kSkyRayBias = 0.02;
-constexpr double kSkyRayCenterBias = 0.02;
 constexpr int kTaaJitterSalt = 37;
 constexpr double kTaaSharpenMax = 0.25;
 constexpr double kTaaSharpenRotThreshold = 0.25;
@@ -410,203 +319,25 @@ constexpr float kShadowFilterNormalThreshold = 0.5f;
 constexpr float kShadowFilterCenterWeight = 4.0f;
 constexpr float kShadowFilterNeighborWeight = 1.0f;
 
-static Vec3 normalize_vec(const Vec3& v);
 static float compute_shadow_factor(const Vec3& light_dir, const Vec3& world, const Vec3& normal);
 static bool triangle_in_front_of_near_plane(double z0, double z1, double z2);
-static void build_terrain_mesh();
-static void build_light_basis(const Vec3& light_dir, Vec3& right, Vec3& up, Vec3& forward);
 static Vec3 jitter_shadow_direction(const Vec3& light_dir, 
                                     const Vec3& right_scaled,
                                     const Vec3& up_scaled,
                                     const int px, const int py,
-                                    const BlueNoiseShift& shift_u,
-                                    const BlueNoiseShift& shift_v);
-static float shadow_filter_at(const float* mask, const float* depth, const Vec3* normals,
+                                    const BlueNoise::Shift& shift_u,
+                                    const BlueNoise::Shift& shift_v);
+static float shadow_filter_at(std::span<const float> mask,
+                              std::span<const float> depth,
+                              std::span<const Vec3> normals,
                               size_t width, size_t height, int x, int y, float depth_max);
-static void filter_shadow_masks(const float* mask_a, const float* mask_b,
-                                float* out_a, float* out_b, const float* depth,
-                                const Vec3* normals, size_t width, size_t height, float depth_max);
-static Vec3 add_vec(const Vec3& a, const Vec3& b);
-static double dot_vec(const Vec3& a, const Vec3& b);
-static Vec3 cross_vec(const Vec3& a, const Vec3& b);
-
-static std::array<int, 512> make_permutation(const int seed)
-{
-    std::array<int, 256> p{};
-    std::iota(p.begin(), p.end(), 0);
-    std::mt19937 rng(static_cast<uint32_t>(seed));
-    std::shuffle(p.begin(), p.end(), rng);
-    std::array<int, 512> perm{};
-    for (size_t i = 0; i < perm.size(); ++i)
-    {
-        perm[i] = p[i & 255];
-    }
-    return perm;
-}
-
-static double simplex_noise(const double xin, const double yin)
-{
-    static const std::array<int, 512> perm = make_permutation(1337);
-    static constexpr int grad2[8][2] = {
-        {1, 0}, {-1, 0}, {0, 1}, {0, -1},
-        {1, 1}, {-1, 1}, {1, -1}, {-1, -1}
-    };
-
-    static constexpr double f2 = 0.366025403784438646; // (sqrt(3)-1)/2
-    static constexpr double g2 = 0.211324865405187117; // (3-sqrt(3))/6
-
-    const double s = (xin + yin) * f2;
-    const int i = static_cast<int>(std::floor(xin + s));
-    const int j = static_cast<int>(std::floor(yin + s));
-    const double t = (i + j) * g2;
-    const double x0 = xin - (static_cast<double>(i) - t);
-    const double y0 = yin - (static_cast<double>(j) - t);
-
-    const int i1 = (x0 > y0) ? 1 : 0;
-    const int j1 = (x0 > y0) ? 0 : 1;
-
-    const double x1 = x0 - static_cast<double>(i1) + g2;
-    const double y1 = y0 - static_cast<double>(j1) + g2;
-    const double x2 = x0 - 1.0 + 2.0 * g2;
-    const double y2 = y0 - 1.0 + 2.0 * g2;
-
-    const int ii = i & 255;
-    const int jj = j & 255;
-
-    auto grad_dot = [&](int hash, double x, double y) {
-        const int* g = grad2[hash & 7];
-        return static_cast<double>(g[0]) * x + static_cast<double>(g[1]) * y;
-    };
-
-    double n0 = 0.0;
-    double t0 = 0.5 - x0 * x0 - y0 * y0;
-    if (t0 > 0.0)
-    {
-        t0 *= t0;
-        n0 = t0 * t0 * grad_dot(perm[ii + perm[jj]], x0, y0);
-    }
-
-    double n1 = 0.0;
-    double t1 = 0.5 - x1 * x1 - y1 * y1;
-    if (t1 > 0.0)
-    {
-        t1 *= t1;
-        n1 = t1 * t1 * grad_dot(perm[ii + i1 + perm[jj + j1]], x1, y1);
-    }
-
-    double n2 = 0.0;
-    double t2 = 0.5 - x2 * x2 - y2 * y2;
-    if (t2 > 0.0)
-    {
-        t2 *= t2;
-        n2 = t2 * t2 * grad_dot(perm[ii + 1 + perm[jj + 1]], x2, y2);
-    }
-
-    return 70.0 * (n0 + n1 + n2);
-}
-
-struct VoxelBlock
-{
-    Vec3 position;
-    uint32_t color;
-    ColorRGB albedo_linear;
-    TopFaceLighting topFace;
-    std::array<std::array<Vec3, 4>, 6> face_normals;
-    std::array<std::array<float, 4>, 6> face_sky_visibility;
-};
-
-struct RenderQuad
-{
-    Vec3 v[4];
-    Vec3 n[4];
-    std::array<float, 4> sky_visibility;
-    uint32_t color;
-};
-
-static std::vector<VoxelBlock> terrainBlocks;
-static int terrainSize = 0;
-static int terrainMaxHeight = 0;
-static std::vector<int> terrainHeights;
-static std::vector<uint32_t> terrainTopColors;
-static std::vector<int> terrainBlockIndex;
-static std::vector<RenderQuad> terrainQuads;
-static bool terrainMeshReady = false;
-static size_t terrainVisibleFaces = 0;
-static size_t terrainMeshTriangles = 0;
-
-static bool terrain_has_block(const int gx, const int gy, const int gz)
-{
-    if (gx < 0 || gx >= terrainSize || gz < 0 || gz >= terrainSize)
-    {
-        return false;
-    }
-    if (gy < 0)
-    {
-        return false;
-    }
-    const size_t idx = static_cast<size_t>(gz * terrainSize + gx);
-    return gy < terrainHeights[idx];
-}
-
-static size_t terrain_block_slot(const int gx, const int gy, const int gz)
-{
-    return (static_cast<size_t>(gz) * static_cast<size_t>(terrainMaxHeight) +
-            static_cast<size_t>(gy)) * static_cast<size_t>(terrainSize) +
-           static_cast<size_t>(gx);
-}
-
-static const VoxelBlock* terrain_block_at(const int gx, const int gy, const int gz)
-{
-    if (gx < 0 || gx >= terrainSize || gz < 0 || gz >= terrainSize)
-    {
-        return nullptr;
-    }
-    if (gy < 0 || gy >= terrainMaxHeight)
-    {
-        return nullptr;
-    }
-    const size_t slot = terrain_block_slot(gx, gy, gz);
-    if (slot >= terrainBlockIndex.size())
-    {
-        return nullptr;
-    }
-    const int index = terrainBlockIndex[slot];
-    if (index < 0 || static_cast<size_t>(index) >= terrainBlocks.size())
-    {
-        return nullptr;
-    }
-    return &terrainBlocks[static_cast<size_t>(index)];
-}
-
-static double radical_inverse_vdc(uint32_t bits)
-{
-    bits = (bits << 16u) | (bits >> 16u);
-    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
-    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
-    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
-    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
-    return static_cast<double>(bits) * 2.3283064365386963e-10;
-}
-
-static const std::array<Vec3, kSkyRayCount>& sky_sample_dirs()
-{
-    static const std::array<Vec3, kSkyRayCount> dirs = [] {
-        std::array<Vec3, kSkyRayCount> samples{};
-        for (size_t i = 0; i < kSkyRayCount; ++i)
-        {
-            const double u = (static_cast<double>(i) + 0.5) / static_cast<double>(kSkyRayCount);
-            const double v = radical_inverse_vdc(static_cast<uint32_t>(i));
-            const double r = std::sqrt(u);
-            const double theta = 2.0 * kPi * v;
-            const double x = r * std::cos(theta);
-            const double y = r * std::sin(theta);
-            const double z = std::sqrt(std::max(0.0, 1.0 - u));
-            samples[i] = {x, y, z};
-        }
-        return samples;
-    }();
-    return dirs;
-}
+static void filter_shadow_masks(std::span<const float> mask_a,
+                                std::span<const float> mask_b,
+                                std::span<float> out_a,
+                                std::span<float> out_b,
+                                std::span<const float> depth,
+                                std::span<const Vec3> normals,
+                                size_t width, size_t height, float depth_max);
 
 static const std::array<Vec2, 64>& disk_sample_points()
 {
@@ -626,350 +357,29 @@ static const std::array<Vec2, 64>& disk_sample_points()
     return samples;
 }
 
-static float compute_vertex_sky_visibility(const int gx, const int gy, const int gz,
-                                           const int face, const int corner)
-{
-    Vec3 normal{
-        static_cast<double>(cubeFaceNormal[face][0]),
-        static_cast<double>(cubeFaceNormal[face][1]),
-        static_cast<double>(cubeFaceNormal[face][2])
-    };
-    Vec3 tangent;
-    Vec3 bitangent;
-    Vec3 forward;
-    build_light_basis(normal, tangent, bitangent, forward);
-    normal = forward;
-
-    const int vi = cubeFaceVertices[face][corner];
-    const Vec3 offset = cubeVerticesGrid[vi];
-    const Vec3 vertex{
-        static_cast<double>(gx) + offset.x,
-        static_cast<double>(gy) + offset.y,
-        static_cast<double>(gz) + offset.z
-    };
-    const Vec3 center{
-        static_cast<double>(gx) + 0.5,
-        static_cast<double>(gy) + 0.5,
-        static_cast<double>(gz) + 0.5
-    };
-
-    Vec3 origin = vertex;
-    origin.x += normal.x * kSkyRayBias;
-    origin.y += normal.y * kSkyRayBias;
-    origin.z += normal.z * kSkyRayBias;
-    origin.x += (center.x - vertex.x) * kSkyRayCenterBias;
-    origin.y += (center.y - vertex.y) * kSkyRayCenterBias;
-    origin.z += (center.z - vertex.z) * kSkyRayCenterBias;
-
-    const auto& samples = sky_sample_dirs();
-    size_t occluded = 0;
-    for (const auto& sample : samples)
-    {
-        Vec3 dir{
-            tangent.x * sample.x + bitangent.x * sample.y + normal.x * sample.z,
-            tangent.y * sample.x + bitangent.y * sample.y + normal.y * sample.z,
-            tangent.z * sample.x + bitangent.z * sample.y + normal.z * sample.z
-        };
-
-        bool hit = false;
-        for (double t = kSkyRayStep; t <= kSkyRayMaxDistance; t += kSkyRayStep)
-        {
-            const Vec3 p{
-                origin.x + dir.x * t,
-                origin.y + dir.y * t,
-                origin.z + dir.z * t
-            };
-            const int vx = static_cast<int>(std::floor(p.x));
-            const int vy = static_cast<int>(std::floor(p.y));
-            const int vz = static_cast<int>(std::floor(p.z));
-            if (terrain_has_block(vx, vy, vz))
-            {
-                hit = true;
-                break;
-            }
-        }
-        if (hit)
-        {
-            occluded++;
-        }
-    }
-
-    const double visibility = 1.0 - static_cast<double>(occluded) /
-                                      static_cast<double>(samples.size());
-    return static_cast<float>(std::clamp(visibility, 0.0, 1.0));
-}
-
-static void build_terrain_chunk()
-{
-    const int chunk_size = kTerrainChunkSize;
-    const int base_height = 4;
-    const int dirt_thickness = 2;
-    const int height_variation = 6;
-    const double height_freq = 0.12;
-    const double surface_freq = 0.4;
-
-    const double block_size = kTerrainBlockSize;
-    const double start_x = -(chunk_size - 1) * block_size * 0.5;
-    const double start_z = kTerrainStartZ;
-    const double base_y = kTerrainBaseY;
-
-    const uint32_t stone_color = 0xFF7A7A7A;
-    const uint32_t dirt_color = 0xFF7D4714;
-    const uint32_t grass_color = 0xFF3B8A38;
-    const uint32_t water_color = 0xFF2B5FA8;
-
-    terrainSize = chunk_size;
-    terrainHeights.assign(static_cast<size_t>(chunk_size * chunk_size), 0);
-    terrainTopColors.assign(static_cast<size_t>(chunk_size * chunk_size), grass_color);
-
-    auto index = [chunk_size](int x, int z) {
-        return static_cast<size_t>(z * chunk_size + x);
-    };
-    auto height_at_clamped = [&](int x, int z) {
-        x = std::clamp(x, 0, chunk_size - 1);
-        z = std::clamp(z, 0, chunk_size - 1);
-        return terrainHeights[index(x, z)];
-    };
-    auto height_at_or_zero = [&](int x, int z) {
-        if (x < 0 || x >= chunk_size || z < 0 || z >= chunk_size)
-        {
-            return 0;
-        }
-        return terrainHeights[index(x, z)];
-    };
-
-    terrainBlocks.reserve(static_cast<size_t>(chunk_size * chunk_size * (base_height + height_variation + 3)));
-
-    for (int z = 0; z < chunk_size; ++z)
-    {
-        for (int x = 0; x < chunk_size; ++x)
-        {
-            const double h = simplex_noise(x * height_freq, z * height_freq);
-            int height = base_height + static_cast<int>(((h + 1.0) * 0.5 * height_variation) + 0.5);
-            if (height < 3)
-            {
-                height = 3;
-            }
-
-            const double surface = simplex_noise(x * surface_freq + 100.0, z * surface_freq - 100.0);
-            uint32_t top_color = grass_color;
-            if (surface > 0.55)
-            {
-                top_color = water_color;
-            }
-            else if (surface < -0.35)
-            {
-                top_color = dirt_color;
-            }
-
-            terrainHeights[index(x, z)] = height;
-            terrainTopColors[index(x, z)] = top_color;
-        }
-    }
-
-    terrainBlocks.clear();
-    terrainMaxHeight = 0;
-    for (int value : terrainHeights)
-    {
-        if (value > terrainMaxHeight)
-        {
-            terrainMaxHeight = value;
-        }
-    }
-    if (terrainMaxHeight < 0)
-    {
-        terrainMaxHeight = 0;
-    }
-    terrainBlockIndex.assign(static_cast<size_t>(terrainSize * std::max(terrainMaxHeight, 1) * terrainSize), -1);
-    terrainMeshReady = false;
-    const Vec3 top_normal = face_normal_world(FaceTop);
-    const TopFaceLighting empty_top{
-        {top_normal, top_normal, top_normal, top_normal}
-    };
-
-    for (int z = 0; z < chunk_size; ++z)
-    {
-        for (int x = 0; x < chunk_size; ++x)
-        {
-            const int height = terrainHeights[index(x, z)];
-            const uint32_t top_color = terrainTopColors[index(x, z)];
-            for (int y = 0; y < height; ++y)
-            {
-                uint32_t color = stone_color;
-                if (y >= height - 1)
-                {
-                    color = top_color;
-                }
-                else if (y >= height - 1 - dirt_thickness)
-                {
-                    color = dirt_color;
-                }
-
-                std::array<std::array<Vec3, 4>, 6> face_normals{};
-                for (int face = 0; face < 6; ++face)
-                {
-                    const Vec3 base = face_normal_world(face);
-                    for (int corner = 0; corner < 4; ++corner)
-                    {
-                        face_normals[face][corner] = base;
-                    }
-                }
-                std::array<std::array<float, 4>, 6> face_sky_visibility{};
-                for (auto& face_visibility : face_sky_visibility)
-                {
-                    face_visibility.fill(0.0f);
-                }
-                for (int face = 0; face < 6; ++face)
-                {
-                    const int nx = x + cubeFaceNormal[face][0];
-                    const int ny = y + cubeFaceNormal[face][1];
-                    const int nz = z + cubeFaceNormal[face][2];
-                    if (!terrain_has_block(nx, ny, nz))
-                    {
-                        for (int corner = 0; corner < 4; ++corner)
-                        {
-                            face_sky_visibility[face][corner] = compute_vertex_sky_visibility(x, y, z, face, corner);
-                        }
-                    }
-                }
-                const ColorRGB albedo_linear = srgb_to_linear(unpack_color(color));
-                terrainBlocks.push_back({
-                    {start_x + x * block_size, base_y - y * block_size, start_z + z * block_size},
-                    color,
-                    albedo_linear,
-                    empty_top,
-                    face_normals,
-                    face_sky_visibility
-                });
-                const size_t block_index = terrainBlocks.size() - 1;
-                const size_t slot = terrain_block_slot(x, y, z);
-                if (slot < terrainBlockIndex.size())
-                {
-                    terrainBlockIndex[slot] = static_cast<int>(block_index);
-                }
-            }
-        }
-    }
-
-    build_terrain_mesh();
-}
-
-static void generate_terrain_chunk()
-{
-    static std::once_flag terrain_init_flag;
-    std::call_once(terrain_init_flag, build_terrain_chunk);
-}
-
-static void emit_block_face_quad(const VoxelBlock& block, const int face)
-{
-    RenderQuad quad{};
-    quad.color = block.color;
-    auto corner_index = [&](const int vertex_index) -> int {
-        for (int i = 0; i < 4; ++i)
-        {
-            if (cubeFaceVertices[face][i] == vertex_index)
-            {
-                return i;
-            }
-        }
-        return -1;
-    };
-    for (int corner = 0; corner < 4; ++corner)
-    {
-        const int vi = cubeFaceQuadOrder[face][corner];
-        quad.v[corner] = add_vec(block.position, cubeVertices[vi]);
-        const int face_corner = corner_index(vi);
-        const int attr_corner = face_corner < 0 ? corner : face_corner;
-        quad.sky_visibility[corner] = block.face_sky_visibility[static_cast<size_t>(face)][static_cast<size_t>(attr_corner)];
-        if (face == FaceTop)
-        {
-            quad.n[corner] = block.topFace.normals[static_cast<size_t>(attr_corner)];
-        }
-        else
-        {
-            quad.n[corner] = block.face_normals[static_cast<size_t>(face)][static_cast<size_t>(attr_corner)];
-        }
-    }
-    terrainQuads.push_back(quad);
-}
-
-static void build_terrain_mesh()
-{
-    if (terrainMeshReady)
-    {
-        return;
-    }
-    terrainMeshReady = true;
-    terrainQuads.clear();
-    terrainVisibleFaces = 0;
-    terrainMeshTriangles = 0;
-
-    if (terrainSize <= 0 || terrainMaxHeight <= 0)
-    {
-        return;
-    }
-
-    static constexpr int face_order[6] = {
-        FaceFront,
-        FaceBack,
-        FaceLeft,
-        FaceRight,
-        FaceBottom,
-        FaceTop
-    };
-    for (int z = 0; z < terrainSize; ++z)
-    {
-        for (int x = 0; x < terrainSize; ++x)
-        {
-            const int height = terrainHeights[static_cast<size_t>(z * terrainSize + x)];
-            for (int y = 0; y < height; ++y)
-            {
-                const VoxelBlock* block = terrain_block_at(x, y, z);
-                if (!block)
-                {
-                    continue;
-                }
-                for (int i = 0; i < 6; ++i)
-                {
-                    const int face = face_order[i];
-                    const int nx = x + cubeFaceNormal[face][0];
-                    const int ny = y + cubeFaceNormal[face][1];
-                    const int nz = z + cubeFaceNormal[face][2];
-                    if (!terrain_has_block(nx, ny, nz))
-                    {
-                        terrainVisibleFaces++;
-                        emit_block_face_quad(*block, face);
-                    }
-                }
-            }
-        }
-    }
-
-    terrainMeshTriangles = terrainQuads.size() * 2;
-}
-
-static ColorRGB lerp_color(const ColorRGB& a, const ColorRGB& b, float t)
+template <typename ColorT>
+static ColorT lerp_color(const ColorT& a, const ColorT& b, float t)
 {
     return {
-        a.r + (b.r - a.r) * t,
-        a.g + (b.g - a.g) * t,
-        a.b + (b.b - a.b) * t
+        std::lerp(a.r, b.r, t),
+        std::lerp(a.g, b.g, t),
+        std::lerp(a.b, b.b, t)
     };
 }
 
 static Vec3 lerp_vec3(const Vec3& a, const Vec3& b, const double t)
 {
     return {
-        a.x + (b.x - a.x) * t,
-        a.y + (b.y - a.y) * t,
-        a.z + (b.z - a.z) * t
+        std::lerp(a.x, b.x, t),
+        std::lerp(a.y, b.y, t),
+        std::lerp(a.z, b.z, t)
     };
 }
 
-static ColorRGB sample_bilinear_history(const ColorRGB* buffer, const size_t width, const size_t height,
-                                        const double screen_x, const double screen_y)
+static LinearColor sample_bilinear_history(std::span<const LinearColor> buffer, const size_t width,
+                                        const size_t height, const double screen_x, const double screen_y)
 {
-    if (!buffer || width == 0 || height == 0)
+    if (buffer.empty() || width == 0 || height == 0)
     {
         return {0.0f, 0.0f, 0.0f};
     }
@@ -988,19 +398,19 @@ static ColorRGB sample_bilinear_history(const ColorRGB* buffer, const size_t wid
 
     const size_t row0 = static_cast<size_t>(y0) * width;
     const size_t row1 = static_cast<size_t>(y1) * width;
-    const ColorRGB c00 = buffer[row0 + static_cast<size_t>(x0)];
-    const ColorRGB c10 = buffer[row0 + static_cast<size_t>(x1)];
-    const ColorRGB c01 = buffer[row1 + static_cast<size_t>(x0)];
-    const ColorRGB c11 = buffer[row1 + static_cast<size_t>(x1)];
-    const ColorRGB top = lerp_color(c00, c10, fx);
-    const ColorRGB bottom = lerp_color(c01, c11, fx);
+    const LinearColor c00 = buffer[row0 + static_cast<size_t>(x0)];
+    const LinearColor c10 = buffer[row0 + static_cast<size_t>(x1)];
+    const LinearColor c01 = buffer[row1 + static_cast<size_t>(x0)];
+    const LinearColor c11 = buffer[row1 + static_cast<size_t>(x1)];
+    const LinearColor top = lerp_color(c00, c10, fx);
+    const LinearColor bottom = lerp_color(c01, c11, fx);
     return lerp_color(top, bottom, fy);
 }
 
-static Vec3 sample_bilinear_history_vec3(const Vec3* buffer, const size_t width, const size_t height,
-                                         const double screen_x, const double screen_y)
+static Vec3 sample_bilinear_history_vec3(std::span<const Vec3> buffer, const size_t width,
+                                         const size_t height, const double screen_x, const double screen_y)
 {
-    if (!buffer || width == 0 || height == 0)
+    if (buffer.empty() || width == 0 || height == 0)
     {
         return {0.0, 0.0, 0.0};
     }
@@ -1028,22 +438,22 @@ static Vec3 sample_bilinear_history_vec3(const Vec3* buffer, const size_t width,
     return lerp_vec3(top, bottom, fy);
 }
 
-static ColorRGB scale_color(const ColorRGB& color, float scale)
+static LinearColor scale_color(const LinearColor& color, float scale)
 {
     return {color.r * scale, color.g * scale, color.b * scale};
 }
 
-static ColorRGB mul_color(const ColorRGB& a, const ColorRGB& b)
+static LinearColor mul_color(const LinearColor& a, const LinearColor& b)
 {
     return {a.r * b.r, a.g * b.g, a.b * b.b};
 }
 
-static ColorRGB add_color(const ColorRGB& a, const ColorRGB& b)
+static LinearColor add_color(const LinearColor& a, const LinearColor& b)
 {
     return {a.r + b.r, a.g + b.g, a.b + b.b};
 }
 
-static ColorRGB compute_hemisphere_ground(const ColorRGB& base_ground,
+static LinearColor compute_hemisphere_ground(const LinearColor& base_ground,
                                           const std::array<ShadingContext::DirectionalLightInfo, 2>& lights)
 {
     double bounce_energy = 0.0;
@@ -1111,13 +521,6 @@ static double eval_specular_term(const double ndoth, const double vdoth, const d
     return blinn_phong_normalization(shininess) * power * fresnel * ndotl_clamped;
 }
 
-static Vec3 normalize_vec(const Vec3& v)
-{
-    const double len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (len == 0.0) return {0.0, 0.0, 0.0};
-    return {v.x / len, v.y / len, v.z / len};
-}
-
 static bool triangle_in_front_of_near_plane(const double z0, const double z1, const double z2)
 {
     return z0 >= kNearPlane || z1 >= kNearPlane || z2 >= kNearPlane;
@@ -1134,37 +537,37 @@ struct ClipVertex
 static ClipVertex clip_lerp(const ClipVertex& a, const ClipVertex& b, const double t)
 {
     const Vec3 view{
-        a.view.x + (b.view.x - a.view.x) * t,
-        a.view.y + (b.view.y - a.view.y) * t,
-        a.view.z + (b.view.z - a.view.z) * t
+        std::lerp(a.view.x, b.view.x, t),
+        std::lerp(a.view.y, b.view.y, t),
+        std::lerp(a.view.z, b.view.z, t)
     };
     const Vec3 world{
-        a.world.x + (b.world.x - a.world.x) * t,
-        a.world.y + (b.world.y - a.world.y) * t,
-        a.world.z + (b.world.z - a.world.z) * t
+        std::lerp(a.world.x, b.world.x, t),
+        std::lerp(a.world.y, b.world.y, t),
+        std::lerp(a.world.z, b.world.z, t)
     };
     Vec3 normal{
-        a.normal.x + (b.normal.x - a.normal.x) * t,
-        a.normal.y + (b.normal.y - a.normal.y) * t,
-        a.normal.z + (b.normal.z - a.normal.z) * t
+        std::lerp(a.normal.x, b.normal.x, t),
+        std::lerp(a.normal.y, b.normal.y, t),
+        std::lerp(a.normal.z, b.normal.z, t)
     };
-    normal = normalize_vec(normal);
-    const float visibility = a.sky_visibility + (b.sky_visibility - a.sky_visibility) * static_cast<float>(t);
+    normal = normal.normalize();
+    const float visibility = std::lerp(a.sky_visibility, b.sky_visibility, static_cast<float>(t));
     return {view, world, normal, visibility};
 }
 
-static size_t clip_triangle_to_near_plane(const ClipVertex* input, const size_t input_count,
-                                          ClipVertex* output, const size_t max_output)
+static size_t clip_triangle_to_near_plane(std::span<const ClipVertex> input,
+                                          std::span<ClipVertex> output)
 {
-    if (!input || !output || input_count == 0 || max_output == 0)
+    if (input.empty() || output.empty())
     {
         return 0;
     }
     size_t out_count = 0;
-    ClipVertex prev = input[input_count - 1];
+    ClipVertex prev = input[input.size() - 1];
     bool prev_inside = prev.view.z >= kNearPlane;
 
-    for (size_t i = 0; i < input_count; ++i)
+    for (size_t i = 0; i < input.size(); ++i)
     {
         const ClipVertex cur = input[i];
         const bool cur_inside = cur.view.z >= kNearPlane;
@@ -1174,12 +577,12 @@ static size_t clip_triangle_to_near_plane(const ClipVertex* input, const size_t 
             if (!prev_inside)
             {
                 const double t = (kNearPlane - prev.view.z) / (cur.view.z - prev.view.z);
-                if (out_count < max_output)
+                if (out_count < output.size())
                 {
                     output[out_count++] = clip_lerp(prev, cur, t);
                 }
             }
-            if (out_count < max_output)
+            if (out_count < output.size())
             {
                 output[out_count++] = cur;
             }
@@ -1187,7 +590,7 @@ static size_t clip_triangle_to_near_plane(const ClipVertex* input, const size_t 
         else if (prev_inside)
         {
             const double t = (kNearPlane - prev.view.z) / (cur.view.z - prev.view.z);
-            if (out_count < max_output)
+            if (out_count < output.size())
             {
                 output[out_count++] = clip_lerp(prev, cur, t);
             }
@@ -1198,25 +601,6 @@ static size_t clip_triangle_to_near_plane(const ClipVertex* input, const size_t 
     }
 
     return out_count;
-}
-
-static Vec3 add_vec(const Vec3& a, const Vec3& b)
-{
-    return {a.x + b.x, a.y + b.y, a.z + b.z};
-}
-
-static double dot_vec(const Vec3& a, const Vec3& b)
-{
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-static Vec3 cross_vec(const Vec3& a, const Vec3& b)
-{
-    return {
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x
-    };
 }
 
 static Vec3 compute_sun_orbit_direction(double angle)
@@ -1234,7 +618,7 @@ static Vec3 compute_sun_orbit_direction(double angle)
     const double x = cos_alt * std::sin(az);
     const double z = cos_alt * std::cos(az);
     const double y = -sin_alt;
-    return normalize_vec({x, y, z});
+    return Vec3{x, y, z}.normalize();
 }
 
 static double compute_sun_height(const Vec3& sun_dir)
@@ -1248,53 +632,6 @@ static double compute_sun_height(const Vec3& sun_dir)
     return std::clamp(height, 0.0, 1.0);
 }
 
-static ColorRGB unpack_color(uint32_t color)
-{
-    return {
-        static_cast<float>((color >> 16) & 0xFF),
-        static_cast<float>((color >> 8) & 0xFF),
-        static_cast<float>(color & 0xFF)
-    };
-}
-
-static float srgb_channel_to_linear(const float channel)
-{
-    const float c = channel / 255.0f;
-    if (c <= 0.04045f)
-    {
-        return c / 12.92f;
-    }
-    return std::pow((c + 0.055f) / 1.055f, 2.4f);
-}
-
-static float linear_channel_to_srgb(float channel)
-{
-    channel = std::clamp(channel, 0.0f, 1.0f);
-    if (channel <= 0.0031308f)
-    {
-        return channel * 12.92f;
-    }
-    return 1.055f * std::pow(channel, 1.0f / 2.4f) - 0.055f;
-}
-
-static ColorRGB srgb_to_linear(const ColorRGB& color)
-{
-    return {
-        srgb_channel_to_linear(color.r),
-        srgb_channel_to_linear(color.g),
-        srgb_channel_to_linear(color.b)
-    };
-}
-
-static ColorRGB linear_to_srgb(const ColorRGB& color)
-{
-    return {
-        linear_channel_to_srgb(color.r) * 255.0f,
-        linear_channel_to_srgb(color.g) * 255.0f,
-        linear_channel_to_srgb(color.b) * 255.0f
-    };
-}
-
 static float tonemap_reinhard_channel(float value)
 {
     if (value <= 0.0f)
@@ -1304,7 +641,7 @@ static float tonemap_reinhard_channel(float value)
     return value / (1.0f + value);
 }
 
-static ColorRGB tonemap_reinhard(const ColorRGB& color, const float exposure_factor)
+static LinearColor tonemap_reinhard(const LinearColor& color, const float exposure_factor)
 {
     if (exposure_factor <= 0.0f)
     {
@@ -1320,7 +657,7 @@ static ColorRGB tonemap_reinhard(const ColorRGB& color, const float exposure_fac
     };
 }
 
-static uint32_t pack_color(const ColorRGB& color)
+static uint32_t pack_color(const ColorSrgb& color)
 {
     const auto clamp_channel = [](float value) {
         if (value < 0.0f) value = 0.0f;
@@ -1377,120 +714,14 @@ static ViewRotation make_view_rotation(const double yaw, const double pitch)
     return {std::cos(yaw), std::sin(yaw), std::cos(pitch), std::sin(pitch)};
 }
 
-static Mat4 mat4_identity()
-{
-    Mat4 m{};
-    m.m[0][0] = 1.0;
-    m.m[1][1] = 1.0;
-    m.m[2][2] = 1.0;
-    m.m[3][3] = 1.0;
-    return m;
-}
-
-static Mat4 mat4_multiply(const Mat4& a, const Mat4& b)
-{
-    Mat4 r{};
-    for (int i = 0; i < 4; ++i)
-    {
-        for (int j = 0; j < 4; ++j)
-        {
-            double sum = 0.0;
-            for (int k = 0; k < 4; ++k)
-            {
-                sum += a.m[i][k] * b.m[k][j];
-            }
-            r.m[i][j] = sum;
-        }
-    }
-    return r;
-}
-
-static bool mat4_invert(const Mat4& m, Mat4* out)
-{
-    if (!out)
-    {
-        return false;
-    }
-    double aug[4][8]{};
-    for (int i = 0; i < 4; ++i)
-    {
-        for (int j = 0; j < 4; ++j)
-        {
-            aug[i][j] = m.m[i][j];
-        }
-        for (int j = 0; j < 4; ++j)
-        {
-            aug[i][j + 4] = (i == j) ? 1.0 : 0.0;
-        }
-    }
-
-    for (int col = 0; col < 4; ++col)
-    {
-        int pivot = col;
-        double max_abs = std::fabs(aug[col][col]);
-        for (int row = col + 1; row < 4; ++row)
-        {
-            const double value = std::fabs(aug[row][col]);
-            if (value > max_abs)
-            {
-                max_abs = value;
-                pivot = row;
-            }
-        }
-        if (max_abs < 1e-12)
-        {
-            return false;
-        }
-        if (pivot != col)
-        {
-            for (int j = 0; j < 8; ++j)
-            {
-                std::swap(aug[col][j], aug[pivot][j]);
-            }
-        }
-
-        const double inv_pivot = 1.0 / aug[col][col];
-        for (int j = 0; j < 8; ++j)
-        {
-            aug[col][j] *= inv_pivot;
-        }
-
-        for (int row = 0; row < 4; ++row)
-        {
-            if (row == col)
-            {
-                continue;
-            }
-            const double factor = aug[row][col];
-            if (factor == 0.0)
-            {
-                continue;
-            }
-            for (int j = 0; j < 8; ++j)
-            {
-                aug[row][j] -= factor * aug[col][j];
-            }
-        }
-    }
-
-    for (int i = 0; i < 4; ++i)
-    {
-        for (int j = 0; j < 4; ++j)
-        {
-            out->m[i][j] = aug[i][j + 4];
-        }
-    }
-    return true;
-}
-
-static Mat4 make_view_matrix(const Vec3& pos, const double yaw, const double pitch)
+static auto make_view_matrix(const Vec3& pos, const double yaw, const double pitch) -> Mat4
 {
     const double cy = std::cos(yaw);
     const double sy = std::sin(yaw);
     const double cp = std::cos(pitch);
     const double sp = std::sin(pitch);
 
-    Mat4 m = mat4_identity();
+    Mat4 m = Mat4::identity();
     m.m[0][0] = cy;
     m.m[0][1] = 0.0;
     m.m[0][2] = sy;
@@ -1509,12 +740,12 @@ static Mat4 make_view_matrix(const Vec3& pos, const double yaw, const double pit
     return m;
 }
 
-static Mat4 make_projection_matrix(const double width, const double height,
-                                   const double fov_x, const double fov_y)
+static auto make_projection_matrix(const double width, const double height,
+                                   const double fov_x, const double fov_y) -> Mat4
 {
     if (width <= 0.0 || height <= 0.0 || kFarPlane <= kNearPlane)
     {
-        return mat4_identity();
+        return Mat4::identity();
     }
     const double sx = 2.0 * fov_x / width;
     const double sy = 2.0 * fov_y / height;
@@ -1544,10 +775,10 @@ static inline float edge_function(const ScreenVertex& a, const ScreenVertex& b, 
     return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
 }
 
-static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
-                                 ColorRGB* sample_direct_sun, ColorRGB* sample_direct_moon,
+static void draw_shaded_triangle(float* zbuffer, LinearColor* sample_ambient,
+                                 LinearColor* sample_direct_sun, LinearColor* sample_direct_moon,
                                  float* shadow_mask_sun, float* shadow_mask_moon,
-                                 Vec3* sample_normals, ColorRGB* sample_albedo, float* sample_ao,
+                                 Vec3* sample_normals, LinearColor* sample_albedo, float* sample_ao,
                                  Vec3* world_positions, uint32_t* world_stamp, uint32_t frame_index,
                                  size_t width, size_t height,
                                  const ScreenVertex& v0, const ScreenVertex& v1, const ScreenVertex& v2,
@@ -1558,8 +789,8 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                                  const float jitter_x, const float jitter_y,
                                  const std::array<Vec3, 2>& lights_right_scaled,
                                  const std::array<Vec3, 2>& lights_up_scaled,
-                                 const std::array<BlueNoiseShift, 2>& shadow_shift_u,
-                                 const std::array<BlueNoiseShift, 2>& shadow_shift_v)
+                                 const std::array<BlueNoise::Shift, 2>& shadow_shift_u,
+                                 const std::array<BlueNoise::Shift, 2>& shadow_shift_v)
 {
     float min_x = std::min({v0.x, v1.x, v2.x});
     float max_x = std::max({v0.x, v1.x, v2.x});
@@ -1616,9 +847,9 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
     const double ambient = direct_lighting_enabled ? ctx.ambient_light * ctx.material.ambient : 0.0;
     const bool use_sky = ctx.sky_scale > 0.0f;
     const float sky_scale = ctx.sky_scale;
-    const ColorRGB albedo = ctx.albedo;
-    const ColorRGB hemi_ground = ctx.hemi_ground;
-    const ColorRGB sky_top = ctx.sky_top;
+    const LinearColor albedo = ctx.albedo;
+    const LinearColor hemi_ground = ctx.hemi_ground;
+    const LinearColor sky_top = ctx.sky_top;
     const Vec3 camera_pos = ctx.camera_pos;
     const double f0 = std::clamp(ctx.material.specular, 0.0, 1.0);
     const bool has_specular = f0 > 0.0;
@@ -1658,7 +889,7 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                             w0p * n0.y + w1p * n1.y + w2p * n2.y,
                             w0p * n0.z + w1p * n1.z + w2p * n2.z
                         };
-                        normal = normalize_vec(normal);
+                        normal = normal.normalize();
 
                         Vec3 world{
                             w0p * wp0.x + w1p * wp1.x + w2p * wp2.x,
@@ -1671,7 +902,7 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                             world_stamp[idx] = frame_index;
                         }
 
-                        ColorRGB ambient_color{
+                        LinearColor ambient_color{
                             static_cast<float>(albedo.r * ambient),
                             static_cast<float>(albedo.g * ambient),
                             static_cast<float>(albedo.b * ambient)
@@ -1680,7 +911,7 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                         {
                             float sky_t = static_cast<float>((-normal.y) * 0.5 + 0.5);
                             sky_t = std::clamp(sky_t, 0.0f, 1.0f);
-                            const ColorRGB sky = lerp_color(hemi_ground, sky_top, sky_t);
+                            const LinearColor sky = lerp_color(hemi_ground, sky_top, sky_t);
                             ambient_color.r = sky.r * sky_scale * albedo.r;
                             ambient_color.g = sky.g * sky_scale * albedo.g;
                             ambient_color.b = sky.b * sky_scale * albedo.b;
@@ -1689,8 +920,8 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                         ambient_color.g *= visibility;
                         ambient_color.b *= visibility;
 
-                        ColorRGB direct_sun{0.0f, 0.0f, 0.0f};
-                        ColorRGB direct_moon{0.0f, 0.0f, 0.0f};
+                        LinearColor direct_sun{0.0f, 0.0f, 0.0f};
+                        LinearColor direct_moon{0.0f, 0.0f, 0.0f};
                         float shadow_sun = 1.0f;
                         float shadow_moon = 1.0f;
                         if (direct_lighting_enabled)
@@ -1700,18 +931,18 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                                 camera_pos.y - world.y,
                                 camera_pos.z - world.z
                             };
-                            const Vec3 view_dir = normalize_vec(view_vec);
+                            const Vec3 view_dir = view_vec.normalize();
 
                             auto eval_light = [&](const ShadingContext::DirectionalLightInfo& light,
                                                   const int light_idx, const int shadow_salt,
-                                                  ColorRGB& out_direct, float& out_shadow) {
+                                                  LinearColor& out_direct, float& out_shadow) {
                                 out_direct = {0.0f, 0.0f, 0.0f};
                                 out_shadow = 1.0f;
                                 if (light.intensity <= 0.0)
                                 {
                                     return;
                                 }
-                                const double ndotl = std::max(0.0, dot_vec(normal, light.dir));
+                                const double ndotl = std::max(0.0, normal.dot(light.dir));
                                 if (ndotl <= 0.0)
                                 {
                                     return;
@@ -1727,12 +958,12 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                                     out_shadow = compute_shadow_factor(shadow_dir, world, normal);
                                 }
 
-                                const Vec3 half_vec = normalize_vec(add_vec(light.dir, view_dir));
-                                const double vdoth = std::max(0.0, dot_vec(view_dir, half_vec));
+                                const Vec3 half_vec = (light.dir + view_dir).normalize();
+                                const double vdoth = std::max(0.0, view_dir.dot(half_vec));
                                 const double fresnel = schlick_fresnel(vdoth, f0);
                                 const double diffuse_scale = std::clamp(1.0 - fresnel, 0.0, 1.0);
                                 const double diffuse = ndotl * light.intensity * diffuse_coeff * diffuse_scale;
-                                ColorRGB light_color{
+                                LinearColor light_color{
                                     static_cast<float>(albedo.r * diffuse),
                                     static_cast<float>(albedo.g * diffuse),
                                     static_cast<float>(albedo.b * diffuse)
@@ -1742,7 +973,7 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
                                 light_color.b *= light.color.b;
                                 if (has_specular)
                                 {
-                                    const double spec_dot = std::max(0.0, dot_vec(normal, half_vec));
+                                    const double spec_dot = std::max(0.0, normal.dot(half_vec));
                                     double spec = eval_specular_term(spec_dot, vdoth, ndotl,
                                                                      shininess, f0);
                                     spec *= light.intensity;
@@ -1793,32 +1024,20 @@ static void draw_shaded_triangle(float* zbuffer, ColorRGB* sample_ambient,
     }
 }
 
-static void build_light_basis(const Vec3& light_dir, Vec3& right, Vec3& up, Vec3& forward)
-{
-    forward = light_dir;
-    Vec3 up_guess{0.0, 1.0, 0.0};
-    if (std::abs(dot_vec(forward, up_guess)) > 0.99)
-    {
-        up_guess = {0.0, 0.0, 1.0};
-    }
-    right = normalize_vec(cross_vec(up_guess, forward));
-    up = cross_vec(forward, right);
-}
-
 static Vec3 jitter_shadow_direction(const Vec3& light_dir, 
                                     const Vec3& right_scaled,
                                     const Vec3& up_scaled,
                                     const int px, const int py,
-                                    const BlueNoiseShift& shift_u,
-                                    const BlueNoiseShift& shift_v)
+                                    const BlueNoise::Shift& shift_u,
+                                    const BlueNoise::Shift& shift_v)
 {
     if (right_scaled.x == 0.0 && right_scaled.y == 0.0 && right_scaled.z == 0.0)
     {
         return light_dir;
     }
 
-    const float u1 = sample_noise_shifted(px, py, shift_u);
-    const float u2 = sample_noise_shifted(px, py, shift_v);
+    const float u1 = BlueNoise::sample(px, py, shift_u);
+    const float u2 = BlueNoise::sample(px, py, shift_v);
     const int ix = static_cast<int>(u1 * 8.0f);
     const int iy = static_cast<int>(u2 * 8.0f);
     const size_t idx = static_cast<size_t>((iy & 7) * 8 + (ix & 7));
@@ -1837,7 +1056,7 @@ struct GiHit
 {
     Vec3 position;
     Vec3 normal;
-    ColorRGB albedo;
+    LinearColor albedo;
     float sky_visibility;
 };
 
@@ -1848,20 +1067,18 @@ static bool gi_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec3& d
     {
         return false;
     }
-    if (terrainSize <= 0 || terrainMaxHeight <= 0)
+    const int terrain_size = terrain.chunk_size;
+    const int terrain_height = terrain.max_height();
+    if (terrain_size <= 0 || terrain_height <= 0)
     {
         return false;
     }
 
-    const size_t terrain_size = static_cast<size_t>(terrainSize);
-    const size_t terrain_height = static_cast<size_t>(terrainMaxHeight);
-    const size_t terrain_stride = terrain_size * terrain_height;
-
-    const double block_size = kTerrainBlockSize;
+    const double block_size = terrain.block_size();
     const double half = block_size * 0.5;
-    const double start_x = -(terrainSize - 1) * block_size * 0.5;
-    const double start_z = kTerrainStartZ;
-    const double base_y = kTerrainBaseY;
+    const double start_x = terrain.start_x();
+    const double start_z = terrain.start_z();
+    const double base_y = terrain.base_y();
     const double inv_block = 1.0 / block_size;
 
     const Vec3 origin_world{
@@ -1892,7 +1109,7 @@ static bool gi_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec3& d
     int y = static_cast<int>(origin_y_floor);
     int z = static_cast<int>(origin_z_floor);
 
-    if (x < 0 || x >= terrainSize || z < 0 || z >= terrainSize || y < 0 || y >= terrainMaxHeight)
+    if (x < 0 || x >= terrain_size || z < 0 || z >= terrain_size || y < 0 || y >= terrain_height)
     {
         return false;
     }
@@ -1915,7 +1132,7 @@ static bool gi_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec3& d
     double t_max_z = step_z != 0 ? (next_z - origin.z) / dir_grid.z : inf;
 
     const double max_t = max_distance * inv_block;
-    const int max_steps = (terrainSize + terrainSize + terrainMaxHeight) * 4;
+    const int max_steps = (terrain_size + terrain_size + terrain_height) * 4;
     bool skip_first = true;
     double traveled = 0.0;
     int last_axis = -1;
@@ -1924,14 +1141,9 @@ static bool gi_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec3& d
     {
         if (!skip_first)
         {
-            const size_t slot = static_cast<size_t>(z) * terrain_stride +
-                                static_cast<size_t>(y) * terrain_size +
-                                static_cast<size_t>(x);
-            const int block_index = terrainBlockIndex[slot];
-            if (block_index >= 0)
+            const VoxelBlock* block = terrain.block_at(x, y, z);
+            if (block)
             {
-                const VoxelBlock* block = &terrainBlocks[static_cast<size_t>(block_index)];
-
                 Vec3 hit_normal{0.0, 0.0, 0.0};
                 int face = FaceTop;
                 if (last_axis == 0)
@@ -2014,7 +1226,7 @@ static bool gi_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec3& d
         {
             return false;
         }
-        if (x < 0 || x >= terrainSize || z < 0 || z >= terrainSize || y < 0 || y >= terrainMaxHeight)
+        if (x < 0 || x >= terrain_size || z < 0 || z >= terrain_size || y < 0 || y >= terrain_height)
         {
             return false;
         }
@@ -2024,16 +1236,18 @@ static bool gi_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec3& d
 
 static bool shadow_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec3& light_dir)
 {
-    if (terrainSize <= 0 || terrainMaxHeight <= 0)
+    const int terrain_size = terrain.chunk_size;
+    const int terrain_height = terrain.max_height();
+    if (terrain_size <= 0 || terrain_height <= 0)
     {
         return false;
     }
 
-    const double block_size = kTerrainBlockSize;
+    const double block_size = terrain.block_size();
     const double half = block_size * 0.5;
-    const double start_x = -(terrainSize - 1) * block_size * 0.5;
-    const double start_z = kTerrainStartZ;
-    const double base_y = kTerrainBaseY;
+    const double start_x = terrain.start_x();
+    const double start_z = terrain.start_z();
+    const double base_y = terrain.base_y();
     const double inv_block = 1.0 / block_size;
 
     const Vec3 origin_world{
@@ -2060,7 +1274,7 @@ static bool shadow_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec
     int y = static_cast<int>(std::floor(origin.y));
     int z = static_cast<int>(std::floor(origin.z));
 
-    if (x < 0 || x >= terrainSize || z < 0 || z >= terrainSize || y < 0 || y >= terrainMaxHeight)
+    if (x < 0 || x >= terrain_size || z < 0 || z >= terrain_size || y < 0 || y >= terrain_height)
     {
         return false;
     }
@@ -2082,12 +1296,12 @@ static bool shadow_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec
     double t_max_y = step_y != 0 ? (next_y - origin.y) / dir.y : inf;
     double t_max_z = step_z != 0 ? (next_z - origin.z) / dir.z : inf;
 
-    const int max_steps = (terrainSize + terrainSize + terrainMaxHeight) * 4;
+    const int max_steps = (terrain_size + terrain_size + terrain_height) * 4;
     bool skip_first = true;
 
     for (int i = 0; i < max_steps; ++i)
     {
-        if (!skip_first && terrain_has_block(x, y, z))
+        if (!skip_first && terrain.has_block(x, y, z))
         {
             return true;
         }
@@ -2120,7 +1334,7 @@ static bool shadow_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec
             }
         }
 
-        if (x < 0 || x >= terrainSize || z < 0 || z >= terrainSize || y < 0 || y >= terrainMaxHeight)
+        if (x < 0 || x >= terrain_size || z < 0 || z >= terrain_size || y < 0 || y >= terrain_height)
         {
             return false;
         }
@@ -2130,7 +1344,7 @@ static bool shadow_raymarch_hit(const Vec3& world, const Vec3& normal, const Vec
 
 static float compute_shadow_factor(const Vec3& light_dir, const Vec3& world, const Vec3& normal)
 {
-    const double ndotl = std::max(0.0, dot_vec(normal, light_dir));
+    const double ndotl = std::max(0.0, normal.dot(light_dir));
     if (ndotl <= 0.0)
     {
         return 1.0f;
@@ -2138,8 +1352,8 @@ static float compute_shadow_factor(const Vec3& light_dir, const Vec3& world, con
     return shadow_raymarch_hit(world, normal, light_dir) ? 0.0f : 1.0f;
 }
 
-static float shadow_filter_at(const float* mask, const float* depth, const Vec3* normals,
-                              const size_t width, const size_t height,
+static float shadow_filter_at(std::span<const float> mask, std::span<const float> depth,
+                              std::span<const Vec3> normals, const size_t width, const size_t height,
                               const int x, const int y, const float depth_max)
 {
     const int ix = std::clamp(x, 0, static_cast<int>(width) - 1);
@@ -2212,10 +1426,10 @@ static float shadow_filter_at(const float* mask, const float* depth, const Vec3*
     return filtered;
 }
 
-static void filter_shadow_masks(const float* mask_a, const float* mask_b,
-                                float* out_a, float* out_b, const float* depth,
-                                const Vec3* normals, const size_t width, const size_t height,
-                                const float depth_max)
+static void filter_shadow_masks(std::span<const float> mask_a, std::span<const float> mask_b,
+                                std::span<float> out_a, std::span<float> out_b,
+                                std::span<const float> depth, std::span<const Vec3> normals,
+                                const size_t width, const size_t height, const float depth_max)
 {
     for (size_t y = 0; y < height; ++y)
     {
@@ -2310,10 +1524,10 @@ static void filter_shadow_masks(const float* mask_a, const float* mask_b,
     }
 }
 
-static void render_quad(float* zbuffer, ColorRGB* sample_ambient,
-                        ColorRGB* sample_direct_sun, ColorRGB* sample_direct_moon,
+static void render_quad(float* zbuffer, LinearColor* sample_ambient,
+                        LinearColor* sample_direct_sun, LinearColor* sample_direct_moon,
                         float* shadow_mask_sun, float* shadow_mask_moon, Vec3* sample_normals,
-                        ColorRGB* sample_albedo, float* sample_ao,
+                        LinearColor* sample_albedo, float* sample_ao,
                         Vec3* world_positions, uint32_t* world_stamp, uint32_t frame_index,
                         size_t width, size_t height,
                         const RenderQuad& quad, const double fov_x, const double fov_y,
@@ -2321,11 +1535,11 @@ static void render_quad(float* zbuffer, ColorRGB* sample_ambient,
                         const float jitter_x, const float jitter_y,
                         const std::array<Vec3, 2>& lights_right_scaled,
                         const std::array<Vec3, 2>& lights_up_scaled,
-                        const std::array<BlueNoiseShift, 2>& shadow_shift_u,
-                        const std::array<BlueNoiseShift, 2>& shadow_shift_v)
+                        const std::array<BlueNoise::Shift, 2>& shadow_shift_u,
+                        const std::array<BlueNoise::Shift, 2>& shadow_shift_v)
 
 {
-    Vec3 view_space[4];
+    std::array<Vec3, 4> view_space{};
     for (int i = 0; i < 4; ++i)
     {
         Vec3 view{
@@ -2397,13 +1611,13 @@ static void render_quad(float* zbuffer, ColorRGB* sample_ambient,
     };
 
     auto draw_clipped = [&](int i0, int i1, int i2) {
-        ClipVertex input[3]{
+        const std::array<ClipVertex, 3> input{{
             {view_space[i0], quad.v[i0], quad.n[i0], quad.sky_visibility[i0]},
             {view_space[i1], quad.v[i1], quad.n[i1], quad.sky_visibility[i1]},
             {view_space[i2], quad.v[i2], quad.n[i2], quad.sky_visibility[i2]}
-        };
-        ClipVertex clipped[4]{};
-        const size_t clipped_count = clip_triangle_to_near_plane(input, 3, clipped, 4);
+        }};
+        std::array<ClipVertex, 4> clipped{};
+        const size_t clipped_count = clip_triangle_to_near_plane(input, clipped);
         if (clipped_count < 3)
         {
             return;
@@ -2456,23 +1670,23 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     static size_t cached_width = 0;
     static size_t cached_height = 0;
     static std::vector<float> zbuffer;
-    static std::vector<ColorRGB> sample_colors;
-    static std::vector<ColorRGB> sample_direct;
-    static std::vector<ColorRGB> sample_direct_sun;
-    static std::vector<ColorRGB> sample_direct_moon;
+    static std::vector<LinearColor> sample_colors;
+    static std::vector<LinearColor> sample_direct;
+    static std::vector<LinearColor> sample_direct_sun;
+    static std::vector<LinearColor> sample_direct_moon;
     static std::vector<float> shadow_mask_sun;
     static std::vector<float> shadow_mask_moon;
     static std::vector<float> shadow_mask_filtered_sun;
     static std::vector<float> shadow_mask_filtered_moon;
     static std::vector<Vec3> sample_normals;
-    static std::vector<ColorRGB> sample_albedo;
-    static std::vector<ColorRGB> sample_indirect;
+    static std::vector<LinearColor> sample_albedo;
+    static std::vector<LinearColor> sample_indirect;
     static std::vector<float> sample_ao;
     static std::vector<Vec3> world_positions;
     static std::vector<uint32_t> world_stamp;
-    static std::vector<ColorRGB> taa_history[2]; 
-    static std::vector<ColorRGB> taa_resolved;
-    static std::vector<ColorRGB> current_linear_buffer;
+    static std::array<std::vector<LinearColor>, 2> taa_history;
+    static std::vector<LinearColor> taa_resolved;
+    static std::vector<LinearColor> current_linear_buffer;
     static std::vector<uint8_t> taa_history_mask;
     static int taa_ping_pong = 0;
     static size_t taa_width = 0;
@@ -2632,10 +1846,14 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     const Mat4 proj = make_projection_matrix(static_cast<double>(width),
                                              static_cast<double>(height),
                                              fov_x, fov_y);
-    currentVP = mat4_multiply(proj, view);
-    if (!mat4_invert(currentVP, &inverseCurrentVP))
+    currentVP = proj * view;
+    if (const auto inv = currentVP.invert())
     {
-        inverseCurrentVP = mat4_identity();
+        inverseCurrentVP = *inv;
+    }
+    else
+    {
+        inverseCurrentVP = Mat4::identity();
     }
 
     const double inv_dist = 1.0 / (kFarPlane - kNearPlane);
@@ -2647,8 +1865,8 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     if (taa_on)
     {
         const float jitter_scale = 1.0f;
-        const float u = sample_noise(0, 0, static_cast<int>(frame_index), kTaaJitterSalt);
-        const float v = sample_noise(1, 0, static_cast<int>(frame_index), kTaaJitterSalt + 1);
+        const float u = BlueNoise::sample(0, 0, static_cast<int>(frame_index), kTaaJitterSalt);
+        const float v = BlueNoise::sample(1, 0, static_cast<int>(frame_index), kTaaJitterSalt + 1);
         jitter_x = (u - 0.5f) * jitter_scale;
         jitter_y = (v - 0.5f) * jitter_scale;
     }
@@ -2660,10 +1878,10 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     const double mat_diffuse = 1.0;
     const Material cube_material{0xFFFFFFFF, mat_ambient, mat_diffuse, 0.15, 24.0};
 
-    generate_terrain_chunk();
+    terrain.generate();
 
     const bool sun_orbit = sunOrbitEnabled.load(std::memory_order_relaxed);
-    Vec3 sun_dir = normalize_vec(load_light_direction());
+    Vec3 sun_dir = load_light_direction().normalize();
     double sun_intensity = lightIntensity.load(std::memory_order_relaxed);
     if (sun_orbit)
     {
@@ -2676,21 +1894,21 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     }
     sun_intensity *= kSunIntensityBoost;
 
-    ColorRGB sky_top = unpack_color(skyTopColor.load(std::memory_order_relaxed));
-    ColorRGB sky_bottom = unpack_color(skyBottomColor.load(std::memory_order_relaxed));
+    ColorSrgb sky_top = ColorSrgb::from_hex(skyTopColor.load(std::memory_order_relaxed));
+    ColorSrgb sky_bottom = ColorSrgb::from_hex(skyBottomColor.load(std::memory_order_relaxed));
     double sun_height = 1.0;
     if (sun_orbit)
     {
         sun_height = compute_sun_height(sun_dir);
         const float t = static_cast<float>(sun_height);
-        const ColorRGB sunrise_top = unpack_color(kSkySunriseTopColor);
-        const ColorRGB sunrise_bottom = unpack_color(kSkySunriseBottomColor);
+        const ColorSrgb sunrise_top = ColorSrgb::from_hex(kSkySunriseTopColor);
+        const ColorSrgb sunrise_bottom = ColorSrgb::from_hex(kSkySunriseBottomColor);
         sky_top = lerp_color(sunrise_top, sky_top, t);
         sky_bottom = lerp_color(sunrise_bottom, sky_bottom, t);
     }
 
-    const ColorRGB sky_top_linear = srgb_to_linear(sky_top);
-    const ColorRGB sky_bottom_linear = srgb_to_linear(sky_bottom);
+    const LinearColor sky_top_linear = sky_top.to_linear();
+    const LinearColor sky_bottom_linear = sky_bottom.to_linear();
     const double moon_intensity = moonIntensity.load(std::memory_order_relaxed);
     double effective_sky_intensity = skyLightIntensity.load(std::memory_order_relaxed);
     if (sun_orbit)
@@ -2702,7 +1920,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         effective_sky_intensity = std::min(1.0, effective_sky_intensity + moon_factor);
     }
 
-    const Vec3 moon_dir = normalize_vec(load_moon_direction());
+    const Vec3 moon_dir = load_moon_direction().normalize();
     const bool shadows_on = shadowEnabled.load(std::memory_order_relaxed);
     const std::array<ShadingContext::DirectionalLightInfo, 2> lights = {
         ShadingContext::DirectionalLightInfo{sun_dir, sun_intensity, kSunLightColorLinear, kSunDiskRadius},
@@ -2716,8 +1934,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     {
         if (lights[i].angular_radius > 0.0 && lights[i].intensity > 0.0)
         {
-            Vec3 right, up, forward;
-            build_light_basis(lights[i].dir, right, up, forward);
+            auto [right, up, forward] = Vec3::get_basis(lights[i].dir);
             const double scale = std::tan(lights[i].angular_radius);
 
             lights_right_scaled[i] = {right.x * scale, right.y * scale, right.z * scale};
@@ -2730,19 +1947,19 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         }
     }
 
-    const std::array<BlueNoiseShift, 2> shadow_shift_u{
-        blue_noise_shift(static_cast<int>(frame_index), kSunShadowSalt),
-        blue_noise_shift(static_cast<int>(frame_index), kMoonShadowSalt)
+    const std::array<BlueNoise::Shift, 2> shadow_shift_u{
+        BlueNoise::shift(static_cast<int>(frame_index), kSunShadowSalt),
+        BlueNoise::shift(static_cast<int>(frame_index), kMoonShadowSalt)
     };
-    const std::array<BlueNoiseShift, 2> shadow_shift_v{
-        blue_noise_shift(static_cast<int>(frame_index), kSunShadowSalt + 1),
-        blue_noise_shift(static_cast<int>(frame_index), kMoonShadowSalt + 1)
+    const std::array<BlueNoise::Shift, 2> shadow_shift_v{
+        BlueNoise::shift(static_cast<int>(frame_index), kSunShadowSalt + 1),
+        BlueNoise::shift(static_cast<int>(frame_index), kMoonShadowSalt + 1)
     };
 
     const bool direct_lighting_enabled = (lights[0].intensity > 0.0) || (lights[1].intensity > 0.0);
     const bool ao_enabled = ambientOcclusionEnabled.load(std::memory_order_relaxed);
     const float sky_scale = static_cast<float>(std::clamp(effective_sky_intensity, 0.0, 1.0));
-    const ColorRGB hemi_ground = compute_hemisphere_ground(sky_bottom_linear, lights);
+    const LinearColor hemi_ground = compute_hemisphere_ground(sky_bottom_linear, lights);
     const double ambient_value = ambientLight.load(std::memory_order_relaxed);
 
     struct CachedContext
@@ -2763,8 +1980,8 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         }
         Material material = cube_material;
         material.color = color;
-        const ColorRGB albedo_srgb = unpack_color(material.color);
-        const ColorRGB albedo = srgb_to_linear(albedo_srgb);
+        const ColorSrgb albedo_srgb = ColorSrgb::from_hex(material.color);
+        const LinearColor albedo = albedo_srgb.to_linear();
         CachedContext entry{};
         entry.color = color;
         entry.ctx = {
@@ -2790,7 +2007,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         return ctx_cache[0].ctx;
     };
 
-    for (const auto& quad : terrainQuads)
+    for (const auto& quad : terrain.mesh)
     {
         ShadingContext& ctx = get_ctx(quad.color);
         render_quad(zbuffer.data(), sample_colors.data(),
@@ -2810,19 +2027,25 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         const float* shadow_moon = shadow_mask_moon.data();
         if (kShadowFilterEnabled)
         {
-            filter_shadow_masks(shadow_mask_sun.data(), shadow_mask_moon.data(),
-                                shadow_mask_filtered_sun.data(), shadow_mask_filtered_moon.data(),
-                                zbuffer.data(), sample_normals.data(),
+            const std::span<const float> shadow_sun_span(shadow_mask_sun.data(), sample_count);
+            const std::span<const float> shadow_moon_span(shadow_mask_moon.data(), sample_count);
+            const std::span<float> shadow_sun_out_span(shadow_mask_filtered_sun.data(), sample_count);
+            const std::span<float> shadow_moon_out_span(shadow_mask_filtered_moon.data(), sample_count);
+            const std::span<const float> depth_span(zbuffer.data(), sample_count);
+            const std::span<const Vec3> normals_span(sample_normals.data(), sample_count);
+            filter_shadow_masks(shadow_sun_span, shadow_moon_span,
+                                shadow_sun_out_span, shadow_moon_out_span,
+                                depth_span, normals_span,
                                 width, height, depth_max);
             shadow_sun = shadow_mask_filtered_sun.data();
             shadow_moon = shadow_mask_filtered_moon.data();
         }
         for (size_t i = 0; i < sample_count; ++i)
         {
-            const ColorRGB sun = sample_direct_sun[i];
-            const ColorRGB moon = sample_direct_moon[i];
-            const ColorRGB sun_shadowed = scale_color(sun, shadow_sun[i]);
-            const ColorRGB moon_shadowed = scale_color(moon, shadow_moon[i]);
+            const LinearColor sun = sample_direct_sun[i];
+            const LinearColor moon = sample_direct_moon[i];
+            const LinearColor sun_shadowed = scale_color(sun, shadow_sun[i]);
+            const LinearColor moon_shadowed = scale_color(moon, shadow_moon[i]);
             sample_direct[i] = add_color(sun_shadowed, moon_shadowed);
         }
     }
@@ -2840,7 +2063,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
     if (gi_active)
     {
         const size_t gi_shift_count = static_cast<size_t>(gi_bounce_count) * kGiSampleCount * 2;
-        std::vector<BlueNoiseShift> gi_shifts(gi_shift_count);
+        std::vector<BlueNoise::Shift> gi_shifts(gi_shift_count);
         for (int bounce = 0; bounce < gi_bounce_count; ++bounce)
         {
             for (int sample_idx = 0; sample_idx < kGiSampleCount; ++sample_idx)
@@ -2848,8 +2071,8 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                 const int salt_index = bounce * kGiSampleCount + sample_idx;
                 const int base_salt = kGiNoiseSalt + salt_index * 2;
                 const size_t base_idx = static_cast<size_t>(salt_index) * 2;
-                gi_shifts[base_idx + 0] = blue_noise_shift(static_cast<int>(frame_index), base_salt);
-                gi_shifts[base_idx + 1] = blue_noise_shift(static_cast<int>(frame_index), base_salt + 1);
+                gi_shifts[base_idx + 0] = BlueNoise::shift(static_cast<int>(frame_index), base_salt);
+                gi_shifts[base_idx + 1] = BlueNoise::shift(static_cast<int>(frame_index), base_salt + 1);
             }
         }
         for (size_t y = 0; y < height; ++y)
@@ -2869,7 +2092,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                 {
                     continue;
                 }
-                const ColorRGB origin_albedo = sample_albedo[idx];
+                const LinearColor origin_albedo = sample_albedo[idx];
 
                 const double screen_x = static_cast<double>(x) + 0.5 + jitter_x_d;
                 const Vec3 world = unproject_fast(screen_x, screen_y, zbuffer[idx],
@@ -2879,12 +2102,12 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                 world_stamp[idx] = frame_index;
 
                 auto sample_gi_dir = [&](const Vec3& hemi_normal,
-                                         const BlueNoiseShift& shift_u,
-                                         const BlueNoiseShift& shift_v,
+                                         const BlueNoise::Shift& shift_u,
+                                         const BlueNoise::Shift& shift_v,
                                          Vec3& out_dir,
                                          double& out_cos_theta) -> bool {
-                    const float u1 = sample_noise_shifted(static_cast<int>(x), static_cast<int>(y), shift_u);
-                    const float u2 = sample_noise_shifted(static_cast<int>(x), static_cast<int>(y), shift_v);
+                    const float u1 = BlueNoise::sample(static_cast<int>(x), static_cast<int>(y), shift_u);
+                    const float u2 = BlueNoise::sample(static_cast<int>(x), static_cast<int>(y), shift_v);
                     const double r = std::sqrt(static_cast<double>(u1));
                     const double theta = 2.0 * kPi * static_cast<double>(u2);
                     double sin_theta_angle = 0.0;
@@ -2894,8 +2117,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                     const double local_y = r * sin_theta_angle;
                     const double local_z = std::sqrt(std::max(0.0, 1.0 - r * r));
 
-                    Vec3 tangent, bitangent, forward;
-                    build_light_basis(hemi_normal, tangent, bitangent, forward);
+                    auto [tangent, bitangent, forward] = Vec3::get_basis(hemi_normal);
                     out_dir = {
                         tangent.x * local_x + bitangent.x * local_y + forward.x * local_z,
                         tangent.y * local_x + bitangent.y * local_y + forward.y * local_z,
@@ -2905,15 +2127,15 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                     return out_cos_theta > 0.0;
                 };
 
-                auto eval_gi_incoming = [&](const GiHit& hit) -> ColorRGB {
-                    ColorRGB incoming{0.0f, 0.0f, 0.0f};
+                auto eval_gi_incoming = [&](const GiHit& hit) -> LinearColor {
+                    LinearColor incoming{0.0f, 0.0f, 0.0f};
                     for (const auto& light : lights)
                     {
                         if (light.intensity <= 0.0)
                         {
                             continue;
                         }
-                        const double ndotl = std::max(0.0, dot_vec(hit.normal, light.dir));
+                        const double ndotl = std::max(0.0, hit.normal.dot(light.dir));
                         if (ndotl <= 0.0)
                         {
                             continue;
@@ -2928,7 +2150,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                     {
                         float sky_t = static_cast<float>((-hit.normal.y) * 0.5 + 0.5);
                         sky_t = std::clamp(sky_t, 0.0f, 1.0f);
-                        const ColorRGB sky = lerp_color(hemi_ground, sky_top_linear, sky_t);
+                        const LinearColor sky = lerp_color(hemi_ground, sky_top_linear, sky_t);
                         const float vis = hit.sky_visibility;
                         incoming.r += sky.r * sky_scale * vis;
                         incoming.g += sky.g * sky_scale * vis;
@@ -2941,8 +2163,8 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                 auto trace_gi_bounce = [&](const Vec3& world_origin,
                                            const Vec3& surface_normal,
                                            const Vec3& hemi_normal,
-                                           const BlueNoiseShift& shift_u,
-                                           const BlueNoiseShift& shift_v,
+                                           const BlueNoise::Shift& shift_u,
+                                           const BlueNoise::Shift& shift_v,
                                            GiHit& out_hit,
                                            double& out_cos_theta) -> bool {
                     Vec3 dir;
@@ -2953,13 +2175,13 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                     return gi_raymarch_hit(world_origin, surface_normal, dir, kGiMaxDistance, &out_hit);
                 };
 
-                ColorRGB gi_sum{0.0f, 0.0f, 0.0f};
+                LinearColor gi_sum{0.0f, 0.0f, 0.0f};
                 for (int sample_idx = 0; sample_idx < kGiSampleCount; ++sample_idx)
                 {
-                    ColorRGB gi_sample{0.0f, 0.0f, 0.0f};
+                    LinearColor gi_sample{0.0f, 0.0f, 0.0f};
                     Vec3 current_world = world;
                     Vec3 current_normal = normal;
-                    ColorRGB throughput = origin_albedo;
+                    LinearColor throughput = origin_albedo;
                     bool hit_any = false;
 
                     for (int bounce = 0; bounce < gi_bounce_count; ++bounce)
@@ -2980,17 +2202,17 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                             break;
                         }
 
-                        const ColorRGB incoming = eval_gi_incoming(hit);
+                        const LinearColor incoming = eval_gi_incoming(hit);
                         if (incoming.r > 0.0f || incoming.g > 0.0f || incoming.b > 0.0f)
                         {
-                            ColorRGB bounced = mul_color(incoming, hit.albedo);
+                            LinearColor bounced = mul_color(incoming, hit.albedo);
                             bounced = mul_color(bounced, throughput);
                             bounced = scale_color(bounced, static_cast<float>(cos_theta));
                             gi_sample = add_color(gi_sample, bounced);
                             hit_any = true;
                         }
 
-                        ColorRGB next_throughput = mul_color(throughput, hit.albedo);
+                        LinearColor next_throughput = mul_color(throughput, hit.albedo);
                         next_throughput = scale_color(next_throughput, static_cast<float>(cos_theta));
                         if (next_throughput.r <= 0.0f && next_throughput.g <= 0.0f && next_throughput.b <= 0.0f)
                         {
@@ -3013,7 +2235,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                 if (gi_sum.r > 0.0f || gi_sum.g > 0.0f || gi_sum.b > 0.0f)
                 {
                     const float inv_samples = 1.0f / static_cast<float>(kGiSampleCount);
-                    ColorRGB gi_sample{
+                    LinearColor gi_sample{
                         gi_sum.r * inv_samples,
                         gi_sum.g * inv_samples,
                         gi_sum.b * inv_samples
@@ -3028,12 +2250,12 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         }
     }
 
-    static constexpr int bayer4[4][4] = {
-        {0, 8, 2, 10},
-        {12, 4, 14, 6},
-        {3, 11, 1, 9},
-        {15, 7, 13, 5}
-    };
+    static constexpr std::array<std::array<int, 4>, 4> bayer4 = {{
+        {{0, 8, 2, 10}},
+        {{12, 4, 14, 6}},
+        {{3, 11, 1, 9}},
+        {{15, 7, 13, 5}}
+    }};
     const float dither_strength = 2.0f;
     const float dither_scale = dither_strength / 16.0f;
     const float exposure_factor = static_cast<float>(std::max(0.0, exposure.load(std::memory_order_relaxed)));
@@ -3041,13 +2263,14 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
 
     const int read_idx = (taa_ping_pong + 1) % 2;
     const int write_idx = taa_ping_pong;
-    const ColorRGB* history_read_ptr = taa_history[read_idx].data();
-    ColorRGB* history_write_ptr = taa_history[write_idx].data();
+    const LinearColor* history_read_ptr = taa_history[read_idx].data();
+    LinearColor* history_write_ptr = taa_history[write_idx].data();
+    const std::span<const LinearColor> history_read_span(history_read_ptr, sample_count);
 
     for (size_t y = 0; y < height; ++y)
     {
         const float sky_t = height > 1 ? static_cast<float>(y) / static_cast<float>(height - 1) : 0.0f;
-        const ColorRGB sky_row_linear = lerp_color(sky_top_linear, sky_bottom_linear, sky_t);
+        const LinearColor sky_row_linear = lerp_color(sky_top_linear, sky_bottom_linear, sky_t);
         for (size_t x = 0; x < width; ++x)
         {
             const size_t idx = y * width + x;
@@ -3056,16 +2279,16 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                 current_linear_buffer[idx] = sky_row_linear;
                 continue;
             }
-            ColorRGB accum = sample_colors[idx];
-            const ColorRGB direct = sample_direct[idx];
+            LinearColor accum = sample_colors[idx];
+            const LinearColor direct = sample_direct[idx];
             accum.r += direct.r;
             accum.g += direct.g;
             accum.b += direct.b;
             if (gi_active)
             {
-                const ColorRGB indirect = sample_indirect[idx];
+                const LinearColor indirect = sample_indirect[idx];
                 const float gi_ao = std::min(1.0f, sample_ao[idx] + kGiAoLift);
-                const ColorRGB indirect_scaled = scale_color(indirect, gi_ao);
+                const LinearColor indirect_scaled = scale_color(indirect, gi_ao);
                 accum.r += indirect_scaled.r;
                 accum.g += indirect_scaled.g;
                 accum.b += indirect_scaled.b;
@@ -3074,7 +2297,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         }
     }
 
-    auto current_linear_at = [&](int ix, int iy) -> ColorRGB {
+    auto current_linear_at = [&](int ix, int iy) -> LinearColor {
         ix = std::clamp(ix, 0, static_cast<int>(width) - 1);
         iy = std::clamp(iy, 0, static_cast<int>(height) - 1);
         const size_t idx = static_cast<size_t>(iy) * width + static_cast<size_t>(ix);
@@ -3089,14 +2312,14 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
             const size_t pixel = y * width + x;
             const float depth = zbuffer[pixel];
             const bool is_sky = depth >= depth_max;
-            const ColorRGB current_linear = current_linear_buffer[pixel];
+            const LinearColor current_linear = current_linear_buffer[pixel];
 
-            ColorRGB blended = current_linear;
+            LinearColor blended = current_linear;
             bool history_used = false;
             if (taa_on)
             {
                 bool history_valid = use_history;
-                ColorRGB prev = current_linear;
+                LinearColor prev = current_linear;
                 if (history_valid)
                 {
                     prev = history_read_ptr[pixel];
@@ -3126,8 +2349,8 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                             prev_screen.x >= 0.0 && prev_screen.x <= static_cast<double>(width) &&
                             prev_screen.y >= 0.0 && prev_screen.y <= static_cast<double>(height))
                         {
-                            prev = sample_bilinear_history(history_read_ptr, width, height,
-                                                           prev_screen.x, prev_screen.y);
+                            prev = sample_bilinear_history(history_read_span, width, height,
+                                                          prev_screen.x, prev_screen.y);
                         }
                         else
                         {
@@ -3138,13 +2361,13 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
 
                 if (history_valid && clamp_history)
                 {
-                    ColorRGB minc = current_linear;
-                    ColorRGB maxc = current_linear;
+                    LinearColor minc = current_linear;
+                    LinearColor maxc = current_linear;
                     for (int ny = -1; ny <= 1; ++ny)
                     {
                         for (int nx = -1; nx <= 1; ++nx)
                         {
-                            const ColorRGB neighbor = current_linear_at(static_cast<int>(x) + nx,
+                            const LinearColor neighbor = current_linear_at(static_cast<int>(x) + nx,
                                                                        static_cast<int>(y) + ny);
                             minc.r = std::min(minc.r, neighbor.r);
                             minc.g = std::min(minc.g, neighbor.g);
@@ -3179,7 +2402,7 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         }
     }
 
-    auto resolved_at = [&](int ix, int iy) -> ColorRGB {
+    auto resolved_at = [&](int ix, int iy) -> LinearColor {
         ix = std::clamp(ix, 0, static_cast<int>(width) - 1);
         iy = std::clamp(iy, 0, static_cast<int>(height) - 1);
         const size_t idx = static_cast<size_t>(iy) * width + static_cast<size_t>(ix);
@@ -3194,17 +2417,17 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
         {
             const size_t pixel = y * width + x;
             const bool is_sky = zbuffer[pixel] >= depth_max;
-            ColorRGB resolved = taa_resolved[pixel];
+            LinearColor resolved = taa_resolved[pixel];
 
             if (apply_sharpen && taa_history_mask[pixel])
             {
-                const ColorRGB center = resolved;
-                const ColorRGB north = resolved_at(static_cast<int>(x), static_cast<int>(y) - 1);
-                const ColorRGB south = resolved_at(static_cast<int>(x), static_cast<int>(y) + 1);
-                const ColorRGB west = resolved_at(static_cast<int>(x) - 1, static_cast<int>(y));
-                const ColorRGB east = resolved_at(static_cast<int>(x) + 1, static_cast<int>(y));
+                const LinearColor center = resolved;
+                const LinearColor north = resolved_at(static_cast<int>(x), static_cast<int>(y) - 1);
+                const LinearColor south = resolved_at(static_cast<int>(x), static_cast<int>(y) + 1);
+                const LinearColor west = resolved_at(static_cast<int>(x) - 1, static_cast<int>(y));
+                const LinearColor east = resolved_at(static_cast<int>(x) + 1, static_cast<int>(y));
                 const float inv = 1.0f / 8.0f;
-                const ColorRGB blur{
+                const LinearColor blur{
                     (center.r * 4.0f + north.r + south.r + west.r + east.r) * inv,
                     (center.g * 4.0f + north.g + south.g + west.g + east.g) * inv,
                     (center.b * 4.0f + north.b + south.b + west.b + east.b) * inv
@@ -3217,8 +2440,8 @@ void render_update_array(uint32_t* framebuffer, size_t width, size_t height)
                 resolved.b = std::max(0.0f, resolved.b);
             }
 
-            const ColorRGB mapped = tonemap_reinhard(resolved, exposure_factor);
-            ColorRGB srgb = linear_to_srgb(mapped);
+            const LinearColor mapped = tonemap_reinhard(resolved, exposure_factor);
+            ColorSrgb srgb = mapped.to_srgb();
             if (!is_sky)
             {
                 const float dither = (static_cast<float>(bayer4[y & 3][x & 3]) - 7.5f) * dither_scale;
@@ -3247,12 +2470,12 @@ double render_debug_eval_specular(const double ndoth, const double vdoth,
 Vec3 render_debug_tonemap_reinhard(const Vec3 color, const double exposure_value)
 {
     const float exposure_factor = static_cast<float>(std::max(0.0, exposure_value));
-    const ColorRGB input{
+    const LinearColor input{
         static_cast<float>(color.x),
         static_cast<float>(color.y),
         static_cast<float>(color.z)
     };
-    const ColorRGB mapped = tonemap_reinhard(input, exposure_factor);
+    const LinearColor mapped = tonemap_reinhard(input, exposure_factor);
     return {mapped.r, mapped.g, mapped.b};
 }
 
@@ -3265,7 +2488,12 @@ void render_debug_set_sky_colors_raw(const uint32_t top, const uint32_t bottom)
 Vec3 render_debug_sample_history_bilinear(const Vec3* buffer, const size_t width, const size_t height,
                                           const Vec2 screen_coord)
 {
-    return sample_bilinear_history_vec3(buffer, width, height, screen_coord.x, screen_coord.y);
+    if (!buffer)
+    {
+        return {0.0, 0.0, 0.0};
+    }
+    const std::span<const Vec3> span(buffer, width * height);
+    return sample_bilinear_history_vec3(span, width, height, screen_coord.x, screen_coord.y);
 }
 
 void render_debug_set_frame_index(const uint32_t frame_index)
@@ -3516,31 +2744,13 @@ bool render_get_terrain_vertex_sky_visibility(const int x, const int y, const in
     {
         return false;
     }
-    generate_terrain_chunk();
-    if (face < 0 || face >= 6 || corner < 0 || corner >= 4)
+    terrain.generate();
+    const auto visibility = terrain.get_sky_visibility_at(x, y, z, face, corner);
+    if (!visibility)
     {
         return false;
     }
-    if (x < 0 || z < 0 || x >= terrainSize || z >= terrainSize)
-    {
-        return false;
-    }
-    const size_t idx = static_cast<size_t>(z * terrainSize + x);
-    if (idx >= terrainHeights.size())
-    {
-        return false;
-    }
-    const int height = terrainHeights[idx];
-    if (y < 0 || y >= height)
-    {
-        return false;
-    }
-    const VoxelBlock* block = terrain_block_at(x, y, z);
-    if (!block)
-    {
-        return false;
-    }
-    *out_visibility = block->face_sky_visibility[static_cast<size_t>(face)][static_cast<size_t>(corner)];
+    *out_visibility = *visibility;
     return true;
 }
 
@@ -3550,7 +2760,7 @@ bool render_get_shadow_factor_at_point(const Vec3 world, const Vec3 normal, floa
     {
         return false;
     }
-    generate_terrain_chunk();
+    terrain.generate();
     if (!shadowEnabled.load(std::memory_order_relaxed))
     {
         *out_factor = 1.0f;
@@ -3558,7 +2768,7 @@ bool render_get_shadow_factor_at_point(const Vec3 world, const Vec3 normal, floa
     }
     const bool sun_orbit = sunOrbitEnabled.load(std::memory_order_relaxed);
     const double base_intensity = lightIntensity.load(std::memory_order_relaxed);
-    Vec3 light_dir = normalize_vec(load_light_direction());
+    Vec3 light_dir = load_light_direction().normalize();
     double sun_intensity = base_intensity;
     if (sun_orbit)
     {
@@ -3576,7 +2786,7 @@ bool render_get_shadow_factor_at_point(const Vec3 world, const Vec3 normal, floa
         return true;
     }
 
-    *out_factor = compute_shadow_factor(light_dir, world, normalize_vec(normal));
+    *out_factor = compute_shadow_factor(light_dir, world, normal.normalize());
     return true;
 }
 
@@ -3588,30 +2798,29 @@ bool render_debug_shadow_factor_with_frame(const Vec3 world, const Vec3 normal, 
     {
         return false;
     }
-    generate_terrain_chunk();
+    terrain.generate();
     if (!shadowEnabled.load(std::memory_order_relaxed))
     {
         *out_factor = 1.0f;
         return true;
     }
 
-    const Vec3 dir = normalize_vec(light_dir);
+    const Vec3 dir = light_dir.normalize();
 
-    Vec3 right, up, forward;
-    build_light_basis(dir, right, up, forward);
+    auto [right, up, forward] = Vec3::get_basis(dir);
 
     const double scale = std::tan(kSunDiskRadius);
     const Vec3 right_scaled = {right.x * scale, right.y * scale, right.z * scale};
     const Vec3 up_scaled    = {up.x * scale, up.y * scale, up.z * scale};
 
-    const BlueNoiseShift shift_u = blue_noise_shift(frame, kSunShadowSalt);
-    const BlueNoiseShift shift_v = blue_noise_shift(frame, kSunShadowSalt + 1);
+    const BlueNoise::Shift shift_u = BlueNoise::shift(frame, kSunShadowSalt);
+    const BlueNoise::Shift shift_v = BlueNoise::shift(frame, kSunShadowSalt + 1);
     const Vec3 shadow_dir = jitter_shadow_direction(dir, 
                                                     right_scaled, up_scaled,
                                                     pixel_x, pixel_y,
                                                     shift_u, shift_v);
                                                     
-    *out_factor = compute_shadow_factor(shadow_dir, world, normalize_vec(normal));
+    *out_factor = compute_shadow_factor(shadow_dir, world, normal.normalize());
     return true;
 }
 
@@ -3622,38 +2831,11 @@ float render_debug_shadow_filter(const float* mask, const float* depth, const Ve
         return 0.0f;
     }
     const float depth_max = std::numeric_limits<float>::max();
-    return shadow_filter_at(mask, depth, normals, 3, 3, 1, 1, depth_max);
-}
-
-static bool camera_intersects_block(const Vec3& pos)
-{
-    generate_terrain_chunk();
-    const double block_size = kTerrainBlockSize;
-    const double half = block_size * 0.5;
-    const double start_x = -(kTerrainChunkSize - 1) * block_size * 0.5;
-    const double start_z = kTerrainStartZ;
-    const double base_y = kTerrainBaseY;
-
-    const double gx_f = (pos.x - start_x + half) / block_size;
-    const double gz_f = (pos.z - start_z + half) / block_size;
-    const double gy_f = (base_y - pos.y + half) / block_size;
-
-    const int gx = static_cast<int>(std::floor(gx_f));
-    const int gz = static_cast<int>(std::floor(gz_f));
-    const int gy = static_cast<int>(std::floor(gy_f));
-
-    if (!terrain_has_block(gx, gy, gz))
-    {
-        return false;
-    }
-
-    const double center_x = start_x + gx * block_size;
-    const double center_z = start_z + gz * block_size;
-    const double center_y = base_y - gy * block_size;
-
-    return std::abs(pos.x - center_x) < half &&
-           std::abs(pos.y - center_y) < half &&
-           std::abs(pos.z - center_z) < half;
+    constexpr size_t kDebugShadowFilterSize = 3 * 3;
+    const std::span<const float> mask_span(mask, kDebugShadowFilterSize);
+    const std::span<const float> depth_span(depth, kDebugShadowFilterSize);
+    const std::span<const Vec3> normals_span(normals, kDebugShadowFilterSize);
+    return shadow_filter_at(mask_span, depth_span, normals_span, 3, 3, 1, 1, depth_max);
 }
 
 void render_set_camera_position(const Vec3 pos)
@@ -3674,11 +2856,12 @@ Vec3 render_get_camera_position()
 
 void render_move_camera(const Vec3 delta)
 {
+    terrain.generate();
     Vec3 pos = render_get_camera_position();
     if (delta.x != 0.0)
     {
         const Vec3 candidate{pos.x + delta.x, pos.y, pos.z};
-        if (!camera_intersects_block(candidate))
+        if (!terrain.intersects_block(candidate))
         {
             pos.x = candidate.x;
         }
@@ -3686,7 +2869,7 @@ void render_move_camera(const Vec3 delta)
     if (delta.y != 0.0)
     {
         const Vec3 candidate{pos.x, pos.y + delta.y, pos.z};
-        if (!camera_intersects_block(candidate))
+        if (!terrain.intersects_block(candidate))
         {
             pos.y = candidate.y;
         }
@@ -3694,7 +2877,7 @@ void render_move_camera(const Vec3 delta)
     if (delta.z != 0.0)
     {
         const Vec3 candidate{pos.x, pos.y, pos.z + delta.z};
-        if (!camera_intersects_block(candidate))
+        if (!terrain.intersects_block(candidate))
         {
             pos.z = candidate.z;
         }
@@ -3704,6 +2887,7 @@ void render_move_camera(const Vec3 delta)
 
 void render_move_camera_local(const Vec3 delta)
 {
+    terrain.generate();
     const double yaw = camera_yaw.load(std::memory_order_relaxed);
     const double pitch = camera_pitch.load(std::memory_order_relaxed);
     Vec3 rotated = rotate_yaw_pitch(delta, yaw, pitch);
@@ -3722,7 +2906,7 @@ void render_move_camera_local(const Vec3 delta)
     {
         const Vec3 pos = render_get_camera_position();
         const Vec3 candidate{pos.x + rotated.x, pos.y + rotated.y, pos.z + rotated.z};
-        if (camera_intersects_block(candidate))
+        if (terrain.intersects_block(candidate))
         {
             rotated.y = 0.0;
         }
@@ -3769,13 +2953,13 @@ size_t render_clip_triangle_to_near_plane(const Vec3 v0, const Vec3 v1, const Ve
     {
         return 0;
     }
-    ClipVertex input[3]{
+    const std::array<ClipVertex, 3> input{{
         {v0, v0, {0.0, 0.0, 0.0}, 0.0f},
         {v1, v1, {0.0, 0.0, 0.0}, 0.0f},
         {v2, v2, {0.0, 0.0, 0.0}, 0.0f}
-    };
-    ClipVertex clipped[4]{};
-    const size_t count = clip_triangle_to_near_plane(input, 3, clipped, 4);
+    }};
+    std::array<ClipVertex, 4> clipped{};
+    const size_t count = clip_triangle_to_near_plane(input, clipped);
     const size_t out_count = std::min(count, max_vertices);
     for (size_t i = 0; i < out_count; ++i)
     {
@@ -3880,20 +3064,20 @@ Vec2 render_reproject_point(const Vec3 world, const size_t width, const size_t h
 
 size_t render_debug_get_terrain_block_count()
 {
-    generate_terrain_chunk();
-    return terrainBlocks.size();
+    terrain.generate();
+    return terrain.block_count();
 }
 
 size_t render_debug_get_terrain_visible_face_count()
 {
-    generate_terrain_chunk();
-    return terrainVisibleFaces;
+    terrain.generate();
+    return terrain.visible_face_count();
 }
 
 size_t render_debug_get_terrain_triangle_count()
 {
-    generate_terrain_chunk();
-    return terrainMeshTriangles;
+    terrain.generate();
+    return terrain.triangle_count();
 }
 
 bool render_debug_depth_at_sample(const Vec3 v0, const Vec3 v1, const Vec3 v2, const Vec2 p, float* out_depth)

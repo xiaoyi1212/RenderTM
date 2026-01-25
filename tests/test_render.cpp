@@ -1,7 +1,6 @@
 #include "test_prelude.hpp"
 
 import render;
-import noise;
 
 static void reset_camera()
 {
@@ -235,81 +234,6 @@ static double average_luminance_delta_masked(const std::vector<uint32_t>& a,
     return sum / static_cast<double>(count);
 }
 
-static std::array<int, 512> make_permutation(const int seed)
-{
-    std::array<int, 256> p{};
-    std::iota(p.begin(), p.end(), 0);
-    std::mt19937 rng(static_cast<uint32_t>(seed));
-    std::shuffle(p.begin(), p.end(), rng);
-    std::array<int, 512> perm{};
-    for (size_t i = 0; i < perm.size(); ++i)
-    {
-        perm[i] = p[i & 255];
-    }
-    return perm;
-}
-
-static double simplex_noise(const double xin, const double yin)
-{
-    static const std::array<int, 512> perm = make_permutation(1337);
-    static constexpr int grad2[8][2] = {
-        {1, 0}, {-1, 0}, {0, 1}, {0, -1},
-        {1, 1}, {-1, 1}, {1, -1}, {-1, -1}
-    };
-
-    static constexpr double f2 = 0.366025403784438646;
-    static constexpr double g2 = 0.211324865405187117;
-
-    const double s = (xin + yin) * f2;
-    const int i = static_cast<int>(std::floor(xin + s));
-    const int j = static_cast<int>(std::floor(yin + s));
-    const double t = (i + j) * g2;
-    const double x0 = xin - (static_cast<double>(i) - t);
-    const double y0 = yin - (static_cast<double>(j) - t);
-
-    const int i1 = (x0 > y0) ? 1 : 0;
-    const int j1 = (x0 > y0) ? 0 : 1;
-
-    const double x1 = x0 - static_cast<double>(i1) + g2;
-    const double y1 = y0 - static_cast<double>(j1) + g2;
-    const double x2 = x0 - 1.0 + 2.0 * g2;
-    const double y2 = y0 - 1.0 + 2.0 * g2;
-
-    const int ii = i & 255;
-    const int jj = j & 255;
-
-    auto grad_dot = [&](int hash, double x, double y) {
-        const int* g = grad2[hash & 7];
-        return static_cast<double>(g[0]) * x + static_cast<double>(g[1]) * y;
-    };
-
-    double n0 = 0.0;
-    double t0 = 0.5 - x0 * x0 - y0 * y0;
-    if (t0 > 0.0)
-    {
-        t0 *= t0;
-        n0 = t0 * t0 * grad_dot(perm[ii + perm[jj]], x0, y0);
-    }
-
-    double n1 = 0.0;
-    double t1 = 0.5 - x1 * x1 - y1 * y1;
-    if (t1 > 0.0)
-    {
-        t1 *= t1;
-        n1 = t1 * t1 * grad_dot(perm[ii + i1 + perm[jj + j1]], x1, y1);
-    }
-
-    double n2 = 0.0;
-    double t2 = 0.5 - x2 * x2 - y2 * y2;
-    if (t2 > 0.0)
-    {
-        t2 *= t2;
-        n2 = t2 * t2 * grad_dot(perm[ii + 1 + perm[jj + 1]], x2, y2);
-    }
-
-    return 70.0 * (n0 + n1 + n2);
-}
-
 static void build_heightmap(std::vector<int>& heights, std::vector<uint32_t>& top_colors)
 {
     const int chunk_size = 16;
@@ -332,14 +256,14 @@ static void build_heightmap(std::vector<int>& heights, std::vector<uint32_t>& to
     {
         for (int x = 0; x < chunk_size; ++x)
         {
-            const double h = simplex_noise(x * height_freq, z * height_freq);
+            const double h = SimplexNoise::sample(x * height_freq, z * height_freq);
             int height = base_height + static_cast<int>(std::lround((h + 1.0) * 0.5 * height_variation));
             if (height < 3)
             {
                 height = 3;
             }
 
-            const double surface = simplex_noise(x * surface_freq + 100.0, z * surface_freq - 100.0);
+            const double surface = SimplexNoise::sample(x * surface_freq + 100.0, z * surface_freq - 100.0);
             uint32_t top_color = grass_color;
             if (surface > 0.55)
             {
@@ -1035,7 +959,7 @@ static uint32_t expected_gamma_luminance(uint32_t albedo, float intensity)
 
 TEST_CASE("blue noise sampling responds to salt and frame")
 {
-    const float base = sample_noise(5, 7, 0, 0);
+    const float base = BlueNoise::sample(5, 7, 0, 0);
     REQUIRE(base >= 0.0f);
     REQUIRE(base < 1.0f);
 
@@ -1046,9 +970,9 @@ TEST_CASE("blue noise sampling responds to salt and frame")
     {
         for (int x = 0; x < 8; ++x)
         {
-            const float a = sample_noise(x, y, 0, 0);
-            const float b = sample_noise(x, y, 0, 1);
-            const float c = sample_noise(x, y, 1, 0);
+            const float a = BlueNoise::sample(x, y, 0, 0);
+            const float b = BlueNoise::sample(x, y, 0, 1);
+            const float c = BlueNoise::sample(x, y, 1, 0);
             if (a == b) same_salt++;
             if (a == c) same_frame++;
             total++;

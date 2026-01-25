@@ -19,7 +19,7 @@ export struct TerminalRender
     static void update_size(int sig);
     static void submit_frame();
     static void output_loop(std::stop_token token);
-    static TerminalSize size();
+    static auto size() -> TerminalSize; 
 };
 
 namespace {
@@ -366,7 +366,7 @@ void TerminalRender::shutdown() {
     stdout_mode.restore();
 }
 
-TerminalSize TerminalRender::size() {
+auto TerminalRender::size() -> TerminalSize {
     return {
         raw_width.load(std::memory_order_relaxed),
         raw_height.load(std::memory_order_relaxed)

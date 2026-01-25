@@ -17,9 +17,11 @@
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <numbers>
 #include <numeric>
 #include <optional>
 #include <random>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>

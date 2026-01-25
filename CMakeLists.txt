@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 4.0)
 project(RenderTM)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 
 include(CTest)
 include(FetchContent)
@@ -13,11 +14,13 @@ target_sources(core
     src/controls.cppm
     src/input.cppm
     src/keyboard.cppm
-    src/render.cppm
     src/terminal.cppm
-    src/noise.cppm
+    src/render/math.cppm
+    src/render/noise.cppm
+    src/render/terrain.cppm
+    src/render/render.cppm
 )
-target_compile_features(core PUBLIC cxx_std_23)
+target_compile_features(core PUBLIC cxx_std_26)
 target_compile_options(core PRIVATE
     "$<$<CONFIG:Release>:-O3>"
     "$<$<CONFIG:Release>:-ffast-math>"
