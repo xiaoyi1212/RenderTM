@@ -11,8 +11,7 @@ export struct KeyboardMode
 
     KeyboardMode(const KeyboardMode&) = delete;
     KeyboardMode& operator=(const KeyboardMode&) = delete;
-
-    std::optional<unsigned char> read_char() const;
+    auto read_char() const -> std::optional<unsigned char>;
 
     struct termios original_termios_{};
     int original_flags_ = -1;
@@ -54,7 +53,7 @@ KeyboardMode::~KeyboardMode()
     configured_ = false;
 }
 
-std::optional<unsigned char> KeyboardMode::read_char() const
+auto KeyboardMode::read_char() const -> std::optional<unsigned char>
 {
     unsigned char ch = 0;
     const ssize_t count = read(STDIN_FILENO, &ch, 1);

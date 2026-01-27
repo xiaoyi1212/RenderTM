@@ -35,7 +35,7 @@ TEST_CASE("key_to_action maps camera movement keys")
 TEST_CASE("parse_sgr_mouse parses motion event")
 {
     const auto result = InputParser::parse_sgr_mouse(std::string_view("\x1b[<35;12;8M"));
-    REQUIRE(result.result == MouseParseResult::Parsed);
+    REQUIRE(result.result == ParseResult::Parsed);
     REQUIRE(result.consumed == 11);
     REQUIRE(result.event.x == 12);
     REQUIRE(result.event.y == 8);
@@ -45,52 +45,74 @@ TEST_CASE("parse_sgr_mouse parses motion event")
 TEST_CASE("parse_sgr_mouse detects incomplete sequence")
 {
     const auto result = InputParser::parse_sgr_mouse(std::string_view("\x1b[<35;12;"));
-    REQUIRE(result.result == MouseParseResult::NeedMore);
+    REQUIRE(result.result == ParseResult::NeedMore);
 }
 
 TEST_CASE("parse_sgr_mouse rejects non-mouse input")
 {
     const auto result = InputParser::parse_sgr_mouse(std::string_view("abc"));
-    REQUIRE(result.result == MouseParseResult::Invalid);
+    REQUIRE(result.result == ParseResult::Invalid);
 }
 
 TEST_CASE("parse_csi_key parses arrow keys")
 {
     const auto up = InputParser::parse_csi_key(std::string_view("\x1b[A"));
-    REQUIRE(up.result == InputParseResult::Parsed);
+    REQUIRE(up.result == ParseResult::Parsed);
     REQUIRE(up.consumed == 3);
     REQUIRE(up.action == InputAction::MoveForward);
 
     const auto down = InputParser::parse_csi_key(std::string_view("\x1b[B"));
-    REQUIRE(down.result == InputParseResult::Parsed);
+    REQUIRE(down.result == ParseResult::Parsed);
     REQUIRE(down.action == InputAction::MoveBackward);
 
     const auto right = InputParser::parse_csi_key(std::string_view("\x1b[C"));
-    REQUIRE(right.result == InputParseResult::Parsed);
+    REQUIRE(right.result == ParseResult::Parsed);
     REQUIRE(right.action == InputAction::MoveRight);
 
     const auto left = InputParser::parse_csi_key(std::string_view("\x1b[D"));
-    REQUIRE(left.result == InputParseResult::Parsed);
+    REQUIRE(left.result == ParseResult::Parsed);
     REQUIRE(left.action == InputAction::MoveLeft);
 }
 
 TEST_CASE("parse_csi_key handles incomplete sequence")
 {
     const auto result = InputParser::parse_csi_key(std::string_view("\x1b["));
-    REQUIRE(result.result == InputParseResult::NeedMore);
+    REQUIRE(result.result == ParseResult::NeedMore);
 }
 
 TEST_CASE("mouse_look_velocity respects deadzone")
 {
-    const auto delta = InputParser::mouse_look_velocity(40, 12, 80, 24, 2, 1.0);
+    const auto delta = InputParser::mouse_look_velocity({
+        .mouse_x = 40,
+        .mouse_y = 12,
+        .term_width = 80,
+        .term_height = 24,
+        .deadzone_radius = 2,
+        .max_speed = 1.0
+    });
+
     REQUIRE(delta.yaw == Catch::Approx(0.0));
     REQUIRE(delta.pitch == Catch::Approx(0.0));
 }
 
 TEST_CASE("mouse_look_velocity scales with distance and direction")
 {
-    const auto near = InputParser::mouse_look_velocity(38, 8, 80, 24, 2, 1.0);
-    const auto far = InputParser::mouse_look_velocity(1, 1, 80, 24, 2, 1.0);
+    MouseLookParams params {
+        .mouse_x = 0,
+        .mouse_y = 0,
+        .term_width = 80,
+        .term_height = 24,
+        .deadzone_radius = 2,
+        .max_speed = 1.0
+    };
+
+    params.mouse_x = 38;
+    params.mouse_y = 8;
+    const auto near = InputParser::mouse_look_velocity(params);
+
+    params.mouse_x = 1;
+    params.mouse_y = 1;
+    const auto far = InputParser::mouse_look_velocity(params);
 
     REQUIRE(near.yaw < 0.0);
     REQUIRE(near.pitch > 0.0);

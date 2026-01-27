@@ -18,14 +18,7 @@ export enum class InputAction
     MoveDown
 };
 
-export enum class MouseParseResult
-{
-    Parsed,
-    NeedMore,
-    Invalid
-};
-
-export enum class InputParseResult
+export enum class ParseResult
 {
     Parsed,
     NeedMore,
@@ -34,23 +27,23 @@ export enum class InputParseResult
 
 export struct MouseEvent
 {
-    int button;
-    int x;
-    int y;
-    bool motion;
-    bool pressed;
+    int button = 0;
+    int x = 0;
+    int y = 0;
+    bool motion = false;
+    bool pressed = false;
 };
 
 export struct MouseParse
 {
-    MouseParseResult result = MouseParseResult::Invalid;
+    ParseResult result = ParseResult::Invalid;
     size_t consumed = 0;
     MouseEvent event{};
 };
 
 export struct InputParse
 {
-    InputParseResult result = InputParseResult::Invalid;
+    ParseResult result = ParseResult::Invalid;
     size_t consumed = 0;
     InputAction action = InputAction::None;
 };
@@ -61,16 +54,26 @@ export struct MouseLookDelta
     double pitch;
 };
 
-export struct InputParser
+export struct MouseLookParams
 {
-    static InputAction key_to_action(int ch);
-    static MouseParse parse_sgr_mouse(std::string_view buffer);
-    static InputParse parse_csi_key(std::string_view buffer);
-    static MouseLookDelta mouse_look_velocity(int mouse_x, int mouse_y, int width, int height,
-                                              int deadzone_radius, double max_speed);
+    int mouse_x;
+    int mouse_y;
+    int term_width;
+    int term_height;
+    int deadzone_radius;
+    double max_speed;
 };
 
-InputAction InputParser::key_to_action(const int ch)
+export struct InputParser
+{
+    static auto key_to_action(const int ch) -> InputAction;
+    static auto parse_sgr_mouse(const std::string_view buffer) -> MouseParse;
+    static auto parse_csi_key(const std::string_view buffer) -> InputParse;
+    static auto mouse_look_velocity(const MouseLookParams& params) -> MouseLookDelta;
+};
+
+[[nodiscard]]
+auto InputParser::key_to_action(const int ch) -> InputAction
 {
     if (ch < 0)
     {
@@ -98,56 +101,60 @@ struct ParseCursor
     std::string_view buffer;
     size_t idx = 0;
 
-    bool has(size_t count = 1) const
+    [[nodiscard]]
+    constexpr auto has(size_t count = 1) const -> bool
     {
         return idx + count <= buffer.size();
     }
 
-    MouseParseResult parse_int(int& value)
+    [[nodiscard]]
+    auto parse_int(int& value) -> ParseResult
     {
         if (!has())
         {
-            return MouseParseResult::NeedMore;
+            return ParseResult::NeedMore;
         }
         const char* begin = buffer.data() + idx;
         const char* end = buffer.data() + buffer.size();
         const auto result = std::from_chars(begin, end, value);
         if (result.ptr == begin)
         {
-            return MouseParseResult::Invalid;
+            return ParseResult::Invalid;
         }
         idx = static_cast<size_t>(result.ptr - buffer.data());
-        return MouseParseResult::Parsed;
+        return ParseResult::Parsed;
     }
 
-    MouseParseResult expect(char ch)
+    [[nodiscard]]
+    constexpr auto expect(char ch) -> ParseResult
     {
         if (!has())
         {
-            return MouseParseResult::NeedMore;
+            return ParseResult::NeedMore;
         }
         if (buffer[idx] != ch)
         {
-            return MouseParseResult::Invalid;
+            return ParseResult::Invalid;
         }
         ++idx;
-        return MouseParseResult::Parsed;
+        return ParseResult::Parsed;
     }
 };
 
 } // namespace
 
-MouseParse InputParser::parse_sgr_mouse(const std::string_view buffer)
+[[nodiscard]]
+auto InputParser::parse_sgr_mouse(const std::string_view buffer) -> MouseParse
 {
     MouseParse parsed{};
     if (buffer.size() < 3)
     {
-        parsed.result = MouseParseResult::NeedMore;
+        parsed.result = ParseResult::NeedMore;
         return parsed;
     }
     if (buffer[0] != '\x1b' || buffer[1] != '[' || buffer[2] != '<')
     {
-        parsed.result = MouseParseResult::Invalid;
+        parsed.result = ParseResult::Invalid;
         return parsed;
     }
 
@@ -156,51 +163,51 @@ MouseParse InputParser::parse_sgr_mouse(const std::string_view buffer)
     int x = 0;
     int y = 0;
 
-    MouseParseResult result = cursor.parse_int(button);
-    if (result != MouseParseResult::Parsed)
+    ParseResult result = cursor.parse_int(button);
+    if (result != ParseResult::Parsed)
     {
         parsed.result = result;
         return parsed;
     }
     result = cursor.expect(';');
-    if (result != MouseParseResult::Parsed)
+    if (result != ParseResult::Parsed)
     {
         parsed.result = result;
         return parsed;
     }
     result = cursor.parse_int(x);
-    if (result != MouseParseResult::Parsed)
+    if (result != ParseResult::Parsed)
     {
         parsed.result = result;
         return parsed;
     }
     result = cursor.expect(';');
-    if (result != MouseParseResult::Parsed)
+    if (result != ParseResult::Parsed)
     {
         parsed.result = result;
         return parsed;
     }
     result = cursor.parse_int(y);
-    if (result != MouseParseResult::Parsed)
+    if (result != ParseResult::Parsed)
     {
         parsed.result = result;
         return parsed;
     }
     if (!cursor.has())
     {
-        parsed.result = MouseParseResult::NeedMore;
+        parsed.result = ParseResult::NeedMore;
         return parsed;
     }
 
     const char terminator = buffer[cursor.idx];
     if (terminator != 'M' && terminator != 'm')
     {
-        parsed.result = MouseParseResult::Invalid;
+        parsed.result = ParseResult::Invalid;
         return parsed;
     }
     ++cursor.idx;
 
-    parsed.result = MouseParseResult::Parsed;
+    parsed.result = ParseResult::Parsed;
     parsed.consumed = cursor.idx;
     parsed.event.button = button;
     parsed.event.x = x;
@@ -210,80 +217,71 @@ MouseParse InputParser::parse_sgr_mouse(const std::string_view buffer)
     return parsed;
 }
 
-InputParse InputParser::parse_csi_key(const std::string_view buffer)
+[[nodiscard]]
+auto InputParser::parse_csi_key(const std::string_view buffer) -> InputParse
 {
     InputParse parsed{};
     if (buffer.size() < 2)
     {
-        parsed.result = InputParseResult::NeedMore;
+        parsed.result = ParseResult::NeedMore;
         return parsed;
     }
     if (buffer[0] != '\x1b' || buffer[1] != '[')
     {
-        parsed.result = InputParseResult::Invalid;
+        parsed.result = ParseResult::Invalid;
         return parsed;
     }
     if (buffer.size() < 3)
     {
-        parsed.result = InputParseResult::NeedMore;
+        parsed.result = ParseResult::NeedMore;
         return parsed;
     }
     InputAction action = InputAction::None;
     switch (buffer[2])
     {
-        case 'A':
-            action = InputAction::MoveForward;
-            break;
-        case 'B':
-            action = InputAction::MoveBackward;
-            break;
-        case 'C':
-            action = InputAction::MoveRight;
-            break;
-        case 'D':
-            action = InputAction::MoveLeft;
-            break;
+        case 'A': action = InputAction::MoveForward; break;
+        case 'B': action = InputAction::MoveBackward; break;
+        case 'C': action = InputAction::MoveRight; break;
+        case 'D': action = InputAction::MoveLeft; break;
         default:
-            parsed.result = InputParseResult::Invalid;
+            parsed.result = ParseResult::Invalid;
             return parsed;
     }
-    parsed.result = InputParseResult::Parsed;
+    parsed.result = ParseResult::Parsed;
     parsed.consumed = 3;
     parsed.action = action;
     return parsed;
 }
 
-MouseLookDelta InputParser::mouse_look_velocity(const int mouse_x, const int mouse_y,
-                                                const int width, const int height,
-                                                const int deadzone_radius, const double max_speed)
+[[nodiscard]]
+auto InputParser::mouse_look_velocity(const MouseLookParams& params) -> MouseLookDelta
 {
-    if (width <= 0 || height <= 0 || max_speed <= 0.0)
+    if (params.term_width <= 0 || params.term_height <= 0 || params.max_speed <= 0.0)
     {
         return {0.0, 0.0};
     }
 
-    const double center_x = (static_cast<double>(width) + 1.0) * 0.5;
-    const double center_y = (static_cast<double>(height) + 1.0) * 0.5;
-    const double dx = static_cast<double>(mouse_x) - center_x;
-    const double dy = static_cast<double>(mouse_y) - center_y;
+    const double center_x = (static_cast<double>(params.term_width) + 1.0) * 0.5;
+    const double center_y = (static_cast<double>(params.term_height) + 1.0) * 0.5;
+    const double dx = static_cast<double>(params.mouse_x) - center_x;
+    const double dy = static_cast<double>(params.mouse_y) - center_y;
 
-    if (std::abs(dx) <= deadzone_radius && std::abs(dy) <= deadzone_radius)
+    if (std::abs(dx) <= params.deadzone_radius && std::abs(dy) <= params.deadzone_radius)
     {
         return {0.0, 0.0};
     }
 
-    const double max_dx = std::max(center_x - 1.0, static_cast<double>(width) - center_x);
-    const double max_dy = std::max(center_y - 1.0, static_cast<double>(height) - center_y);
-    const double avail_x = max_dx - static_cast<double>(deadzone_radius);
-    const double avail_y = max_dy - static_cast<double>(deadzone_radius);
-    if (avail_x <= 0.0 || avail_y <= 0.0)
-    {
-        return {0.0, 0.0};
-    }
+    const double max_dx = std::max(center_x - 1.0, static_cast<double>(params.term_width) - center_x);
+    const double max_dy = std::max(center_y - 1.0, static_cast<double>(params.term_height) - center_y);
+    const double avail_x = max_dx - static_cast<double>(params.deadzone_radius);
+    const double avail_y = max_dy - static_cast<double>(params.deadzone_radius);
+    
+    if (avail_x <= 0.0 || avail_y <= 0.0) return {0.0, 0.0};
 
-    const double mag_x = std::clamp((std::abs(dx) - deadzone_radius) / avail_x, 0.0, 1.0);
-    const double mag_y = std::clamp((std::abs(dy) - deadzone_radius) / avail_y, 0.0, 1.0);
-    const double yaw = std::copysign(mag_x * max_speed, dx);
-    const double pitch = -std::copysign(mag_y * max_speed, dy);
+    const double mag_x = std::clamp((std::abs(dx) - params.deadzone_radius) / avail_x, 0.0, 1.0);
+    const double mag_y = std::clamp((std::abs(dy) - params.deadzone_radius) / avail_y, 0.0, 1.0);
+    const double yaw = std::copysign(mag_x * params.max_speed, dx);
+    const double pitch = -std::copysign(mag_y * params.max_speed, dy);
+
     return {yaw, pitch};
 }

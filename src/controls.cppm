@@ -20,7 +20,7 @@ export struct MoveIntent
     Vec3 delta;
 
     [[nodiscard]]
-    static constexpr auto from_action(InputAction action, double step, double yaw) -> MoveIntent
+    static auto from_action(InputAction action, double step, double yaw) -> MoveIntent
     {
         switch (action)
         {
@@ -29,6 +29,12 @@ export struct MoveIntent
 
             case InputAction::MoveBackward:
                 return {MoveSpace::Local, {0.0, 0.0, -step}};
+
+            case InputAction::MoveUp:
+                return {MoveSpace::World, {0.0, -step, 0.0}};
+
+            case InputAction::MoveDown:
+                return {MoveSpace::World, {0.0, step, 0.0}};
 
             case InputAction::MoveLeft:
             case InputAction::MoveRight:
@@ -39,16 +45,9 @@ export struct MoveIntent
                 return {MoveSpace::World, {dir * step * cy, 0.0, -dir * step * sy}};
             }
 
-            case InputAction::MoveUp:
-                return {MoveSpace::World, {0.0, -step, 0.0}};
-
-            case InputAction::MoveDown:
-                return {MoveSpace::World, {0.0, step, 0.0}};
-
             case InputAction::None:
             case InputAction::Quit:
-            case InputAction::TogglePause:
-                break;
+            case InputAction::TogglePause: break;
         }
 
         return {MoveSpace::None, {}};

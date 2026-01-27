@@ -76,12 +76,15 @@ private:
 
 struct RenderThreads
 {
-    RenderThreads():
+    explicit RenderThreads(RenderEngine& engine):
         output_thread([](std::stop_token token) {
             TerminalRender::output_loop(token);
         }),
-        render_thread([](std::stop_token token) {
-            while (!token.stop_requested()) TerminalRender::submit_frame();
+        render_thread([&engine](std::stop_token token) {
+            while (!token.stop_requested())
+            {
+                TerminalRender::submit_frame(engine);
+            }
         })
     {}
 
@@ -160,8 +163,8 @@ private:
                 view.remove_prefix(offset);
 
                 const MouseParse mouse_result = InputParser::parse_sgr_mouse(view);
-                if (mouse_result.result == MouseParseResult::NeedMore) break;
-                if (mouse_result.result == MouseParseResult::Parsed)
+                if (mouse_result.result == ParseResult::NeedMore) break;
+                if (mouse_result.result == ParseResult::Parsed)
                 {
                     offset += mouse_result.consumed;
                     mouse_pos = MousePos{mouse_result.event.x, mouse_result.event.y};
@@ -169,8 +172,8 @@ private:
                 }
 
                 const InputParse key_result = InputParser::parse_csi_key(view);
-                if (key_result.result == InputParseResult::NeedMore) break;
-                if (key_result.result == InputParseResult::Parsed)
+                if (key_result.result == ParseResult::NeedMore) break;
+                if (key_result.result == ParseResult::Parsed)
                 {
                     offset += key_result.consumed;
                     if (!handle_action(key_result.action)) return false;
@@ -196,21 +199,21 @@ private:
         auto perform_movement = [&](const MoveIntent& move)
         {
             if (move.space == MoveSpace::Local)
-                render_move_camera_local(move.delta);
+                engine.move_camera_local(move.delta);
             else if (move.space == MoveSpace::World)
-                render_move_camera(move.delta);
+                engine.move_camera(move.delta);
         };
 
         switch (action)
         {
             case InputAction::Quit: return false;
             case InputAction::None: return true;
-            case InputAction::TogglePause: render_toggle_pause(); return true;
+            case InputAction::TogglePause: engine.toggle_pause(); return true;
             case InputAction::ToggleGI: toggle_gi(); return true;
             default: break;
         }
 
-        const Vec2 rot = render_get_camera_rotation();
+        const Vec2 rot = engine.get_camera_rotation();
         perform_movement(MoveIntent::from_action(action, kMoveStep, rot.x));
         return true;
     }
@@ -236,36 +239,37 @@ private:
 
         const int max_x = static_cast<int>(term_size.width);
         const int max_y = static_cast<int>(term_size.height - 1);
-        
-        const int mouse_x = clamp_pos(mouse_pos->x, 1, max_x);
-        const int mouse_y = clamp_pos(mouse_pos->y - 1, 1, max_y);
 
-        const MouseLookDelta velocity = InputParser::mouse_look_velocity(
-            mouse_x, mouse_y,
-            max_x,
-            max_y,
-            kMouseDeadzone,
-            kMouseMaxSpeed
-        );
+        const MouseLookParams look_params{
+            .mouse_x = clamp_pos(mouse_pos->x, 1, max_x),
+            .mouse_y = clamp_pos(mouse_pos->y - 1, 1, max_y),
+            .term_width = max_x,
+            .term_height = max_y,
+            .deadzone_radius = kMouseDeadzone,
+            .max_speed = kMouseMaxSpeed
+        };
+
+        const MouseLookDelta velocity = InputParser::mouse_look_velocity(look_params);
 
         if (velocity.yaw != 0.0 || velocity.pitch != 0.0)
         {
-            render_rotate_camera({velocity.yaw * dt, velocity.pitch * dt});
+            engine.rotate_camera({velocity.yaw * dt, velocity.pitch * dt});
         }
     }
 
-    auto toggle_gi() const -> void
+    auto toggle_gi() -> void
     {
-        const bool enabled = render_get_gi_enabled();
-        render_set_gi_enabled(!enabled);
-        if (!enabled && render_get_gi_strength() <= 0.0)
+        const bool enabled = engine.get_gi_enabled();
+        engine.set_gi_enabled(!enabled);
+        if (!enabled && engine.get_gi_strength() <= 0.0)
         {
-            render_set_gi_strength(1.0);
+            engine.set_gi_strength(1.0);
         }
     }
 
+    RenderEngine engine;
     TerminalSession session;
-    RenderThreads threads;
+    RenderThreads threads{engine};
     std::string input_buffer;
     std::optional<MousePos> mouse_pos;
     std::chrono::steady_clock::time_point last_look_time = std::chrono::steady_clock::now();

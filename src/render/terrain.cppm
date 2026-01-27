@@ -88,7 +88,7 @@ static double radical_inverse_vdc(uint32_t bits)
     return static_cast<double>(bits) * 2.3283064365386963e-10;
 }
 
-static const std::array<Vec3, kSkyRayCount>& sky_sample_dirs()
+static auto sky_sample_dirs() -> const std::array<Vec3, kSkyRayCount>&
 {
     static const std::array<Vec3, kSkyRayCount> dirs = [] {
         std::array<Vec3, kSkyRayCount> samples{};

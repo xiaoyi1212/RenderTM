@@ -17,7 +17,7 @@ export struct TerminalRender
     static void init();
     static void shutdown();
     static void update_size(int sig);
-    static void submit_frame();
+    static void submit_frame(RenderEngine& engine);
     static void output_loop(std::stop_token token);
     static auto size() -> TerminalSize; 
 };
@@ -334,7 +334,7 @@ void TerminalRender::init() {
     (void)::write(STDOUT_FILENO, kEnterAlt.data(), kEnterAlt.size());
 }
 
-void TerminalRender::submit_frame() {
+void TerminalRender::submit_frame(RenderEngine& engine) {
     const size_t term_width = raw_width.load(std::memory_order_relaxed);
     const size_t term_height = raw_height.load(std::memory_order_relaxed);
     if (term_width == 0 || term_height < 2) return;
@@ -347,16 +347,16 @@ void TerminalRender::submit_frame() {
 
     std::vector<uint32_t> framebuffer = frame_queue.take_recycled();
     if (framebuffer.size() != width * height) framebuffer.resize(width * height);
-    render_update_array(framebuffer.data(), width, height);
+    engine.update(framebuffer.data(), width, height);
 
     RenderFrame frame;
     frame.width = width;
     frame.height = height;
     frame.render_fps = render_fps;
-    frame.cam_pos = render_get_camera_position();
-    frame.cam_rot = render_get_camera_rotation();
-    frame.sharpen = render_debug_get_taa_sharpen_strength();
-    frame.sharpen_pct = render_debug_get_taa_sharpen_percent();
+    frame.cam_pos = engine.get_camera_position();
+    frame.cam_rot = engine.get_camera_rotation();
+    frame.sharpen = engine.taa_sharpen_strength();
+    frame.sharpen_pct = engine.taa_sharpen_percent();
     frame.pixels = std::move(framebuffer);
     frame_queue.submit(std::move(frame));
 }
@@ -394,7 +394,7 @@ void TerminalRender::output_loop(std::stop_token token) {
     while (true) {
         const bool had_pending = output_writer.has_pending();
         if (!output_writer.flush()) {
-            usleep(1000);
+            std::this_thread::sleep_for(std::chrono::microseconds(1000));
             continue;
         }
         if (had_pending) {

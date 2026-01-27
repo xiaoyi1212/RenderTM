@@ -4,6 +4,79 @@ module;
 
 export module render:math;
 
+export template<bool IsLinear>
+struct ColorBase {
+    float r, g, b;
+
+    using Color = ColorBase;
+    using OtherColor = ColorBase<!IsLinear>;
+
+    [[nodiscard]]
+    constexpr auto to_srgb() const -> OtherColor
+    requires (IsLinear) {
+        auto convert = [](float c) -> float {
+            c = std::clamp(c, 0.0f, 1.0f);
+            float res = (c <= 0.0031308f)
+                ? (c * 12.92f)
+                : (1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f);
+            return res * 255.0f;
+        };
+        return { convert(r), convert(g), convert(b) };
+    }
+
+    [[nodiscard]]
+    constexpr auto to_linear() const -> OtherColor
+    requires (!IsLinear) {
+        auto convert = [](float c) -> float {
+            c /= 255.0f;
+            if (c <= 0.04045f) return c / 12.92f;
+            return std::pow((c + 0.055f) / 1.055f, 2.4f);
+        };
+        return { convert(r), convert(g), convert(b) };
+    }
+
+    [[nodiscard]]
+    constexpr auto operator+(const Color& rhs) const -> Color
+    {
+        return {r + rhs.r, g + rhs.g, b + rhs.b};
+    }
+
+    [[nodiscard]]
+    constexpr auto operator*(const Color& rhs) const -> Color
+    {
+        return {r * rhs.r, g * rhs.g, b * rhs.b};
+    }
+
+    [[nodiscard]]
+    constexpr auto operator*(const float scale) const -> Color
+    {
+        return {r * scale, g * scale, b * scale};
+    }
+
+    [[nodiscard]]
+    static constexpr auto from_hex(uint32_t hex) -> Color
+    requires (!IsLinear) {
+        return {
+            static_cast<float>((hex >> 16) & 0xFF),
+            static_cast<float>((hex >> 8) & 0xFF),
+            static_cast<float>(hex & 0xFF)
+        };
+    }
+
+    [[nodiscard]]
+    static constexpr auto lerp(const Color& a, const Color& b, const float t) -> Color
+    {
+        return {
+            std::lerp(a.r, b.r, t),
+            std::lerp(a.g, b.g, t),
+            std::lerp(a.b, b.b, t)
+        };
+    }
+};
+
+export using LinearColor = ColorBase<true>;
+export using ColorSrgb   = ColorBase<false>;
+
 export struct Vec2
 {
     double x, y;
@@ -29,6 +102,12 @@ export struct Vec3
     constexpr auto operator+(const Vec3& rhs) const -> Vec3
     {
         return {x + rhs.x, y + rhs.y, z + rhs.z};
+    }
+
+    [[nodiscard]]
+    constexpr auto operator-(const Vec3& rhs) const -> Vec3
+    {
+        return {x - rhs.x, y - rhs.y, z - rhs.z};
     }
 
     [[nodiscard]]
@@ -68,51 +147,17 @@ export struct Vec3
         Vec3 up = n.cross(right);
         return {right, up, n};
     }
-};
-
-export template<bool IsLinear>
-struct ColorBase {
-    float r, g, b;
-
-    using OtherColor = ColorBase<!IsLinear>;
 
     [[nodiscard]]
-    constexpr auto to_srgb() const -> OtherColor
-    requires (IsLinear) {
-        auto convert = [](float c) -> float {
-            c = std::clamp(c, 0.0f, 1.0f);
-            float res = (c <= 0.0031308f)
-                ? (c * 12.92f)
-                : (1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f);
-            return res * 255.0f;
-        };
-        return { convert(r), convert(g), convert(b) };
-    }
-
-    [[nodiscard]]
-    constexpr auto to_linear() const -> OtherColor
-    requires (!IsLinear) {
-        auto convert = [](float c) -> float {
-            c /= 255.0f;
-            if (c <= 0.04045f) return c / 12.92f;
-            return std::pow((c + 0.055f) / 1.055f, 2.4f);
-        };
-        return { convert(r), convert(g), convert(b) };
-    }
-
-    [[nodiscard]]
-    static constexpr auto from_hex(uint32_t hex) -> ColorBase
-    requires (!IsLinear) {
+    static constexpr auto lerp(const Vec3& a, const Vec3& b, const double t) -> Vec3
+    {
         return {
-            static_cast<float>((hex >> 16) & 0xFF),
-            static_cast<float>((hex >> 8) & 0xFF),
-            static_cast<float>(hex & 0xFF)
+            std::lerp(a.x, b.x, t),
+            std::lerp(a.y, b.y, t),
+            std::lerp(a.z, b.z, t)
         };
     }
 };
-
-export using LinearColor = ColorBase<true>;
-export using ColorSrgb   = ColorBase<false>;
 
 export struct Mat4
 {

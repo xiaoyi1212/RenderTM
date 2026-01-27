@@ -2,25 +2,196 @@
 
 import render;
 
-static void reset_camera()
+namespace {
+bool terrain_vertex_sky_visibility(Terrain& terrain, const int x, const int y, const int z,
+                                   const int face, const int corner, float* out_visibility)
 {
-    render_set_camera_position({0.0, 0.0, -4.0});
-    render_set_camera_rotation({0.0, 0.0});
-    render_set_sky_top_color(0xFF78C2FF);
-    render_set_sky_bottom_color(0xFF172433);
-    render_set_sky_light_intensity(0.0);
-    render_set_ambient_occlusion_enabled(true);
-    render_set_sun_orbit_enabled(false);
-    render_set_sun_orbit_angle(0.0);
-    render_set_moon_direction({0.0, 1.0, 0.0});
-    render_set_moon_intensity(0.0);
-    render_set_shadow_enabled(true);
-    render_set_exposure(1.0);
-    render_set_taa_enabled(true);
-    render_set_taa_blend(0.2);
-    render_set_taa_clamp_enabled(true);
-    render_set_gi_enabled(false);
-    render_set_gi_strength(0.0);
+    if (!out_visibility)
+    {
+        return false;
+    }
+    terrain.generate();
+    const auto visibility = terrain.get_sky_visibility_at(x, y, z, face, corner);
+    if (!visibility)
+    {
+        return false;
+    }
+    *out_visibility = *visibility;
+    return true;
+}
+
+bool shadow_factor_at_point(Terrain& terrain, const LightingEngine& lighting, const World& world,
+                            const bool shadows_enabled, const Vec3 world_pos, const Vec3 normal,
+                            float* out_factor)
+{
+    if (!out_factor)
+    {
+        return false;
+    }
+    terrain.generate();
+    if (!shadows_enabled)
+    {
+        *out_factor = 1.0f;
+        return true;
+    }
+    const bool sun_orbit = world.sun.orbit_enabled;
+    const double base_intensity = world.sun.intensity;
+    Vec3 light_dir = world.sun.direction.normalize();
+    double sun_intensity = base_intensity;
+    if (sun_orbit)
+    {
+        light_dir = world.sun.orbit_direction(world.sun.orbit_angle);
+        const double visibility = world.sun.orbit_height(light_dir);
+        sun_intensity = base_intensity * visibility;
+    }
+    sun_intensity *= 1.2;
+    if (sun_intensity <= 0.0)
+    {
+        *out_factor = 1.0f;
+        return true;
+    }
+
+    *out_factor = lighting.compute_shadow_factor(terrain, light_dir, world_pos, normal.normalize());
+    return true;
+}
+
+Vec3 tonemap_reinhard_vec3(const Vec3 color, const double exposure_value)
+{
+    const float exposure_factor = static_cast<float>(std::max(0.0, exposure_value));
+    const LinearColor input{
+        static_cast<float>(color.x),
+        static_cast<float>(color.y),
+        static_cast<float>(color.z)
+    };
+    const LinearColor mapped = tonemap_reinhard(input, exposure_factor);
+    return {mapped.r, mapped.g, mapped.b};
+}
+
+Vec3 sample_history_bilinear(const Vec3* buffer, const size_t width, const size_t height,
+                             const Vec2 screen_coord)
+{
+    if (!buffer)
+    {
+        return {0.0, 0.0, 0.0};
+    }
+    const std::span<const Vec3> span(buffer, width * height);
+    return sample_bilinear_history_vec3(span, width, height, screen_coord.x, screen_coord.y);
+}
+
+bool depth_at_sample(const Vec3 v0, const Vec3 v1, const Vec3 v2, const Vec2 p, float* out_depth)
+{
+    if (!out_depth)
+    {
+        return false;
+    }
+    const ScreenVertex sv0{static_cast<float>(v0.x), static_cast<float>(v0.y), static_cast<float>(v0.z)};
+    const ScreenVertex sv1{static_cast<float>(v1.x), static_cast<float>(v1.y), static_cast<float>(v1.z)};
+    const ScreenVertex sv2{static_cast<float>(v2.x), static_cast<float>(v2.y), static_cast<float>(v2.z)};
+
+    const float area = Rasterizer::edge_function(sv0, sv1, sv2);
+    if (area == 0.0f)
+    {
+        return false;
+    }
+    const bool area_positive = area > 0.0f;
+    const ScreenVertex sp{static_cast<float>(p.x), static_cast<float>(p.y), 0.0f};
+
+    float w0 = Rasterizer::edge_function(sv1, sv2, sp);
+    float w1 = Rasterizer::edge_function(sv2, sv0, sp);
+    float w2 = Rasterizer::edge_function(sv0, sv1, sp);
+
+    if ((w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f && area_positive) ||
+        (w0 <= 0.0f && w1 <= 0.0f && w2 <= 0.0f && !area_positive))
+    {
+        w0 /= area;
+        w1 /= area;
+        w2 /= area;
+        const float inv_z0 = 1.0f / sv0.z;
+        const float inv_z1 = 1.0f / sv1.z;
+        const float inv_z2 = 1.0f / sv2.z;
+        const float inv_z = w0 * inv_z0 + w1 * inv_z1 + w2 * inv_z2;
+        if (inv_z <= 0.0f)
+        {
+            return false;
+        }
+        *out_depth = 1.0f / inv_z;
+        return true;
+    }
+    return false;
+}
+
+bool shadow_factor_with_frame(Terrain& terrain, const LightingEngine& lighting,
+                              const double angular_radius, const bool shadows_enabled,
+                              const Vec3 world_pos, const Vec3 normal, const Vec3 light_dir,
+                              const int pixel_x, const int pixel_y, const int frame,
+                              float* out_factor)
+{
+    if (!out_factor)
+    {
+        return false;
+    }
+    terrain.generate();
+    if (!shadows_enabled)
+    {
+        *out_factor = 1.0f;
+        return true;
+    }
+
+    const Vec3 dir = light_dir.normalize();
+
+    auto [right, up, forward] = Vec3::get_basis(dir);
+    (void)forward;
+
+    const double scale = std::tan(angular_radius);
+    const Vec3 right_scaled = {right.x * scale, right.y * scale, right.z * scale};
+    const Vec3 up_scaled    = {up.x * scale, up.y * scale, up.z * scale};
+
+    constexpr int kSunShadowSalt = 17;
+    const BlueNoise::Shift shift_u = BlueNoise::shift(frame, kSunShadowSalt);
+    const BlueNoise::Shift shift_v = BlueNoise::shift(frame, kSunShadowSalt + 1);
+    const Vec3 shadow_dir = lighting.jitter_shadow_direction(dir,
+                                                             right_scaled, up_scaled,
+                                                             pixel_x, pixel_y,
+                                                             shift_u, shift_v);
+
+    *out_factor = lighting.compute_shadow_factor(terrain, shadow_dir, world_pos, normal.normalize());
+    return true;
+}
+
+float shadow_filter(const LightingEngine& lighting, const float* mask, const float* depth, const Vec3* normals)
+{
+    if (!mask || !depth || !normals)
+    {
+        return 0.0f;
+    }
+    const float depth_max = std::numeric_limits<float>::max();
+    constexpr size_t kDebugShadowFilterSize = 3 * 3;
+    const std::span<const float> mask_span(mask, kDebugShadowFilterSize);
+    const std::span<const float> depth_span(depth, kDebugShadowFilterSize);
+    const std::span<const Vec3> normals_span(normals, kDebugShadowFilterSize);
+    return lighting.shadow_filter_at(mask_span, depth_span, normals_span, 3, 3, 1, 1, depth_max);
+}
+} // namespace
+
+static void reset_camera(RenderEngine& engine)
+{
+    engine.set_camera_position({0.0, 0.0, -4.0});
+    engine.set_camera_rotation({0.0, 0.0});
+    engine.set_sky_top_color(0xFF78C2FF);
+    engine.set_sky_bottom_color(0xFF172433);
+    engine.set_sky_light_intensity(0.0);
+    engine.set_ambient_occlusion_enabled(true);
+    engine.set_sun_orbit_enabled(false);
+    engine.set_sun_orbit_angle(0.0);
+    engine.set_moon_direction({0.0, 1.0, 0.0});
+    engine.set_moon_intensity(0.0);
+    engine.set_shadow_enabled(true);
+    engine.set_exposure(1.0);
+    engine.set_taa_enabled(true);
+    engine.set_taa_blend(0.2);
+    engine.set_taa_clamp_enabled(true);
+    engine.set_gi_enabled(false);
+    engine.set_gi_strength(0.0);
 }
 
 static Mat4 mat4_multiply(const Mat4& a, const Mat4& b)
@@ -95,7 +266,8 @@ static std::string mat4_to_string(const Mat4& m)
     return oss.str();
 }
 
-static Vec2 reproject_with_vp(const Mat4& vp, const Vec3 world, const size_t width, const size_t height)
+static Vec2 reproject_with_vp(const Mat4& vp, const Vec3 world, const size_t width, const size_t height,
+                              const double near_plane)
 {
     if (width == 0 || height == 0)
     {
@@ -105,8 +277,6 @@ static Vec2 reproject_with_vp(const Mat4& vp, const Vec3 world, const size_t wid
     const double clip_x = vp.m[0][0] * world.x + vp.m[0][1] * world.y + vp.m[0][2] * world.z + vp.m[0][3];
     const double clip_y = vp.m[1][0] * world.x + vp.m[1][1] * world.y + vp.m[1][2] * world.z + vp.m[1][3];
     const double clip_w = vp.m[3][0] * world.x + vp.m[3][1] * world.y + vp.m[3][2] * world.z + vp.m[3][3];
-    const double near_plane = render_get_near_plane();
-
     if (clip_w <= near_plane)
     {
         const double nan = std::numeric_limits<double>::quiet_NaN();
@@ -153,7 +323,8 @@ static bool is_finite_double(const double value)
 static float srgb_channel_to_linear(float channel);
 static float linear_channel_to_srgb(float channel);
 
-static uint32_t sky_color_for_row(size_t y, size_t height, uint32_t sky_top, uint32_t sky_bottom)
+static uint32_t sky_color_for_row(size_t y, size_t height, uint32_t sky_top, uint32_t sky_bottom,
+                                  double exposure)
 {
     const float t = height > 1 ? static_cast<float>(y) / static_cast<float>(height - 1) : 0.0f;
     const uint32_t r0 = (sky_top >> 16) & 0xFF;
@@ -171,10 +342,10 @@ static uint32_t sky_color_for_row(size_t y, size_t height, uint32_t sky_top, uin
     const float r_lin = r0_lin + (r1_lin - r0_lin) * t;
     const float g_lin = g0_lin + (g1_lin - g0_lin) * t;
     const float b_lin = b0_lin + (b1_lin - b0_lin) * t;
-    const float exposure = static_cast<float>(std::max(0.0, render_get_exposure()));
-    const float r_mapped = exposure <= 0.0f ? 0.0f : (r_lin * exposure) / (1.0f + r_lin * exposure);
-    const float g_mapped = exposure <= 0.0f ? 0.0f : (g_lin * exposure) / (1.0f + g_lin * exposure);
-    const float b_mapped = exposure <= 0.0f ? 0.0f : (b_lin * exposure) / (1.0f + b_lin * exposure);
+    const float exposure_f = static_cast<float>(std::max(0.0, exposure));
+    const float r_mapped = exposure_f <= 0.0f ? 0.0f : (r_lin * exposure_f) / (1.0f + r_lin * exposure_f);
+    const float g_mapped = exposure_f <= 0.0f ? 0.0f : (g_lin * exposure_f) / (1.0f + g_lin * exposure_f);
+    const float b_mapped = exposure_f <= 0.0f ? 0.0f : (b_lin * exposure_f) / (1.0f + b_lin * exposure_f);
     const uint32_t r = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(r_mapped) * 255.0f));
     const uint32_t g = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(g_mapped) * 255.0f));
     const uint32_t b = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(b_mapped) * 255.0f));
@@ -182,12 +353,12 @@ static uint32_t sky_color_for_row(size_t y, size_t height, uint32_t sky_top, uin
 }
 
 static size_t count_geometry_pixels(const std::vector<uint32_t>& framebuffer, size_t width, size_t height,
-                                    uint32_t sky_top, uint32_t sky_bottom)
+                                    uint32_t sky_top, uint32_t sky_bottom, double exposure)
 {
     size_t count = 0;
     for (size_t y = 0; y < height; ++y)
     {
-        const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom);
+        const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom, exposure);
         for (size_t x = 0; x < width; ++x)
         {
             if (framebuffer[y * width + x] != sky)
@@ -207,13 +378,14 @@ static uint32_t pixel_luminance(uint32_t color)
 static double average_luminance_delta_masked(const std::vector<uint32_t>& a,
                                              const std::vector<uint32_t>& b,
                                              size_t width, size_t height,
-                                             uint32_t sky_top, uint32_t sky_bottom)
+                                             uint32_t sky_top, uint32_t sky_bottom,
+                                             double exposure)
 {
     double sum = 0.0;
     size_t count = 0;
     for (size_t y = 0; y < height; ++y)
     {
-        const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom);
+        const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom, exposure);
         for (size_t x = 0; x < width; ++x)
         {
             const size_t idx = y * width + x;
@@ -854,7 +1026,7 @@ static bool colors_similar(uint32_t a, uint32_t b, int tolerance)
 
 static bool sample_average_luminance(const std::vector<uint32_t>& frame, size_t width, size_t height,
                                      int px, int py, uint32_t sky_top, uint32_t sky_bottom,
-                                     double& out_avg)
+                                     double exposure, double& out_avg)
 {
     const int radius = 4;
     double sum = 0.0;
@@ -862,7 +1034,7 @@ static bool sample_average_luminance(const std::vector<uint32_t>& frame, size_t 
     for (int dy = -radius; dy <= radius; ++dy)
     {
         const int y = std::clamp(py + dy, 0, static_cast<int>(height) - 1);
-        const uint32_t sky = sky_color_for_row(static_cast<size_t>(y), height, sky_top, sky_bottom);
+        const uint32_t sky = sky_color_for_row(static_cast<size_t>(y), height, sky_top, sky_bottom, exposure);
         for (int dx = -radius; dx <= radius; ++dx)
         {
             const int x = std::clamp(px + dx, 0, static_cast<int>(width) - 1);
@@ -886,7 +1058,7 @@ static bool sample_average_luminance(const std::vector<uint32_t>& frame, size_t 
 
 static bool sample_average_color(const std::vector<uint32_t>& frame, size_t width, size_t height,
                                  int px, int py, uint32_t sky_top, uint32_t sky_bottom,
-                                 double& out_r, double& out_g, double& out_b)
+                                 double exposure, double& out_r, double& out_g, double& out_b)
 {
     const int radius = 4;
     double sum_r = 0.0;
@@ -896,7 +1068,7 @@ static bool sample_average_color(const std::vector<uint32_t>& frame, size_t widt
     for (int dy = -radius; dy <= radius; ++dy)
     {
         const int y = std::clamp(py + dy, 0, static_cast<int>(height) - 1);
-        const uint32_t sky = sky_color_for_row(static_cast<size_t>(y), height, sky_top, sky_bottom);
+        const uint32_t sky = sky_color_for_row(static_cast<size_t>(y), height, sky_top, sky_bottom, exposure);
         for (int dx = -radius; dx <= radius; ++dx)
         {
             const int x = std::clamp(px + dx, 0, static_cast<int>(width) - 1);
@@ -942,15 +1114,15 @@ static float linear_channel_to_srgb(float channel)
     return 1.055f * std::pow(channel, 1.0f / 2.4f) - 0.055f;
 }
 
-static uint32_t expected_gamma_luminance(uint32_t albedo, float intensity)
+static uint32_t expected_gamma_luminance(uint32_t albedo, float intensity, double exposure)
 {
     const float r_lin = srgb_channel_to_linear(static_cast<float>((albedo >> 16) & 0xFF)) * intensity;
     const float g_lin = srgb_channel_to_linear(static_cast<float>((albedo >> 8) & 0xFF)) * intensity;
     const float b_lin = srgb_channel_to_linear(static_cast<float>(albedo & 0xFF)) * intensity;
-    const float exposure = static_cast<float>(std::max(0.0, render_get_exposure()));
-    const float r_mapped = exposure <= 0.0f ? 0.0f : (r_lin * exposure) / (1.0f + r_lin * exposure);
-    const float g_mapped = exposure <= 0.0f ? 0.0f : (g_lin * exposure) / (1.0f + g_lin * exposure);
-    const float b_mapped = exposure <= 0.0f ? 0.0f : (b_lin * exposure) / (1.0f + b_lin * exposure);
+    const float exposure_f = static_cast<float>(std::max(0.0, exposure));
+    const float r_mapped = exposure_f <= 0.0f ? 0.0f : (r_lin * exposure_f) / (1.0f + r_lin * exposure_f);
+    const float g_mapped = exposure_f <= 0.0f ? 0.0f : (g_lin * exposure_f) / (1.0f + g_lin * exposure_f);
+    const float b_mapped = exposure_f <= 0.0f ? 0.0f : (b_lin * exposure_f) / (1.0f + b_lin * exposure_f);
     const uint32_t r = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(r_mapped) * 255.0f));
     const uint32_t g = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(g_mapped) * 255.0f));
     const uint32_t b = static_cast<uint32_t>(std::lround(linear_channel_to_srgb(b_mapped) * 255.0f));
@@ -985,6 +1157,7 @@ TEST_CASE("blue noise sampling responds to salt and frame")
 
 TEST_CASE("shadow spatial filter applies cross blur with bilateral rejection")
 {
+    LightingEngine lighting;
     const std::array<float, 9> mask = {1.0f, 1.0f, 1.0f,
                                        1.0f, 0.0f, 1.0f,
                                        1.0f, 1.0f, 1.0f};
@@ -996,7 +1169,7 @@ TEST_CASE("shadow spatial filter applies cross blur with bilateral rejection")
         n = {0.0, 1.0, 0.0};
     }
 
-    const float baseline = render_debug_shadow_filter(mask.data(), depth_same.data(), normals_same.data());
+    const float baseline = shadow_filter(lighting, mask.data(), depth_same.data(), normals_same.data());
     REQUIRE(baseline == Catch::Approx(0.5f).margin(0.02f));
 
     std::array<float, 9> depth_far = depth_same;
@@ -1007,7 +1180,7 @@ TEST_CASE("shadow spatial filter applies cross blur with bilateral rejection")
             depth_far[i] = 50.0f;
         }
     }
-    const float depth_filtered = render_debug_shadow_filter(mask.data(), depth_far.data(), normals_same.data());
+    const float depth_filtered = shadow_filter(lighting, mask.data(), depth_far.data(), normals_same.data());
     REQUIRE(depth_filtered < baseline);
     REQUIRE(depth_filtered < 0.2f);
 
@@ -1019,43 +1192,47 @@ TEST_CASE("shadow spatial filter applies cross blur with bilateral rejection")
             normals_flipped[i] = {0.0, -1.0, 0.0};
         }
     }
-    const float normal_filtered = render_debug_shadow_filter(mask.data(), depth_same.data(), normals_flipped.data());
+    const float normal_filtered = shadow_filter(lighting, mask.data(), depth_same.data(), normals_flipped.data());
     REQUIRE(normal_filtered < baseline);
     REQUIRE(normal_filtered < 0.2f);
 }
 
-TEST_CASE("render_update_array clears framebuffer and draws geometry")
+TEST_CASE("RenderEngine update clears framebuffer and draws geometry")
 {
-    reset_camera();
-    render_set_paused(false);
-    render_set_light_direction({0.0, 0.0, -1.0});
-    render_set_light_intensity(1.0);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(false);
+    engine.set_light_direction({0.0, 0.0, -1.0});
+    engine.set_light_intensity(1.0);
     const size_t width = 120;
     const size_t height = 80;
 
     std::vector<uint32_t> framebuffer(width * height, 0xFFFFFFFF);
-    render_update_array(framebuffer.data(), width, height);
+    engine.update(framebuffer.data(), width, height);
 
     for (const uint32_t pixel : framebuffer)
     {
         REQUIRE((pixel & 0xFF000000u) == 0xFF000000u);
     }
 
-    const size_t colored = count_geometry_pixels(framebuffer, width, height, 0xFF78C2FF, 0xFF172433);
+    const size_t colored = count_geometry_pixels(framebuffer, width, height,
+                                                 0xFF78C2FF, 0xFF172433,
+                                                 engine.get_exposure());
     REQUIRE(colored > 0);
 }
 
-TEST_CASE("render_update_array handles tiny even-sized buffers")
+TEST_CASE("RenderEngine update handles tiny even-sized buffers")
 {
-    reset_camera();
-    render_set_paused(false);
-    render_set_light_direction({0.0, 0.0, 1.0});
-    render_set_light_intensity(1.0);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(false);
+    engine.set_light_direction({0.0, 0.0, 1.0});
+    engine.set_light_intensity(1.0);
     const size_t width = 2;
     const size_t height = 2;
 
     std::vector<uint32_t> framebuffer(width * height, 0xFFFFFFFF);
-    render_update_array(framebuffer.data(), width, height);
+    engine.update(framebuffer.data(), width, height);
 
     for (const uint32_t pixel : framebuffer)
     {
@@ -1065,47 +1242,49 @@ TEST_CASE("render_update_array handles tiny even-sized buffers")
 
 TEST_CASE("pause stops sun orbit but keeps rendering active")
 {
-    reset_camera();
+    RenderEngine engine;
+    reset_camera(engine);
     const size_t width = 64;
     const size_t height = 64;
 
-    render_set_light_direction({0.0, 0.0, 1.0});
-    render_set_light_intensity(1.0);
-    render_set_sun_orbit_enabled(true);
-    render_set_sun_orbit_angle(0.5);
+    engine.set_light_direction({0.0, 0.0, 1.0});
+    engine.set_light_intensity(1.0);
+    engine.set_sun_orbit_enabled(true);
+    engine.set_sun_orbit_angle(0.5);
 
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    render_set_paused(false);
+    engine.set_paused(false);
     for (int i = 0; i < 4; ++i)
     {
-        render_update_array(framebuffer.data(), width, height);
+        engine.update(framebuffer.data(), width, height);
     }
-    const double moved_angle = render_get_sun_orbit_angle();
+    const double moved_angle = engine.get_sun_orbit_angle();
     REQUIRE(std::abs(moved_angle - 0.5) > 1e-4);
 
-    render_set_paused(true);
-    const double paused_angle = render_get_sun_orbit_angle();
+    engine.set_paused(true);
+    const double paused_angle = engine.get_sun_orbit_angle();
     for (int i = 0; i < 4; ++i)
     {
-        render_update_array(framebuffer.data(), width, height);
+        engine.update(framebuffer.data(), width, height);
     }
-    render_set_paused(false);
+    engine.set_paused(false);
 
-    REQUIRE(render_get_sun_orbit_angle() == Catch::Approx(paused_angle));
+    REQUIRE(engine.get_sun_orbit_angle() == Catch::Approx(paused_angle));
 }
 
 TEST_CASE("temporal accumulation reduces frame-to-frame noise")
 {
-    reset_camera();
-    render_set_sun_orbit_enabled(false);
-    render_set_light_intensity(1.0);
-    render_set_moon_intensity(0.0);
-    render_set_shadow_enabled(true);
-    render_set_sky_light_intensity(0.0);
-    render_set_ambient_occlusion_enabled(false);
-    render_set_exposure(1.0);
-    render_set_paused(false);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_sun_orbit_enabled(false);
+    engine.set_light_intensity(1.0);
+    engine.set_moon_intensity(0.0);
+    engine.set_shadow_enabled(true);
+    engine.set_sky_light_intensity(0.0);
+    engine.set_ambient_occlusion_enabled(false);
+    engine.set_exposure(1.0);
+    engine.set_paused(false);
 
     const size_t width = 200;
     const size_t height = 160;
@@ -1130,7 +1309,8 @@ TEST_CASE("temporal accumulation reduces frame-to-frame noise")
         double max_delta = 0.0;
         for (size_t y = 0; y < height; ++y)
         {
-            const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom);
+            const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom,
+                                                   engine.get_exposure());
             for (size_t x = 0; x < width; ++x)
             {
                 const size_t idx = y * width + x;
@@ -1156,13 +1336,13 @@ TEST_CASE("temporal accumulation reduces frame-to-frame noise")
     bool found = false;
     for (const auto& cfg : configs)
     {
-        render_set_camera_position(cfg.camera_pos);
-        render_set_camera_rotation(cfg.camera_rot);
-        render_set_light_direction(cfg.light_dir);
+        engine.set_camera_position(cfg.camera_pos);
+        engine.set_camera_rotation(cfg.camera_rot);
+        engine.set_light_direction(cfg.light_dir);
 
-        render_set_taa_enabled(false);
-        render_update_array(frame0.data(), width, height);
-        render_update_array(frame1.data(), width, height);
+        engine.set_taa_enabled(false);
+        engine.update(frame0.data(), width, height);
+        engine.update(frame1.data(), width, height);
 
         delta_no_taa = max_luminance_delta(frame0, frame1);
         if (delta_no_taa > 0.0)
@@ -1178,50 +1358,52 @@ TEST_CASE("temporal accumulation reduces frame-to-frame noise")
         return;
     }
 
-    render_set_taa_enabled(true);
-    render_set_taa_blend(0.2);
+    engine.set_taa_enabled(true);
+    engine.set_taa_blend(0.2);
 
     std::vector<uint32_t> scratch(width * height, 0u);
-    render_update_array(scratch.data(), width, height);
-    render_update_array(scratch.data(), width, height);
+    engine.update(scratch.data(), width, height);
+    engine.update(scratch.data(), width, height);
 
     std::vector<uint32_t> frame2(width * height, 0u);
     std::vector<uint32_t> frame3(width * height, 0u);
-    render_update_array(frame2.data(), width, height);
-    render_update_array(frame3.data(), width, height);
+    engine.update(frame2.data(), width, height);
+    engine.update(frame3.data(), width, height);
 
     const double delta_taa = max_luminance_delta(frame2, frame3);
     REQUIRE(delta_taa < delta_no_taa);
 }
 
-TEST_CASE("render_update_array stabilizes jittered pixels when camera is static")
+TEST_CASE("RenderEngine update stabilizes jittered pixels when camera is static")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_taa_enabled(true);
-    render_set_taa_blend(0.1);
-    render_set_taa_clamp_enabled(true);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_taa_enabled(true);
+    engine.set_taa_blend(0.1);
+    engine.set_taa_clamp_enabled(true);
 
     const size_t width = 160;
     const size_t height = 120;
-    const uint32_t sky_top = render_get_sky_top_color();
-    const uint32_t sky_bottom = render_get_sky_bottom_color();
+    const uint32_t sky_top = engine.get_sky_top_color();
+    const uint32_t sky_bottom = engine.get_sky_bottom_color();
 
     std::vector<uint32_t> warm(width * height, 0u);
-    render_update_array(warm.data(), width, height);
-    render_update_array(warm.data(), width, height);
+    engine.update(warm.data(), width, height);
+    engine.update(warm.data(), width, height);
 
     std::vector<uint32_t> frame_a(width * height, 0u);
     std::vector<uint32_t> frame_b(width * height, 0u);
-    render_update_array(frame_a.data(), width, height);
-    render_update_array(frame_b.data(), width, height);
+    engine.update(frame_a.data(), width, height);
+    engine.update(frame_b.data(), width, height);
 
     auto max_luminance_delta = [&](const std::vector<uint32_t>& a,
                                    const std::vector<uint32_t>& b) {
         double max_delta = 0.0;
         for (size_t y = 0; y < height; ++y)
         {
-            const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom);
+            const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom,
+                                                   engine.get_exposure());
             for (size_t x = 0; x < width; ++x)
             {
                 const size_t idx = y * width + x;
@@ -1242,125 +1424,133 @@ TEST_CASE("render_update_array stabilizes jittered pixels when camera is static"
 
     const double average_delta = average_luminance_delta_masked(frame_a, frame_b,
                                                                 width, height,
-                                                                sky_top, sky_bottom);
+                                                                sky_top, sky_bottom,
+                                                                engine.get_exposure());
     const double max_delta = max_luminance_delta(frame_a, frame_b);
 
     REQUIRE(average_delta < 2.0);
     REQUIRE(max_delta < 64.0);
 
-    render_set_paused(false);
+    engine.set_paused(false);
 }
 
 TEST_CASE("taa sharpening stays disabled when camera is static")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_taa_enabled(true);
-    render_set_taa_blend(0.1);
-    render_set_taa_clamp_enabled(true);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_taa_enabled(true);
+    engine.set_taa_blend(0.1);
+    engine.set_taa_clamp_enabled(true);
 
     const size_t width = 120;
     const size_t height = 90;
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    render_update_array(framebuffer.data(), width, height);
-    render_update_array(framebuffer.data(), width, height);
+    engine.update(framebuffer.data(), width, height);
+    engine.update(framebuffer.data(), width, height);
 
-    const double strength = render_debug_get_taa_sharpen_strength();
+    const double strength = engine.taa_sharpen_strength();
     REQUIRE(strength == Catch::Approx(0.0).margin(1e-6));
 
-    render_set_paused(false);
+    engine.set_paused(false);
 }
 
 TEST_CASE("taa sharpening ramps with camera motion")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_taa_enabled(true);
-    render_set_taa_blend(0.1);
-    render_set_taa_clamp_enabled(true);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_taa_enabled(true);
+    engine.set_taa_blend(0.1);
+    engine.set_taa_clamp_enabled(true);
 
     const size_t width = 120;
     const size_t height = 90;
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    render_update_array(framebuffer.data(), width, height);
-    render_update_array(framebuffer.data(), width, height);
+    engine.update(framebuffer.data(), width, height);
+    engine.update(framebuffer.data(), width, height);
 
-    render_set_camera_rotation({0.005, 0.0});
-    render_update_array(framebuffer.data(), width, height);
-    const double small = render_debug_get_taa_sharpen_strength();
+    engine.set_camera_rotation({0.005, 0.0});
+    engine.update(framebuffer.data(), width, height);
+    const double small = engine.taa_sharpen_strength();
     REQUIRE(small > 0.0);
 
-    render_set_camera_rotation({0.02, 0.0});
-    render_update_array(framebuffer.data(), width, height);
-    const double large = render_debug_get_taa_sharpen_strength();
+    engine.set_camera_rotation({0.02, 0.0});
+    engine.update(framebuffer.data(), width, height);
+    const double large = engine.taa_sharpen_strength();
     REQUIRE(large > small);
 
-    render_set_camera_rotation({0.05, 0.0});
-    render_update_array(framebuffer.data(), width, height);
-    double saturated = render_debug_get_taa_sharpen_strength();
+    engine.set_camera_rotation({0.05, 0.0});
+    engine.update(framebuffer.data(), width, height);
+    double saturated = engine.taa_sharpen_strength();
     REQUIRE(saturated > large);
 
     for (int i = 0; i < 4; ++i)
     {
-        render_set_camera_rotation({0.05 * (i + 2), 0.0});
-        render_update_array(framebuffer.data(), width, height);
-        saturated = render_debug_get_taa_sharpen_strength();
+        engine.set_camera_rotation({0.05 * (i + 2), 0.0});
+        engine.update(framebuffer.data(), width, height);
+        saturated = engine.taa_sharpen_strength();
     }
 
-    const double saturated_pct = render_debug_get_taa_sharpen_percent();
+    const double saturated_pct = engine.taa_sharpen_percent();
     REQUIRE(saturated_pct > 95.0);
 
-    render_set_paused(false);
+    engine.set_paused(false);
 }
 
 TEST_CASE("temporal history clamping prevents ghosting after sudden color changes")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_camera_rotation({0.0, 1.2});
-    render_set_taa_enabled(true);
-    render_set_taa_blend(0.1);
-    render_set_taa_clamp_enabled(true);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_camera_rotation({0.0, 1.2});
+    engine.set_taa_enabled(true);
+    engine.set_taa_blend(0.1);
+    engine.set_taa_clamp_enabled(true);
 
     const size_t width = 96;
     const size_t height = 72;
     std::vector<uint32_t> frame(width * height, 0u);
-    const uint32_t original_top = render_get_sky_top_color();
-    const uint32_t original_bottom = render_get_sky_bottom_color();
+    const uint32_t original_top = engine.get_sky_top_color();
+    const uint32_t original_bottom = engine.get_sky_bottom_color();
 
     const uint32_t red = 0xFFFF0000;
-    render_debug_set_sky_colors_raw(red, red);
-    render_update_array(frame.data(), width, height);
+    engine.world.sky.day_zenith = ColorSrgb::from_hex(red).to_linear();
+    engine.world.sky.day_horizon = ColorSrgb::from_hex(red).to_linear();
+    engine.update(frame.data(), width, height);
 
     const uint32_t green = 0xFF00FF00;
-    render_debug_set_sky_colors_raw(green, green);
-    render_update_array(frame.data(), width, height);
+    engine.world.sky.day_zenith = ColorSrgb::from_hex(green).to_linear();
+    engine.world.sky.day_horizon = ColorSrgb::from_hex(green).to_linear();
+    engine.update(frame.data(), width, height);
 
     const size_t sample_x = width / 2;
     const size_t sample_y = 0;
-    const uint32_t expected = sky_color_for_row(sample_y, height, green, green);
+    const uint32_t expected = sky_color_for_row(sample_y, height, green, green,
+                                                engine.get_exposure());
     REQUIRE(frame[sample_y * width + sample_x] == expected);
 
-    render_set_sky_top_color(original_top);
-    render_set_sky_bottom_color(original_bottom);
-    render_set_paused(false);
+    engine.set_sky_top_color(original_top);
+    engine.set_sky_bottom_color(original_bottom);
+    engine.set_paused(false);
 }
 
-TEST_CASE("render_update_array fills front face")
+TEST_CASE("RenderEngine update fills front face")
 {
-    reset_camera();
+    RenderEngine engine;
+    reset_camera(engine);
     const size_t width = 120;
     const size_t height = 80;
 
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    render_set_light_direction({0.0, 0.0, 1.0});
-    render_set_light_intensity(1.0);
-    render_set_paused(true);
-    render_update_array(framebuffer.data(), width, height);
-    render_set_paused(false);
+    engine.set_light_direction({0.0, 0.0, 1.0});
+    engine.set_light_intensity(1.0);
+    engine.set_paused(true);
+    engine.update(framebuffer.data(), width, height);
+    engine.set_paused(false);
     const int chunk_size = 16;
     const double block_size = 2.0;
     const double start_x = -(chunk_size - 1) * block_size * 0.5;
@@ -1372,35 +1562,38 @@ TEST_CASE("render_update_array fills front face")
         base_y,
         start_z
     };
-    const Vec2 projected = render_project_point(probe, width, height);
+    const Vec2 projected = engine.project_point(probe, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
     const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
-    const uint32_t sky = sky_color_for_row(static_cast<size_t>(py), height, 0xFF78C2FF, 0xFF172433);
+    const uint32_t sky = sky_color_for_row(static_cast<size_t>(py), height, 0xFF78C2FF, 0xFF172433,
+                                           engine.get_exposure());
     REQUIRE(framebuffer[static_cast<size_t>(py) * width + static_cast<size_t>(px)] != sky);
 }
 
-TEST_CASE("render_update_array shows multiple terrain materials")
+TEST_CASE("RenderEngine update shows multiple terrain materials")
 {
-    reset_camera();
+    RenderEngine engine;
+    reset_camera(engine);
     const size_t width = 160;
     const size_t height = 120;
 
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    render_set_paused(true);
-    render_set_light_direction({0.0, 1.0, 1.0});
-    render_set_light_intensity(0.0);
-    render_set_sky_light_intensity(1.0);
+    engine.set_paused(true);
+    engine.set_light_direction({0.0, 1.0, 1.0});
+    engine.set_light_intensity(0.0);
+    engine.set_sky_light_intensity(1.0);
 
-    render_update_array(framebuffer.data(), width, height);
-    render_set_paused(false);
+    engine.update(framebuffer.data(), width, height);
+    engine.set_paused(false);
 
     const uint32_t sky_top = 0xFF78C2FF;
     const uint32_t sky_bottom = 0xFF172433;
     std::unordered_set<uint32_t> colors;
     for (size_t y = 0; y < height; ++y)
     {
-        const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom);
+        const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom,
+                                               engine.get_exposure());
         for (size_t x = 0; x < width; ++x)
         {
             const uint32_t pixel = framebuffer[y * width + x];
@@ -1414,27 +1607,29 @@ TEST_CASE("render_update_array shows multiple terrain materials")
     REQUIRE(colors.size() >= 3);
 }
 
-TEST_CASE("render_update_array applies lighting as multiple shades")
+TEST_CASE("RenderEngine update applies lighting as multiple shades")
 {
-    reset_camera();
+    RenderEngine engine;
+    reset_camera(engine);
     const size_t width = 160;
     const size_t height = 120;
 
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    render_set_paused(true);
-    render_set_light_direction({0.5, -1.0, 0.7});
-    render_set_light_intensity(1.0);
-    render_set_sky_light_intensity(1.0);
+    engine.set_paused(true);
+    engine.set_light_direction({0.5, -1.0, 0.7});
+    engine.set_light_intensity(1.0);
+    engine.set_sky_light_intensity(1.0);
 
-    render_update_array(framebuffer.data(), width, height);
+    engine.update(framebuffer.data(), width, height);
 
     const uint32_t sky_top = 0xFF78C2FF;
     const uint32_t sky_bottom = 0xFF172433;
     std::unordered_set<uint32_t> colors;
     for (size_t y = 0; y < height; ++y)
     {
-        const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom);
+        const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom,
+                                               engine.get_exposure());
         for (size_t x = 0; x < width; ++x)
         {
             const uint32_t pixel = framebuffer[y * width + x];
@@ -1445,113 +1640,115 @@ TEST_CASE("render_update_array applies lighting as multiple shades")
         }
     }
 
-    render_set_paused(false);
+    engine.set_paused(false);
 
     REQUIRE(colors.size() >= 2);
 }
 
 TEST_CASE("light direction magnitude does not affect lighting")
 {
-    reset_camera();
-    render_set_sun_orbit_enabled(false);
-    render_set_shadow_enabled(false);
-    render_set_taa_enabled(false);
-    render_set_gi_enabled(false);
-    render_set_gi_strength(0.0);
-    render_set_sky_light_intensity(0.0);
-    render_set_ambient_occlusion_enabled(false);
-    render_set_paused(true);
-    render_set_light_intensity(1.0);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_sun_orbit_enabled(false);
+    engine.set_shadow_enabled(false);
+    engine.set_taa_enabled(false);
+    engine.set_gi_enabled(false);
+    engine.set_gi_strength(0.0);
+    engine.set_sky_light_intensity(0.0);
+    engine.set_ambient_occlusion_enabled(false);
+    engine.set_paused(true);
+    engine.set_light_intensity(1.0);
 
     const size_t width = 120;
     const size_t height = 80;
     std::vector<uint32_t> frame_a(width * height, 0u);
     std::vector<uint32_t> frame_b(width * height, 0u);
 
-    render_set_light_direction({0.3, -0.7, 0.2});
-    render_update_array(frame_a.data(), width, height);
+    engine.set_light_direction({0.3, -0.7, 0.2});
+    engine.update(frame_a.data(), width, height);
 
-    render_set_light_direction({0.6, -1.4, 0.4});
-    render_update_array(frame_b.data(), width, height);
+    engine.set_light_direction({0.6, -1.4, 0.4});
+    engine.update(frame_b.data(), width, height);
 
     REQUIRE(frame_a == frame_b);
 }
 
 TEST_CASE("render state setters and getters")
 {
-    reset_camera();
+    RenderEngine engine;
+    reset_camera(engine);
 
-    render_set_light_direction({0.1, 0.2, -0.3});
-    const Vec3 dir = render_get_light_direction();
+    engine.set_light_direction({0.1, 0.2, -0.3});
+    const Vec3 dir = engine.get_light_direction();
     REQUIRE(dir.x == Catch::Approx(0.1));
     REQUIRE(dir.y == Catch::Approx(0.2));
     REQUIRE(dir.z == Catch::Approx(-0.3));
 
-    render_set_light_intensity(0.42);
-    REQUIRE(render_get_light_intensity() == Catch::Approx(0.42));
+    engine.set_light_intensity(0.42);
+    REQUIRE(engine.get_light_intensity() == Catch::Approx(0.42));
 
-    render_set_sun_orbit_enabled(true);
-    REQUIRE(render_get_sun_orbit_enabled());
-    render_set_sun_orbit_enabled(false);
-    REQUIRE_FALSE(render_get_sun_orbit_enabled());
+    engine.set_sun_orbit_enabled(true);
+    REQUIRE(engine.get_sun_orbit_enabled());
+    engine.set_sun_orbit_enabled(false);
+    REQUIRE_FALSE(engine.get_sun_orbit_enabled());
 
-    render_set_sun_orbit_angle(1.23);
-    REQUIRE(render_get_sun_orbit_angle() == Catch::Approx(1.23));
+    engine.set_sun_orbit_angle(1.23);
+    REQUIRE(engine.get_sun_orbit_angle() == Catch::Approx(1.23));
 
-    render_set_sky_top_color(0xFF112233);
-    render_set_sky_bottom_color(0xFF445566);
-    REQUIRE(render_get_sky_top_color() == 0xFF112233);
-    REQUIRE(render_get_sky_bottom_color() == 0xFF445566);
+    engine.set_sky_top_color(0xFF112233);
+    engine.set_sky_bottom_color(0xFF445566);
+    REQUIRE(engine.get_sky_top_color() == 0xFF112233);
+    REQUIRE(engine.get_sky_bottom_color() == 0xFF445566);
 
-    render_set_sky_light_intensity(0.77);
-    REQUIRE(render_get_sky_light_intensity() == Catch::Approx(0.77));
+    engine.set_sky_light_intensity(0.77);
+    REQUIRE(engine.get_sky_light_intensity() == Catch::Approx(0.77));
 
-    render_set_exposure(1.4);
-    REQUIRE(render_get_exposure() == Catch::Approx(1.4));
+    engine.set_exposure(1.4);
+    REQUIRE(engine.get_exposure() == Catch::Approx(1.4));
 
-    render_set_taa_enabled(true);
-    REQUIRE(render_get_taa_enabled());
-    render_set_taa_enabled(false);
-    REQUIRE_FALSE(render_get_taa_enabled());
+    engine.set_taa_enabled(true);
+    REQUIRE(engine.get_taa_enabled());
+    engine.set_taa_enabled(false);
+    REQUIRE_FALSE(engine.get_taa_enabled());
 
-    render_set_taa_blend(0.25);
-    REQUIRE(render_get_taa_blend() == Catch::Approx(0.25));
+    engine.set_taa_blend(0.25);
+    REQUIRE(engine.get_taa_blend() == Catch::Approx(0.25));
 
-    render_set_gi_enabled(true);
-    REQUIRE(render_get_gi_enabled());
-    render_set_gi_enabled(false);
-    REQUIRE_FALSE(render_get_gi_enabled());
+    engine.set_gi_enabled(true);
+    REQUIRE(engine.get_gi_enabled());
+    engine.set_gi_enabled(false);
+    REQUIRE_FALSE(engine.get_gi_enabled());
 
-    render_set_gi_strength(0.6);
-    REQUIRE(render_get_gi_strength() == Catch::Approx(0.6));
+    engine.set_gi_strength(0.6);
+    REQUIRE(engine.get_gi_strength() == Catch::Approx(0.6));
 
-    render_set_gi_bounce_count(2);
-    REQUIRE(render_get_gi_bounce_count() == 2);
-    render_set_gi_bounce_count(0);
-    REQUIRE(render_get_gi_bounce_count() == 0);
-    render_set_gi_bounce_count(1);
+    engine.set_gi_bounce_count(2);
+    REQUIRE(engine.get_gi_bounce_count() == 2);
+    engine.set_gi_bounce_count(0);
+    REQUIRE(engine.get_gi_bounce_count() == 0);
+    engine.set_gi_bounce_count(1);
 
-    render_set_paused(false);
-    REQUIRE_FALSE(render_is_paused());
-    render_toggle_pause();
-    REQUIRE(render_is_paused());
-    render_toggle_pause();
-    REQUIRE_FALSE(render_is_paused());
+    engine.set_paused(false);
+    REQUIRE_FALSE(engine.is_paused());
+    engine.toggle_pause();
+    REQUIRE(engine.is_paused());
+    engine.toggle_pause();
+    REQUIRE_FALSE(engine.is_paused());
 
-    render_set_light_direction({0.0, 0.0, -1.0});
-    render_set_light_intensity(1.0);
-    render_set_sky_top_color(0xFF78C2FF);
-    render_set_sky_bottom_color(0xFF172433);
-    render_set_sky_light_intensity(0.0);
-    render_set_exposure(1.0);
-    render_set_taa_enabled(true);
-    render_set_taa_blend(0.2);
-    render_set_paused(false);
+    engine.set_light_direction({0.0, 0.0, -1.0});
+    engine.set_light_intensity(1.0);
+    engine.set_sky_top_color(0xFF78C2FF);
+    engine.set_sky_bottom_color(0xFF172433);
+    engine.set_sky_light_intensity(0.0);
+    engine.set_exposure(1.0);
+    engine.set_taa_enabled(true);
+    engine.set_taa_blend(0.2);
+    engine.set_paused(false);
 }
 
 TEST_CASE("terrain mesh culls internal faces")
 {
-    reset_camera();
+    Terrain terrain;
     const int chunk_size = 16;
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -1560,35 +1757,39 @@ TEST_CASE("terrain mesh culls internal faces")
     const size_t total_blocks = count_blocks(heights, chunk_size);
     const size_t expected_faces = count_visible_faces(heights, chunk_size);
 
-    REQUIRE(render_debug_get_terrain_block_count() == total_blocks);
-    REQUIRE(render_debug_get_terrain_visible_face_count() == expected_faces);
-    REQUIRE(render_debug_get_terrain_triangle_count() < total_blocks * 12);
+    terrain.generate();
+    REQUIRE(terrain.block_count() == total_blocks);
+    REQUIRE(terrain.visible_face_count() == expected_faces);
+    REQUIRE(terrain.triangle_count() < total_blocks * 12);
 }
 
-TEST_CASE("render_update_array renders sky gradient")
+TEST_CASE("RenderEngine update renders sky gradient")
 {
-    reset_camera();
-    render_set_camera_position({0.0, 25.0, -10.0});
-    render_set_camera_rotation({0.0, -0.8});
-    render_set_paused(true);
-    render_set_light_direction({0.0, 0.0, 1.0});
-    render_set_light_intensity(0.0);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_camera_position({0.0, 25.0, -10.0});
+    engine.set_camera_rotation({0.0, -0.8});
+    engine.set_paused(true);
+    engine.set_light_direction({0.0, 0.0, 1.0});
+    engine.set_light_intensity(0.0);
 
     const uint32_t sky_top = 0xFFFF4D4D;
     const uint32_t sky_bottom = 0xFF2A1B70;
-    render_set_sky_top_color(sky_top);
-    render_set_sky_bottom_color(sky_bottom);
-    render_set_sky_light_intensity(0.0);
+    engine.set_sky_top_color(sky_top);
+    engine.set_sky_bottom_color(sky_bottom);
+    engine.set_sky_light_intensity(0.0);
 
     const size_t width = 120;
     const size_t height = 80;
     std::vector<uint32_t> framebuffer(width * height, 0u);
-    render_update_array(framebuffer.data(), width, height);
-    render_set_paused(false);
+    engine.update(framebuffer.data(), width, height);
+    engine.set_paused(false);
 
-    const uint32_t top_color = sky_color_for_row(0, height, sky_top, sky_bottom);
+    const uint32_t top_color = sky_color_for_row(0, height, sky_top, sky_bottom,
+                                                 engine.get_exposure());
     const size_t mid = height / 2;
-    const uint32_t mid_color = sky_color_for_row(mid, height, sky_top, sky_bottom);
+    const uint32_t mid_color = sky_color_for_row(mid, height, sky_top, sky_bottom,
+                                                 engine.get_exposure());
 
     bool found_top = false;
     for (size_t x = 0; x < width; ++x)
@@ -1615,40 +1816,43 @@ TEST_CASE("render_update_array renders sky gradient")
 
 TEST_CASE("sky gradient follows sun altitude when orbit enabled")
 {
-    reset_camera();
-    render_set_camera_position({0.0, 25.0, -10.0});
-    render_set_camera_rotation({0.0, -0.8});
-    render_set_light_direction({0.0, 0.0, 1.0});
-    render_set_light_intensity(1.0);
-    render_set_sky_light_intensity(0.0);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_camera_position({0.0, 25.0, -10.0});
+    engine.set_camera_rotation({0.0, -0.8});
+    engine.set_light_direction({0.0, 0.0, 1.0});
+    engine.set_light_intensity(1.0);
+    engine.set_sky_light_intensity(0.0);
 
     const uint32_t noon_top = 0xFF78C2FF;
     const uint32_t noon_bottom = 0xFF172433;
-    render_set_sky_top_color(noon_top);
-    render_set_sky_bottom_color(noon_bottom);
+    engine.set_sky_top_color(noon_top);
+    engine.set_sky_bottom_color(noon_bottom);
 
     const uint32_t sunrise_top = 0xFFB55A1A;
     const uint32_t sunrise_bottom = 0xFF4A200A;
 
-    render_set_sun_orbit_enabled(true);
-    render_set_paused(true);
+    engine.set_sun_orbit_enabled(true);
+    engine.set_paused(true);
 
     const size_t width = 120;
     const size_t height = 80;
     std::vector<uint32_t> sunrise_frame(width * height, 0u);
     std::vector<uint32_t> noon_frame(width * height, 0u);
 
-    render_set_sun_orbit_angle(0.0);
-    render_update_array(sunrise_frame.data(), width, height);
+    engine.set_sun_orbit_angle(0.0);
+    engine.update(sunrise_frame.data(), width, height);
 
-    render_set_sun_orbit_angle(1.5707963267948966);
-    render_update_array(noon_frame.data(), width, height);
+    engine.set_sun_orbit_angle(1.5707963267948966);
+    engine.update(noon_frame.data(), width, height);
 
-    render_set_paused(false);
-    render_set_sun_orbit_enabled(false);
+    engine.set_paused(false);
+    engine.set_sun_orbit_enabled(false);
 
-    const uint32_t sunrise_top_row = sky_color_for_row(0, height, sunrise_top, sunrise_bottom);
-    const uint32_t noon_top_row = sky_color_for_row(0, height, noon_top, noon_bottom);
+    const uint32_t sunrise_top_row = sky_color_for_row(0, height, sunrise_top, sunrise_bottom,
+                                                       engine.get_exposure());
+    const uint32_t noon_top_row = sky_color_for_row(0, height, noon_top, noon_bottom,
+                                                    engine.get_exposure());
 
     bool found_sunrise = false;
     bool found_noon = false;
@@ -1670,42 +1874,44 @@ TEST_CASE("sky gradient follows sun altitude when orbit enabled")
 
 TEST_CASE("sky light intensity follows sun altitude")
 {
-    reset_camera();
-    render_set_camera_position({0.0, -12.0, -10.0});
-    render_set_camera_rotation({0.0, -0.7});
-    render_set_light_intensity(0.0);
-    render_set_moon_intensity(0.0);
-    render_set_shadow_enabled(false);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_camera_position({0.0, -12.0, -10.0});
+    engine.set_camera_rotation({0.0, -0.7});
+    engine.set_light_intensity(0.0);
+    engine.set_moon_intensity(0.0);
+    engine.set_shadow_enabled(false);
 
     const uint32_t sunrise_top = 0xFFB55A1A;
     const uint32_t sunrise_bottom = 0xFF4A200A;
-    render_set_sky_top_color(sunrise_top);
-    render_set_sky_bottom_color(sunrise_bottom);
-    render_set_sky_light_intensity(1.0);
+    engine.set_sky_top_color(sunrise_top);
+    engine.set_sky_bottom_color(sunrise_bottom);
+    engine.set_sky_light_intensity(1.0);
 
-    render_set_sun_orbit_enabled(true);
-    render_set_paused(true);
+    engine.set_sun_orbit_enabled(true);
+    engine.set_paused(true);
 
     const size_t width = 160;
     const size_t height = 120;
     std::vector<uint32_t> sunrise_frame(width * height, 0u);
     std::vector<uint32_t> noon_frame(width * height, 0u);
 
-    render_set_sun_orbit_angle(0.0);
-    render_update_array(sunrise_frame.data(), width, height);
+    engine.set_sun_orbit_angle(0.0);
+    engine.update(sunrise_frame.data(), width, height);
 
-    render_set_sun_orbit_angle(1.5707963267948966);
-    render_update_array(noon_frame.data(), width, height);
+    engine.set_sun_orbit_angle(1.5707963267948966);
+    engine.update(noon_frame.data(), width, height);
 
-    render_set_paused(false);
-    render_set_sun_orbit_enabled(false);
+    engine.set_paused(false);
+    engine.set_sun_orbit_enabled(false);
 
     double sum_sunrise = 0.0;
     double sum_noon = 0.0;
     size_t count = 0;
     for (size_t y = 0; y < height; ++y)
     {
-        const uint32_t sky = sky_color_for_row(y, height, sunrise_top, sunrise_bottom);
+        const uint32_t sky = sky_color_for_row(y, height, sunrise_top, sunrise_bottom,
+                                               engine.get_exposure());
         for (size_t x = 0; x < width; ++x)
         {
             const size_t idx = y * width + x;
@@ -1725,19 +1931,20 @@ TEST_CASE("sky light intensity follows sun altitude")
 
 TEST_CASE("low sun altitude keeps ambient above black")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_sun_orbit_enabled(true);
-    render_set_sun_orbit_angle(0.08);
-    render_set_light_intensity(0.0);
-    render_set_moon_intensity(0.0);
-    render_set_shadow_enabled(false);
-    render_set_ambient_occlusion_enabled(false);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_sun_orbit_enabled(true);
+    engine.set_sun_orbit_angle(0.08);
+    engine.set_light_intensity(0.0);
+    engine.set_moon_intensity(0.0);
+    engine.set_shadow_enabled(false);
+    engine.set_ambient_occlusion_enabled(false);
 
     const uint32_t sky_color = 0xFFFFFFFF;
-    render_set_sky_top_color(sky_color);
-    render_set_sky_bottom_color(sky_color);
-    render_set_sky_light_intensity(1.0);
+    engine.set_sky_top_color(sky_color);
+    engine.set_sky_bottom_color(sky_color);
+    engine.set_sky_light_intensity(1.0);
 
     int cell_x = 0;
     int cell_z = 0;
@@ -1754,37 +1961,39 @@ TEST_CASE("low sun altitude keeps ambient above black")
     const double center_z = start_z + cell_z * block_size;
     const double center_y = base_y - (cell_height - 1) * block_size;
 
-    render_set_camera_position({center_x, center_y - 20.0, center_z - 12.0});
-    render_set_camera_rotation({0.0, -0.8});
+    engine.set_camera_position({center_x, center_y - 20.0, center_z - 12.0});
+    engine.set_camera_rotation({0.0, -0.8});
 
     const size_t width = 200;
     const size_t height = 160;
     std::vector<uint32_t> framebuffer(width * height, 0u);
-    render_update_array(framebuffer.data(), width, height);
-    render_set_paused(false);
-    render_set_sun_orbit_enabled(false);
+    engine.update(framebuffer.data(), width, height);
+    engine.set_paused(false);
+    engine.set_sun_orbit_enabled(false);
 
-    const Vec2 projected = render_project_point({center_x, center_y - 1.0, center_z}, width, height);
+    const Vec2 projected = engine.project_point({center_x, center_y - 1.0, center_z}, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
     const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
 
     double avg_lum = 0.0;
-    REQUIRE(sample_average_luminance(framebuffer, width, height, px, py, sky_color, sky_color, avg_lum));
+    REQUIRE(sample_average_luminance(framebuffer, width, height, px, py, sky_color, sky_color,
+                                     engine.get_exposure(), avg_lum));
     REQUIRE(avg_lum > 30.0);
 }
 
 TEST_CASE("sun light is warmer than moon light")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_sun_orbit_enabled(false);
-    render_set_shadow_enabled(false);
-    render_set_ambient_occlusion_enabled(false);
-    render_set_sky_light_intensity(0.0);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_sun_orbit_enabled(false);
+    engine.set_shadow_enabled(false);
+    engine.set_ambient_occlusion_enabled(false);
+    engine.set_sky_light_intensity(0.0);
 
     const uint32_t sky_color = 0xFF010203;
-    render_set_sky_top_color(sky_color);
-    render_set_sky_bottom_color(sky_color);
+    engine.set_sky_top_color(sky_color);
+    engine.set_sky_bottom_color(sky_color);
 
     int cell_x = 0;
     int cell_z = 0;
@@ -1801,8 +2010,8 @@ TEST_CASE("sun light is warmer than moon light")
     const double center_z = start_z + cell_z * block_size;
     const double center_y = base_y - (cell_height - 1) * block_size;
 
-    render_set_camera_position({center_x, center_y - 20.0, center_z - 12.0});
-    render_set_camera_rotation({0.0, -0.8});
+    engine.set_camera_position({center_x, center_y - 20.0, center_z - 12.0});
+    engine.set_camera_rotation({0.0, -0.8});
 
     const Vec3 sample_point{center_x, center_y - 1.0, center_z};
 
@@ -1811,18 +2020,18 @@ TEST_CASE("sun light is warmer than moon light")
     std::vector<uint32_t> sun_frame(width * height, 0u);
     std::vector<uint32_t> moon_frame(width * height, 0u);
 
-    render_set_light_direction({0.0, -1.0, 0.0});
-    render_set_light_intensity(1.0);
-    render_set_moon_direction({0.0, -1.0, 0.0});
-    render_set_moon_intensity(0.0);
-    render_update_array(sun_frame.data(), width, height);
+    engine.set_light_direction({0.0, -1.0, 0.0});
+    engine.set_light_intensity(1.0);
+    engine.set_moon_direction({0.0, -1.0, 0.0});
+    engine.set_moon_intensity(0.0);
+    engine.update(sun_frame.data(), width, height);
 
-    render_set_light_intensity(0.0);
-    render_set_moon_intensity(1.0);
-    render_update_array(moon_frame.data(), width, height);
-    render_set_paused(false);
+    engine.set_light_intensity(0.0);
+    engine.set_moon_intensity(1.0);
+    engine.update(moon_frame.data(), width, height);
+    engine.set_paused(false);
 
-    const Vec2 projected = render_project_point(sample_point, width, height);
+    const Vec2 projected = engine.project_point(sample_point, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
     const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
 
@@ -1832,8 +2041,10 @@ TEST_CASE("sun light is warmer than moon light")
     double r_moon = 0.0;
     double g_moon = 0.0;
     double b_moon = 0.0;
-    REQUIRE(sample_average_color(sun_frame, width, height, px, py, sky_color, sky_color, r_sun, g_sun, b_sun));
-    REQUIRE(sample_average_color(moon_frame, width, height, px, py, sky_color, sky_color, r_moon, g_moon, b_moon));
+    REQUIRE(sample_average_color(sun_frame, width, height, px, py, sky_color, sky_color,
+                                 engine.get_exposure(), r_sun, g_sun, b_sun));
+    REQUIRE(sample_average_color(moon_frame, width, height, px, py, sky_color, sky_color,
+                                 engine.get_exposure(), r_moon, g_moon, b_moon));
 
     REQUIRE(b_sun > 1.0);
     REQUIRE(b_moon > 1.0);
@@ -1844,17 +2055,18 @@ TEST_CASE("sun light is warmer than moon light")
 
 TEST_CASE("moonlight adds ambient when sun is below horizon")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_sun_orbit_enabled(true);
-    render_set_sun_orbit_angle(0.0);
-    render_set_light_intensity(0.0);
-    render_set_shadow_enabled(false);
-    render_set_ambient_occlusion_enabled(false);
-    render_set_sky_light_intensity(1.0);
-    render_set_sky_top_color(0xFFFFFFFF);
-    render_set_sky_bottom_color(0xFFFFFFFF);
-    render_set_moon_direction({0.0, 1.0, 0.0});
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_sun_orbit_enabled(true);
+    engine.set_sun_orbit_angle(0.0);
+    engine.set_light_intensity(0.0);
+    engine.set_shadow_enabled(false);
+    engine.set_ambient_occlusion_enabled(false);
+    engine.set_sky_light_intensity(1.0);
+    engine.set_sky_top_color(0xFFFFFFFF);
+    engine.set_sky_bottom_color(0xFFFFFFFF);
+    engine.set_moon_direction({0.0, 1.0, 0.0});
 
     int cell_x = 0;
     int cell_z = 0;
@@ -1871,62 +2083,66 @@ TEST_CASE("moonlight adds ambient when sun is below horizon")
     const double center_z = start_z + cell_z * block_size;
     const double center_y = base_y - (cell_height - 1) * block_size;
 
-    render_set_camera_position({center_x, center_y - 20.0, center_z - 12.0});
-    render_set_camera_rotation({0.0, -0.8});
+    engine.set_camera_position({center_x, center_y - 20.0, center_z - 12.0});
+    engine.set_camera_rotation({0.0, -0.8});
 
     const size_t width = 200;
     const size_t height = 160;
     std::vector<uint32_t> moon_on(width * height, 0u);
     std::vector<uint32_t> moon_off(width * height, 0u);
 
-    render_set_moon_intensity(0.6);
-    render_update_array(moon_on.data(), width, height);
-    render_set_moon_intensity(0.0);
-    render_update_array(moon_off.data(), width, height);
-    render_set_paused(false);
-    render_set_sun_orbit_enabled(false);
+    engine.set_moon_intensity(0.6);
+    engine.update(moon_on.data(), width, height);
+    engine.set_moon_intensity(0.0);
+    engine.update(moon_off.data(), width, height);
+    engine.set_paused(false);
+    engine.set_sun_orbit_enabled(false);
 
-    const Vec2 projected = render_project_point({center_x, center_y - 1.0, center_z}, width, height);
+    const Vec2 projected = engine.project_point({center_x, center_y - 1.0, center_z}, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
     const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
 
     double avg_on = 0.0;
     double avg_off = 0.0;
-    REQUIRE(sample_average_luminance(moon_on, width, height, px, py, 0xFFFFFFFF, 0xFFFFFFFF, avg_on));
-    REQUIRE(sample_average_luminance(moon_off, width, height, px, py, 0xFFFFFFFF, 0xFFFFFFFF, avg_off));
+    REQUIRE(sample_average_luminance(moon_on, width, height, px, py, 0xFFFFFFFF, 0xFFFFFFFF,
+                                     engine.get_exposure(), avg_on));
+    REQUIRE(sample_average_luminance(moon_off, width, height, px, py, 0xFFFFFFFF, 0xFFFFFFFF,
+                                     engine.get_exposure(), avg_off));
     REQUIRE(avg_on > avg_off + 8.0);
 }
 
 TEST_CASE("sky light increases ambient brightness")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_light_direction({0.0, 0.0, 1.0});
-    render_set_light_intensity(0.0);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_light_direction({0.0, 0.0, 1.0});
+    engine.set_light_intensity(0.0);
 
     const uint32_t sky_top = 0xFF9AD4FF;
     const uint32_t sky_bottom = 0xFF101820;
-    render_set_sky_top_color(sky_top);
-    render_set_sky_bottom_color(sky_bottom);
+    engine.set_sky_top_color(sky_top);
+    engine.set_sky_bottom_color(sky_bottom);
 
     const size_t width = 120;
     const size_t height = 80;
     std::vector<uint32_t> no_sky_light(width * height, 0u);
     std::vector<uint32_t> with_sky_light(width * height, 0u);
 
-    render_set_sky_light_intensity(0.0);
-    render_update_array(no_sky_light.data(), width, height);
+    engine.set_sky_light_intensity(0.0);
+    engine.update(no_sky_light.data(), width, height);
 
-    render_set_sky_light_intensity(1.0);
-    render_update_array(with_sky_light.data(), width, height);
-    render_set_paused(false);
+    engine.set_sky_light_intensity(1.0);
+    engine.update(with_sky_light.data(), width, height);
+    engine.set_paused(false);
 
     double sum_no = 0.0;
     double sum_with = 0.0;
     size_t count = 0;
     for (size_t y = 0; y < height; ++y)
     {
-        const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom);
+        const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom,
+                                               engine.get_exposure());
         for (size_t x = 0; x < width; ++x)
         {
             const size_t idx = y * width + x;
@@ -1946,18 +2162,19 @@ TEST_CASE("sky light increases ambient brightness")
 
 TEST_CASE("gamma correction applies to midtone ambient")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_sun_orbit_enabled(false);
-    render_set_light_intensity(0.0);
-    render_set_moon_intensity(0.0);
-    render_set_shadow_enabled(false);
-    render_set_ambient_occlusion_enabled(false);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_sun_orbit_enabled(false);
+    engine.set_light_intensity(0.0);
+    engine.set_moon_intensity(0.0);
+    engine.set_shadow_enabled(false);
+    engine.set_ambient_occlusion_enabled(false);
 
     const uint32_t sky_color = 0xFFFFFFFF;
-    render_set_sky_top_color(sky_color);
-    render_set_sky_bottom_color(sky_color);
-    render_set_sky_light_intensity(0.5);
+    engine.set_sky_top_color(sky_color);
+    engine.set_sky_bottom_color(sky_color);
+    engine.set_sky_light_intensity(0.5);
 
     int cell_x = 0;
     int cell_z = 0;
@@ -1974,41 +2191,42 @@ TEST_CASE("gamma correction applies to midtone ambient")
     const double center_z = start_z + cell_z * block_size;
     const double center_y = base_y - (cell_height - 1) * block_size;
 
-    render_set_camera_position({center_x, center_y - 20.0, center_z - 12.0});
-    render_set_camera_rotation({0.0, -0.8});
+    engine.set_camera_position({center_x, center_y - 20.0, center_z - 12.0});
+    engine.set_camera_rotation({0.0, -0.8});
 
     const size_t width = 200;
     const size_t height = 160;
     std::vector<uint32_t> framebuffer(width * height, 0u);
-    render_update_array(framebuffer.data(), width, height);
-    render_set_paused(false);
+    engine.update(framebuffer.data(), width, height);
+    engine.set_paused(false);
 
-    const Vec2 projected = render_project_point({center_x, center_y - 1.0, center_z}, width, height);
+    const Vec2 projected = engine.project_point({center_x, center_y - 1.0, center_z}, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
     const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
 
     double avg_lum = 0.0;
-    REQUIRE(sample_average_luminance(framebuffer, width, height, px, py, sky_color, sky_color, avg_lum));
+    REQUIRE(sample_average_luminance(framebuffer, width, height, px, py, sky_color, sky_color,
+                                     engine.get_exposure(), avg_lum));
 
-    const uint32_t expected = expected_gamma_luminance(0xFF3B8A38, 0.5f);
+    const uint32_t expected = expected_gamma_luminance(0xFF3B8A38, 0.5f, engine.get_exposure());
     REQUIRE(avg_lum == Catch::Approx(static_cast<double>(expected)).margin(12.0));
 }
 
 TEST_CASE("Reinhard tone mapping applies exposure in linear space")
 {
     const Vec3 color{2.0, 0.5, 0.0};
-    const Vec3 mapped = render_debug_tonemap_reinhard(color, 1.0);
+    const Vec3 mapped = tonemap_reinhard_vec3(color, 1.0);
     REQUIRE(mapped.x == Catch::Approx(2.0 / 3.0).margin(1e-6));
     REQUIRE(mapped.y == Catch::Approx(0.5 / 1.5).margin(1e-6));
     REQUIRE(mapped.z == Catch::Approx(0.0).margin(1e-9));
 
-    const Vec3 mapped_boost = render_debug_tonemap_reinhard(color, 2.0);
+    const Vec3 mapped_boost = tonemap_reinhard_vec3(color, 2.0);
     REQUIRE(mapped_boost.x == Catch::Approx(4.0 / 5.0).margin(1e-6));
     REQUIRE(mapped_boost.y == Catch::Approx(1.0 / 2.0).margin(1e-6));
     REQUIRE(mapped_boost.x > mapped.x);
     REQUIRE(mapped_boost.y > mapped.y);
 
-    const Vec3 mapped_zero = render_debug_tonemap_reinhard(color, -1.0);
+    const Vec3 mapped_zero = tonemap_reinhard_vec3(color, -1.0);
     REQUIRE(mapped_zero.x == Catch::Approx(0.0).margin(1e-9));
     REQUIRE(mapped_zero.y == Catch::Approx(0.0).margin(1e-9));
     REQUIRE(mapped_zero.z == Catch::Approx(0.0).margin(1e-9));
@@ -2016,21 +2234,22 @@ TEST_CASE("Reinhard tone mapping applies exposure in linear space")
 
 TEST_CASE("hemisphere lighting adds sun bounce to shadowed faces")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_sun_orbit_enabled(false);
-    render_set_light_direction({0.0, -1.0, 0.0});
-    render_set_moon_intensity(0.0);
-    render_set_shadow_enabled(false);
-    render_set_ambient_occlusion_enabled(false);
-    render_set_camera_position({0.0, -10.0, -12.0});
-    render_set_camera_rotation({0.0, -0.6});
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_sun_orbit_enabled(false);
+    engine.set_light_direction({0.0, -1.0, 0.0});
+    engine.set_moon_intensity(0.0);
+    engine.set_shadow_enabled(false);
+    engine.set_ambient_occlusion_enabled(false);
+    engine.set_camera_position({0.0, -10.0, -12.0});
+    engine.set_camera_rotation({0.0, -0.6});
 
     const uint32_t sky_top = 0xFFFFFFFF;
     const uint32_t sky_bottom = 0xFF202020;
-    render_set_sky_top_color(sky_top);
-    render_set_sky_bottom_color(sky_bottom);
-    render_set_sky_light_intensity(1.0);
+    engine.set_sky_top_color(sky_top);
+    engine.set_sky_bottom_color(sky_bottom);
+    engine.set_sky_light_intensity(1.0);
 
     int column_x = 0;
     int column_height = 0;
@@ -2052,32 +2271,34 @@ TEST_CASE("hemisphere lighting adds sun bounce to shadowed faces")
     std::vector<uint32_t> sun_on(width * height, 0u);
     std::vector<uint32_t> sun_off(width * height, 0u);
 
-    render_set_light_intensity(1.0);
-    render_update_array(sun_on.data(), width, height);
-    render_set_light_intensity(0.0);
-    render_update_array(sun_off.data(), width, height);
-    render_set_paused(false);
+    engine.set_light_intensity(1.0);
+    engine.update(sun_on.data(), width, height);
+    engine.set_light_intensity(0.0);
+    engine.update(sun_off.data(), width, height);
+    engine.set_paused(false);
 
-    const Vec2 projected = render_project_point(probe, width, height);
+    const Vec2 projected = engine.project_point(probe, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
     const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
 
     double avg_on = 0.0;
     double avg_off = 0.0;
-    REQUIRE(sample_average_luminance(sun_on, width, height, px, py, sky_top, sky_bottom, avg_on));
-    REQUIRE(sample_average_luminance(sun_off, width, height, px, py, sky_top, sky_bottom, avg_off));
+    REQUIRE(sample_average_luminance(sun_on, width, height, px, py, sky_top, sky_bottom,
+                                     engine.get_exposure(), avg_on));
+    REQUIRE(sample_average_luminance(sun_off, width, height, px, py, sky_top, sky_bottom,
+                                     engine.get_exposure(), avg_off));
     REQUIRE(avg_on > avg_off + 3.0);
 }
 
 TEST_CASE("directional shadowing darkens terrain")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_light_direction({0.6, -0.3, 0.8});
-    render_set_light_intensity(1.0);
-    render_set_sky_light_intensity(0.0);
-    render_set_ambient_occlusion_enabled(false);
-    render_set_shadow_enabled(true);
+    Terrain terrain;
+    LightingEngine lighting;
+    World world_state;
+    world_state.sun.orbit_enabled = false;
+    world_state.sun.direction = {0.6, -0.3, 0.8};
+    world_state.sun.intensity = 1.0;
+    const bool shadows_enabled = true;
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -2101,39 +2322,39 @@ TEST_CASE("directional shadowing darkens terrain")
             const int height = heights[index(x, z)];
             const double center_y = base_y - (height - 1) * block_size;
             const double top_y = center_y - block_size * 0.5;
-            const Vec3 world{
+            const Vec3 world_pos{
                 start_x + x * block_size,
                 top_y,
                 start_z + z * block_size
             };
             float factor = 1.0f;
-            if (render_get_shadow_factor_at_point(world, {0.0, -1.0, 0.0}, &factor) && factor < 0.98f)
+            if (shadow_factor_at_point(terrain, lighting, world_state, shadows_enabled,
+                                       world_pos, {0.0, -1.0, 0.0}, &factor) && factor < 0.98f)
             {
                 found_shadow = true;
             }
         }
     }
 
-    render_set_paused(false);
-
     REQUIRE(found_shadow);
 }
 
 TEST_CASE("one-bounce GI does not darken shadowed terrain")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_sun_orbit_enabled(false);
-    render_set_light_intensity(0.0);
-    render_set_moon_intensity(1.0);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_sun_orbit_enabled(false);
+    engine.set_light_intensity(0.0);
+    engine.set_moon_intensity(1.0);
     const Vec3 light_dir = normalize_vec3({0.6, -0.3, 0.8});
-    render_set_moon_direction(light_dir);
-    render_set_shadow_enabled(true);
-    render_set_sky_light_intensity(0.0);
-    render_set_ambient_occlusion_enabled(false);
-    render_set_taa_enabled(false);
-    render_set_gi_enabled(false);
-    render_set_gi_strength(0.0);
+    engine.set_moon_direction(light_dir);
+    engine.set_shadow_enabled(true);
+    engine.set_sky_light_intensity(0.0);
+    engine.set_ambient_occlusion_enabled(false);
+    engine.set_taa_enabled(false);
+    engine.set_gi_enabled(false);
+    engine.set_gi_strength(0.0);
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -2147,26 +2368,27 @@ TEST_CASE("one-bounce GI does not darken shadowed terrain")
     const double yaw = std::atan2(to_target.x, to_target.z);
     const double dist_xz = std::sqrt(to_target.x * to_target.x + to_target.z * to_target.z);
     const double pitch = std::atan2(-to_target.y, dist_xz);
-    render_set_camera_position(eye);
-    render_set_camera_rotation({yaw, pitch});
+    engine.set_camera_position(eye);
+    engine.set_camera_rotation({yaw, pitch});
 
     const size_t width = 200;
     const size_t height = 160;
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    const Vec2 projected = render_project_point(shadow_point, width, height);
+    const Vec2 projected = engine.project_point(shadow_point, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
     const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
-    const uint32_t sky_top = render_get_sky_top_color();
-    const uint32_t sky_bottom = render_get_sky_bottom_color();
+    const uint32_t sky_top = engine.get_sky_top_color();
+    const uint32_t sky_bottom = engine.get_sky_bottom_color();
 
     auto measure_avg = [&](int frames, double& out_avg) {
         double sum = 0.0;
         for (int i = 0; i < frames; ++i)
         {
-            render_update_array(framebuffer.data(), width, height);
+            engine.update(framebuffer.data(), width, height);
             double avg = 0.0;
-            REQUIRE(sample_average_luminance(framebuffer, width, height, px, py, sky_top, sky_bottom, avg));
+            REQUIRE(sample_average_luminance(framebuffer, width, height, px, py, sky_top, sky_bottom,
+                                             engine.get_exposure(), avg));
             sum += avg;
         }
         out_avg = sum / static_cast<double>(frames);
@@ -2175,34 +2397,35 @@ TEST_CASE("one-bounce GI does not darken shadowed terrain")
     double avg_off = 0.0;
     measure_avg(8, avg_off);
 
-    render_set_gi_enabled(true);
-    render_set_gi_strength(1.5);
+    engine.set_gi_enabled(true);
+    engine.set_gi_strength(1.5);
 
     double avg_on = 0.0;
     measure_avg(8, avg_on);
 
-    render_set_gi_enabled(false);
-    render_set_gi_strength(0.0);
-    render_set_paused(false);
+    engine.set_gi_enabled(false);
+    engine.set_gi_strength(0.0);
+    engine.set_paused(false);
 
     REQUIRE(avg_on >= avg_off - 0.5);
 }
 
 TEST_CASE("GI bounce count does not reduce indirect contribution")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_sun_orbit_enabled(false);
-    render_set_light_intensity(0.0);
-    render_set_moon_intensity(1.0);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_sun_orbit_enabled(false);
+    engine.set_light_intensity(0.0);
+    engine.set_moon_intensity(1.0);
     const Vec3 light_dir = normalize_vec3({0.6, -0.3, 0.8});
-    render_set_moon_direction(light_dir);
-    render_set_shadow_enabled(true);
-    render_set_sky_light_intensity(0.0);
-    render_set_ambient_occlusion_enabled(false);
-    render_set_taa_enabled(false);
-    render_set_gi_enabled(true);
-    render_set_gi_strength(2.0);
+    engine.set_moon_direction(light_dir);
+    engine.set_shadow_enabled(true);
+    engine.set_sky_light_intensity(0.0);
+    engine.set_ambient_occlusion_enabled(false);
+    engine.set_taa_enabled(false);
+    engine.set_gi_enabled(true);
+    engine.set_gi_strength(2.0);
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -2216,25 +2439,26 @@ TEST_CASE("GI bounce count does not reduce indirect contribution")
     const double yaw = std::atan2(to_target.x, to_target.z);
     const double dist_xz = std::sqrt(to_target.x * to_target.x + to_target.z * to_target.z);
     const double pitch = std::atan2(-to_target.y, dist_xz);
-    render_set_camera_position(eye);
-    render_set_camera_rotation({yaw, pitch});
+    engine.set_camera_position(eye);
+    engine.set_camera_rotation({yaw, pitch});
 
     const size_t width = 200;
     const size_t height = 160;
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    const Vec2 projected = render_project_point(shadow_point, width, height);
+    const Vec2 projected = engine.project_point(shadow_point, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
     const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
-    const uint32_t sky_top = render_get_sky_top_color();
-    const uint32_t sky_bottom = render_get_sky_bottom_color();
+    const uint32_t sky_top = engine.get_sky_top_color();
+    const uint32_t sky_bottom = engine.get_sky_bottom_color();
 
     auto measure_luminance = [&](int bounces, double& out_avg) {
-        render_set_gi_bounce_count(bounces);
-        render_debug_set_frame_index(121);
-        render_update_array(framebuffer.data(), width, height);
+        engine.set_gi_bounce_count(bounces);
+        engine.renderFrameIndex.store(121, std::memory_order_relaxed);
+        engine.update(framebuffer.data(), width, height);
         double avg = 0.0;
-        REQUIRE(sample_average_luminance(framebuffer, width, height, px, py, sky_top, sky_bottom, avg));
+        REQUIRE(sample_average_luminance(framebuffer, width, height, px, py, sky_top, sky_bottom,
+                                         engine.get_exposure(), avg));
         out_avg = avg;
     };
 
@@ -2243,74 +2467,45 @@ TEST_CASE("GI bounce count does not reduce indirect contribution")
     measure_luminance(1, avg_one);
     measure_luminance(2, avg_two);
 
-    render_set_gi_enabled(false);
-    render_set_gi_strength(0.0);
-    render_set_gi_bounce_count(1);
-    render_set_paused(false);
+    engine.set_gi_enabled(false);
+    engine.set_gi_strength(0.0);
+    engine.set_gi_bounce_count(1);
+    engine.set_paused(false);
 
     REQUIRE(avg_two >= avg_one - 0.1);
 }
 
-TEST_CASE("light direction reads stay coherent under concurrent updates")
+TEST_CASE("light direction updates are consistent")
 {
-    reset_camera();
-    render_set_sun_orbit_enabled(false);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_sun_orbit_enabled(false);
 
     const Vec3 a{1.0, 2.0, 3.0};
     const Vec3 b{-4.0, -5.0, -6.0};
 
-    std::atomic<bool> stop{false};
-    std::atomic<bool> saw_mixed{false};
-    std::atomic<bool> ready{false};
+    engine.set_light_direction(a);
+    Vec3 v = engine.get_light_direction();
+    REQUIRE(v.x == Catch::Approx(a.x));
+    REQUIRE(v.y == Catch::Approx(a.y));
+    REQUIRE(v.z == Catch::Approx(a.z));
 
-    render_set_light_direction(a);
-
-    std::thread writer([&] {
-        for (int i = 0; i < 2000000 && !saw_mixed.load(std::memory_order_relaxed); ++i)
-        {
-            render_set_light_direction(a);
-            render_set_light_direction(b);
-            if (i == 0)
-            {
-                ready.store(true, std::memory_order_release);
-            }
-        }
-        stop.store(true, std::memory_order_relaxed);
-    });
-
-    std::thread reader([&] {
-        while (!ready.load(std::memory_order_acquire))
-        {
-        }
-        while (!stop.load(std::memory_order_relaxed))
-        {
-            const Vec3 v = render_get_light_direction();
-            const bool is_a = (v.x == a.x && v.y == a.y && v.z == a.z);
-            const bool is_b = (v.x == b.x && v.y == b.y && v.z == b.z);
-            if (!is_a && !is_b)
-            {
-                saw_mixed.store(true, std::memory_order_relaxed);
-                break;
-            }
-        }
-    });
-
-    writer.join();
-    stop.store(true, std::memory_order_relaxed);
-    reader.join();
-
-    REQUIRE(!saw_mixed.load(std::memory_order_relaxed));
+    engine.set_light_direction(b);
+    v = engine.get_light_direction();
+    REQUIRE(v.x == Catch::Approx(b.x));
+    REQUIRE(v.y == Catch::Approx(b.y));
+    REQUIRE(v.z == Catch::Approx(b.z));
 }
 
 TEST_CASE("stochastic DDA varies across frames near shadow boundaries")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_sun_orbit_enabled(false);
-    render_set_light_direction({0.6, -0.2, 0.7});
-    render_set_light_intensity(1.0);
-    render_set_moon_intensity(0.0);
-    render_set_shadow_enabled(true);
+    Terrain terrain;
+    LightingEngine lighting;
+    World world_state;
+    world_state.sun.orbit_enabled = false;
+    world_state.sun.direction = {0.6, -0.2, 0.7};
+    world_state.sun.intensity = 1.0;
+    const bool shadows_enabled = true;
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -2346,7 +2541,7 @@ TEST_CASE("stochastic DDA varies across frames near shadow boundaries")
             {
                 for (double oz : offsets)
                 {
-                    const Vec3 world{
+                    const Vec3 world_pos{
                         start_x + x * block_size + ox * block_size,
                         top_y,
                         start_z + z * block_size + oz * block_size
@@ -2356,8 +2551,10 @@ TEST_CASE("stochastic DDA varies across frames near shadow boundaries")
                     for (int frame = 0; frame < 24; ++frame)
                     {
                         float sample = 1.0f;
-                        if (!render_debug_shadow_factor_with_frame(world, normal, light_dir,
-                                                                   x, z, frame, &sample))
+                        if (!shadow_factor_with_frame(terrain, lighting,
+                                                      world_state.sun.angular_radius, shadows_enabled,
+                                                      world_pos, normal, light_dir,
+                                                      x, z, frame, &sample))
                         {
                             continue;
                         }
@@ -2376,41 +2573,41 @@ TEST_CASE("stochastic DDA varies across frames near shadow boundaries")
         }
     }
 
-    render_set_paused(false);
-
     REQUIRE(saw_variation);
 }
 
 TEST_CASE("moon light contributes when sun is disabled")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_light_direction({0.0, 1.0, 0.0});
-    render_set_light_intensity(0.0);
-    render_set_moon_direction({-0.4, 1.0, 0.3});
-    render_set_moon_intensity(0.8);
-    render_set_sky_light_intensity(0.0);
-    render_set_shadow_enabled(false);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_light_direction({0.0, 1.0, 0.0});
+    engine.set_light_intensity(0.0);
+    engine.set_moon_direction({-0.4, 1.0, 0.3});
+    engine.set_moon_intensity(0.8);
+    engine.set_sky_light_intensity(0.0);
+    engine.set_shadow_enabled(false);
 
     const size_t width = 160;
     const size_t height = 120;
     std::vector<uint32_t> moon_on(width * height, 0u);
     std::vector<uint32_t> moon_off(width * height, 0u);
 
-    render_update_array(moon_on.data(), width, height);
+    engine.update(moon_on.data(), width, height);
 
-    render_set_moon_intensity(0.0);
-    render_update_array(moon_off.data(), width, height);
-    render_set_paused(false);
+    engine.set_moon_intensity(0.0);
+    engine.update(moon_off.data(), width, height);
+    engine.set_paused(false);
 
     double sum_on = 0.0;
     double sum_off = 0.0;
     size_t count = 0;
-    const uint32_t sky_top = render_get_sky_top_color();
-    const uint32_t sky_bottom = render_get_sky_bottom_color();
+    const uint32_t sky_top = engine.get_sky_top_color();
+    const uint32_t sky_bottom = engine.get_sky_bottom_color();
     for (size_t y = 0; y < height; ++y)
     {
-        const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom);
+        const uint32_t sky = sky_color_for_row(y, height, sky_top, sky_bottom,
+                                               engine.get_exposure());
         for (size_t x = 0; x < width; ++x)
         {
             const size_t idx = y * width + x;
@@ -2430,15 +2627,16 @@ TEST_CASE("moon light contributes when sun is disabled")
 
 TEST_CASE("phong shading varies within a terrain top face")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_light_intensity(0.0);
-    render_set_sky_light_intensity(1.0);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_light_intensity(0.0);
+    engine.set_sky_light_intensity(1.0);
 
     const uint32_t sky_top = 0xFFFFFFFF;
     const uint32_t sky_bottom = 0xFF000000;
-    render_set_sky_top_color(sky_top);
-    render_set_sky_bottom_color(sky_bottom);
+    engine.set_sky_top_color(sky_top);
+    engine.set_sky_bottom_color(sky_bottom);
 
     int cell_x = 0;
     int cell_z = 0;
@@ -2455,16 +2653,16 @@ TEST_CASE("phong shading varies within a terrain top face")
     const double center_z = start_z + cell_z * block_size;
     const double center_y = base_y - (cell_height - 1) * block_size;
 
-    render_set_camera_position({center_x, center_y - 20.0, center_z - 12.0});
-    render_set_camera_rotation({0.0, -0.8});
+    engine.set_camera_position({center_x, center_y - 20.0, center_z - 12.0});
+    engine.set_camera_rotation({0.0, -0.8});
 
     const size_t width = 200;
     const size_t height = 160;
     std::vector<uint32_t> framebuffer(width * height, 0u);
-    render_update_array(framebuffer.data(), width, height);
-    render_set_paused(false);
+    engine.update(framebuffer.data(), width, height);
+    engine.set_paused(false);
 
-    const Vec2 projected = render_project_point({center_x, center_y - 1.0, center_z}, width, height);
+    const Vec2 projected = engine.project_point({center_x, center_y - 1.0, center_z}, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
     const int py = std::clamp(static_cast<int>(std::lround(projected.y)), 0, static_cast<int>(height) - 1);
 
@@ -2474,7 +2672,8 @@ TEST_CASE("phong shading varies within a terrain top face")
     for (int dy = -radius; dy <= radius && !found_base; ++dy)
     {
         const int y = std::clamp(py + dy, 0, static_cast<int>(height) - 1);
-        const uint32_t sky = sky_color_for_row(static_cast<size_t>(y), height, sky_top, sky_bottom);
+        const uint32_t sky = sky_color_for_row(static_cast<size_t>(y), height, sky_top, sky_bottom,
+                                               engine.get_exposure());
         for (int dx = -radius; dx <= radius; ++dx)
         {
             const int x = std::clamp(px + dx, 0, static_cast<int>(width) - 1);
@@ -2493,7 +2692,8 @@ TEST_CASE("phong shading varies within a terrain top face")
     for (int dy = -radius; dy <= radius; ++dy)
     {
         const int y = std::clamp(py + dy, 0, static_cast<int>(height) - 1);
-        const uint32_t sky = sky_color_for_row(static_cast<size_t>(y), height, sky_top, sky_bottom);
+        const uint32_t sky = sky_color_for_row(static_cast<size_t>(y), height, sky_top, sky_bottom,
+                                               engine.get_exposure());
         for (int dx = -radius; dx <= radius; ++dx)
         {
             const int x = std::clamp(px + dx, 0, static_cast<int>(width) - 1);
@@ -2516,17 +2716,18 @@ TEST_CASE("phong shading varies within a terrain top face")
 
 TEST_CASE("sky lighting is consistent across a terrain side face")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_light_intensity(0.0);
-    render_set_shadow_enabled(false);
-    render_set_ambient_occlusion_enabled(false);
-    render_set_sky_light_intensity(1.0);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_light_intensity(0.0);
+    engine.set_shadow_enabled(false);
+    engine.set_ambient_occlusion_enabled(false);
+    engine.set_sky_light_intensity(1.0);
 
     const uint32_t sky_top = 0xFFFFFFFF;
     const uint32_t sky_bottom = 0xFF000000;
-    render_set_sky_top_color(sky_top);
-    render_set_sky_bottom_color(sky_bottom);
+    engine.set_sky_top_color(sky_top);
+    engine.set_sky_bottom_color(sky_bottom);
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -2549,18 +2750,18 @@ TEST_CASE("sky lighting is consistent across a terrain side face")
     const double face_x = center_x - half;
 
     constexpr double half_pi = 1.5707963267948966;
-    render_set_camera_position({face_x - 8.0, center_y, center_z});
-    render_set_camera_rotation({half_pi, 0.0});
+    engine.set_camera_position({face_x - 8.0, center_y, center_z});
+    engine.set_camera_rotation({half_pi, 0.0});
 
     const size_t width = 200;
     const size_t height = 160;
     std::vector<uint32_t> framebuffer(width * height, 0u);
-    render_update_array(framebuffer.data(), width, height);
-    render_set_paused(false);
+    engine.update(framebuffer.data(), width, height);
+    engine.set_paused(false);
 
     const double inset = half * 0.7;
-    const Vec2 top_proj = render_project_point({face_x, center_y - inset, center_z}, width, height);
-    const Vec2 bottom_proj = render_project_point({face_x, center_y + inset, center_z}, width, height);
+    const Vec2 top_proj = engine.project_point({face_x, center_y - inset, center_z}, width, height);
+    const Vec2 bottom_proj = engine.project_point({face_x, center_y + inset, center_z}, width, height);
 
     REQUIRE(is_finite_double(top_proj.x));
     REQUIRE(is_finite_double(top_proj.y));
@@ -2574,8 +2775,10 @@ TEST_CASE("sky lighting is consistent across a terrain side face")
 
     double top_lum = 0.0;
     double bottom_lum = 0.0;
-    REQUIRE(sample_average_luminance(framebuffer, width, height, top_x, top_y, sky_top, sky_bottom, top_lum));
-    REQUIRE(sample_average_luminance(framebuffer, width, height, bottom_x, bottom_y, sky_top, sky_bottom, bottom_lum));
+    REQUIRE(sample_average_luminance(framebuffer, width, height, top_x, top_y, sky_top, sky_bottom,
+                                     engine.get_exposure(), top_lum));
+    REQUIRE(sample_average_luminance(framebuffer, width, height, bottom_x, bottom_y, sky_top, sky_bottom,
+                                     engine.get_exposure(), bottom_lum));
     REQUIRE(std::abs(top_lum - bottom_lum) <= 6.0);
 }
 
@@ -2586,47 +2789,49 @@ TEST_CASE("normalized Blinn-Phong specular uses Schlick Fresnel")
     const double ndotl = 0.75;
     const double f0 = 0.2;
 
-    const double spec_normal = render_debug_eval_specular(ndoth, 1.0, ndotl, shininess, f0);
+    const double spec_normal = eval_specular_term(ndoth, 1.0, ndotl, shininess, f0);
     const double expected = ((shininess + 8.0) / (8.0 * kPi)) * std::pow(ndoth, shininess) * f0 * ndotl;
     REQUIRE(spec_normal == Catch::Approx(expected).margin(1e-6));
 
-    const double spec_grazing = render_debug_eval_specular(ndoth, 0.2, ndotl, shininess, f0);
+    const double spec_grazing = eval_specular_term(ndoth, 0.2, ndotl, shininess, f0);
     REQUIRE(spec_grazing > spec_normal);
 
-    const double spec_low_ndotl = render_debug_eval_specular(ndoth, 1.0, 0.2, shininess, f0);
+    const double spec_low_ndotl = eval_specular_term(ndoth, 1.0, 0.2, shininess, f0);
     REQUIRE(spec_low_ndotl < spec_normal);
 
-    REQUIRE(render_debug_eval_specular(ndoth, 0.2, ndotl, shininess, 0.0) == Catch::Approx(0.0).margin(1e-9));
+    REQUIRE(eval_specular_term(ndoth, 0.2, ndotl, shininess, 0.0) == Catch::Approx(0.0).margin(1e-9));
 }
 
 TEST_CASE("sky visibility darkens terrain when enabled")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_light_intensity(0.0);
-    render_set_sky_light_intensity(1.0);
-    render_set_sky_top_color(0xFFBBD7FF);
-    render_set_sky_bottom_color(0xFF1A2430);
-    render_set_camera_position({0.0, -10.0, -12.0});
-    render_set_camera_rotation({0.0, -0.6});
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_light_intensity(0.0);
+    engine.set_sky_light_intensity(1.0);
+    engine.set_sky_top_color(0xFFBBD7FF);
+    engine.set_sky_bottom_color(0xFF1A2430);
+    engine.set_camera_position({0.0, -10.0, -12.0});
+    engine.set_camera_rotation({0.0, -0.6});
 
     const size_t width = 160;
     const size_t height = 120;
     std::vector<uint32_t> no_ao(width * height, 0u);
     std::vector<uint32_t> with_ao(width * height, 0u);
 
-    render_set_ambient_occlusion_enabled(false);
-    render_update_array(no_ao.data(), width, height);
-    render_set_ambient_occlusion_enabled(true);
-    render_update_array(with_ao.data(), width, height);
-    render_set_paused(false);
+    engine.set_ambient_occlusion_enabled(false);
+    engine.update(no_ao.data(), width, height);
+    engine.set_ambient_occlusion_enabled(true);
+    engine.update(with_ao.data(), width, height);
+    engine.set_paused(false);
 
     double sum_no = 0.0;
     double sum_with = 0.0;
     size_t count = 0;
     for (size_t y = 0; y < height; ++y)
     {
-        const uint32_t sky = sky_color_for_row(y, height, 0xFFBBD7FF, 0xFF1A2430);
+        const uint32_t sky = sky_color_for_row(y, height, 0xFFBBD7FF, 0xFF1A2430,
+                                               engine.get_exposure());
         for (size_t x = 0; x < width; ++x)
         {
             const size_t idx = y * width + x;
@@ -2649,8 +2854,7 @@ TEST_CASE("sky visibility darkens terrain when enabled")
 
 TEST_CASE("side face sky visibility responds to diagonal neighbor blocks")
 {
-    reset_camera();
-    render_set_paused(true);
+    Terrain terrain;
 
     SideFaceAoProbe probe{};
     REQUIRE(find_right_face_diagonal_occluder(probe));
@@ -2658,8 +2862,8 @@ TEST_CASE("side face sky visibility responds to diagonal neighbor blocks")
     constexpr int kFaceRight = 3;
     constexpr int kCornerTopFront = 3;
     float visibility = 1.0f;
-    REQUIRE(render_get_terrain_vertex_sky_visibility(probe.x, probe.height - 1, probe.z,
-                                                     kFaceRight, kCornerTopFront, &visibility));
+    REQUIRE(terrain_vertex_sky_visibility(terrain, probe.x, probe.height - 1, probe.z,
+                                          kFaceRight, kCornerTopFront, &visibility));
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -2668,13 +2872,11 @@ TEST_CASE("side face sky visibility responds to diagonal neighbor blocks")
                                                          kFaceRight, kCornerTopFront);
 
     REQUIRE(visibility == Catch::Approx(expected).margin(0.02f));
-    render_set_paused(false);
 }
 
 TEST_CASE("side face sky visibility captures off-axis occluders")
 {
-    reset_camera();
-    render_set_paused(true);
+    Terrain terrain;
 
     SideFaceAoProbe probe{};
     REQUIRE(find_right_face_diagonal_occluder(probe));
@@ -2682,16 +2884,14 @@ TEST_CASE("side face sky visibility captures off-axis occluders")
     constexpr int kFaceRight = 3;
     constexpr int kCornerTopFront = 3;
     float visibility = 1.0f;
-    REQUIRE(render_get_terrain_vertex_sky_visibility(probe.x, probe.height - 1, probe.z,
-                                                     kFaceRight, kCornerTopFront, &visibility));
+    REQUIRE(terrain_vertex_sky_visibility(terrain, probe.x, probe.height - 1, probe.z,
+                                          kFaceRight, kCornerTopFront, &visibility));
     REQUIRE(visibility < 0.98f);
-
-    render_set_paused(false);
 }
 
 TEST_CASE("flat terrain top faces match sky visibility raycast")
 {
-    reset_camera();
+    Terrain terrain;
 
     FlatCornerProbe probe{};
     REQUIRE(find_flat_shared_corner(probe));
@@ -2699,7 +2899,7 @@ TEST_CASE("flat terrain top faces match sky visibility raycast")
     const int y = probe.height - 1;
     float visibility = 1.0f;
     const int corner = top_face_corner_from_offsets(probe.sx, probe.sz);
-    REQUIRE(render_get_terrain_vertex_sky_visibility(probe.x, y, probe.z, kFaceTop, corner, &visibility));
+    REQUIRE(terrain_vertex_sky_visibility(terrain, probe.x, y, probe.z, kFaceTop, corner, &visibility));
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -2712,8 +2912,7 @@ TEST_CASE("flat terrain top faces match sky visibility raycast")
 
 TEST_CASE("vertex sky visibility varies within some top faces")
 {
-    reset_camera();
-    render_set_paused(true);
+    Terrain terrain;
 
     constexpr int chunk_size = 16;
     std::vector<int> heights;
@@ -2736,7 +2935,7 @@ TEST_CASE("vertex sky visibility varies within some top faces")
             float max_v = 0.0f;
             for (int corner = 0; corner < 4; ++corner)
             {
-                if (!render_get_terrain_vertex_sky_visibility(x, y, z, kFaceTop, corner, &visibility))
+                if (!terrain_vertex_sky_visibility(terrain, x, y, z, kFaceTop, corner, &visibility))
                 {
                     min_v = 1.0f;
                     max_v = 0.0f;
@@ -2752,15 +2951,12 @@ TEST_CASE("vertex sky visibility varies within some top faces")
         }
     }
 
-    render_set_paused(false);
-
     REQUIRE(found);
 }
 
 TEST_CASE("top face sky visibility varies beyond four discrete levels")
 {
-    reset_camera();
-    render_set_paused(true);
+    Terrain terrain;
 
     constexpr int chunk_size = 16;
     std::unordered_set<int> buckets;
@@ -2777,7 +2973,7 @@ TEST_CASE("top face sky visibility varies beyond four discrete levels")
             const int y = height - 1;
             for (int corner = 0; corner < 4; ++corner)
             {
-                if (!render_get_terrain_vertex_sky_visibility(x, y, z, kFaceTop, corner, &visibility))
+                if (!terrain_vertex_sky_visibility(terrain, x, y, z, kFaceTop, corner, &visibility))
                 {
                     continue;
                 }
@@ -2787,15 +2983,12 @@ TEST_CASE("top face sky visibility varies beyond four discrete levels")
         }
     }
 
-    render_set_paused(false);
-
     REQUIRE(buckets.size() > 4);
 }
 
 TEST_CASE("side face sky visibility varies beyond four discrete levels")
 {
-    reset_camera();
-    render_set_paused(true);
+    Terrain terrain;
 
     constexpr int chunk_size = 16;
     std::vector<int> heights;
@@ -2814,7 +3007,7 @@ TEST_CASE("side face sky visibility varies beyond four discrete levels")
         {
             for (int y = 0; y < max_height; ++y)
             {
-                if (!render_get_terrain_vertex_sky_visibility(x, y, z, kFaceRight, 0, &visibility))
+                if (!terrain_vertex_sky_visibility(terrain, x, y, z, kFaceRight, 0, &visibility))
                 {
                     break;
                 }
@@ -2822,13 +3015,13 @@ TEST_CASE("side face sky visibility varies beyond four discrete levels")
                 buckets.insert(bucket_right0);
                 for (int corner = 1; corner < 4; ++corner)
                 {
-                    if (render_get_terrain_vertex_sky_visibility(x, y, z, kFaceRight, corner, &visibility))
+                    if (terrain_vertex_sky_visibility(terrain, x, y, z, kFaceRight, corner, &visibility))
                     {
                         const int bucket_right = static_cast<int>(std::lround(visibility * 1000.0f));
                         buckets.insert(bucket_right);
                     }
                 }
-                if (!render_get_terrain_vertex_sky_visibility(x, y, z, kFaceFront, 0, &visibility))
+                if (!terrain_vertex_sky_visibility(terrain, x, y, z, kFaceFront, 0, &visibility))
                 {
                     break;
                 }
@@ -2836,7 +3029,7 @@ TEST_CASE("side face sky visibility varies beyond four discrete levels")
                 buckets.insert(bucket_front0);
                 for (int corner = 1; corner < 4; ++corner)
                 {
-                    if (render_get_terrain_vertex_sky_visibility(x, y, z, kFaceFront, corner, &visibility))
+                    if (terrain_vertex_sky_visibility(terrain, x, y, z, kFaceFront, corner, &visibility))
                     {
                         const int bucket_front = static_cast<int>(std::lround(visibility * 1000.0f));
                         buckets.insert(bucket_front);
@@ -2846,66 +3039,67 @@ TEST_CASE("side face sky visibility varies beyond four discrete levels")
         }
     }
 
-    render_set_paused(false);
-
     REQUIRE(buckets.size() > 4);
 }
 
 TEST_CASE("camera state setters and getters")
 {
-    reset_camera();
-    render_set_camera_position({1.0, -2.0, 3.5});
-    const Vec3 pos = render_get_camera_position();
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_camera_position({1.0, -2.0, 3.5});
+    const Vec3 pos = engine.get_camera_position();
     REQUIRE(pos.x == Catch::Approx(1.0));
     REQUIRE(pos.y == Catch::Approx(-2.0));
     REQUIRE(pos.z == Catch::Approx(3.5));
 
-    render_set_camera_rotation({0.25, -0.5});
-    const Vec2 rot = render_get_camera_rotation();
+    engine.set_camera_rotation({0.25, -0.5});
+    const Vec2 rot = engine.get_camera_rotation();
     REQUIRE(rot.x == Catch::Approx(0.25));
     REQUIRE(rot.y == Catch::Approx(-0.5));
 }
 
 TEST_CASE("camera movement in world and local space")
 {
-    reset_camera();
-    render_set_camera_position({0.0, -20.0, -20.0});
-    render_set_camera_rotation({0.0, 0.0});
-    render_move_camera({1.0, -2.0, 3.0});
-    Vec3 pos = render_get_camera_position();
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_camera_position({0.0, -20.0, -20.0});
+    engine.set_camera_rotation({0.0, 0.0});
+    engine.move_camera({1.0, -2.0, 3.0});
+    Vec3 pos = engine.get_camera_position();
     REQUIRE(pos.x == Catch::Approx(1.0));
     REQUIRE(pos.y == Catch::Approx(-22.0));
     REQUIRE(pos.z == Catch::Approx(-17.0));
 
-    render_move_camera_local({0.0, 0.0, 1.0});
-    pos = render_get_camera_position();
+    engine.move_camera_local({0.0, 0.0, 1.0});
+    pos = engine.get_camera_position();
     REQUIRE(pos.x == Catch::Approx(1.0));
     REQUIRE(pos.y == Catch::Approx(-22.0));
     REQUIRE(pos.z == Catch::Approx(-16.0));
 
     constexpr double half_pi = 1.5707963267948966;
-    render_set_camera_position({0.0, -20.0, -20.0});
-    render_set_camera_rotation({half_pi, 0.0});
-    render_move_camera_local({0.0, 0.0, 1.0});
-    pos = render_get_camera_position();
+    engine.set_camera_position({0.0, -20.0, -20.0});
+    engine.set_camera_rotation({half_pi, 0.0});
+    engine.move_camera_local({0.0, 0.0, 1.0});
+    pos = engine.get_camera_position();
     REQUIRE(pos.x == Catch::Approx(1.0));
     REQUIRE(pos.z == Catch::Approx(-20.0).margin(1e-6));
 }
 
 TEST_CASE("reprojection matrices stay stable without camera motion")
 {
-    reset_camera();
-    render_set_taa_enabled(true);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_taa_enabled(true);
     const size_t width = 96;
     const size_t height = 72;
     std::vector<uint32_t> framebuffer(width * height);
 
-    render_update_array(framebuffer.data(), width, height);
-    render_update_array(framebuffer.data(), width, height);
+    engine.update(framebuffer.data(), width, height);
+    engine.update(framebuffer.data(), width, height);
 
-    const Mat4 prev = render_debug_get_previous_vp();
-    const Mat4 curr = render_debug_get_current_vp();
-    const Mat4 inv = render_debug_get_inverse_current_vp();
+    const Mat4 prev = engine.previousVP;
+    const Mat4 curr = engine.currentVP;
+    const Mat4 inv = engine.inverseCurrentVP;
     const Mat4 product = mat4_multiply(curr, inv);
 
     INFO("PreviousVP:\n" << mat4_to_string(prev));
@@ -2918,28 +3112,30 @@ TEST_CASE("reprojection matrices stay stable without camera motion")
 
 TEST_CASE("reprojection matrices change when camera moves")
 {
-    reset_camera();
-    render_set_taa_enabled(true);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_taa_enabled(true);
     const size_t width = 96;
     const size_t height = 72;
     std::vector<uint32_t> framebuffer(width * height);
 
-    render_update_array(framebuffer.data(), width, height);
-    Vec3 pos = render_get_camera_position();
-    render_set_camera_position({pos.x + 1.0, pos.y, pos.z});
-    render_update_array(framebuffer.data(), width, height);
+    engine.update(framebuffer.data(), width, height);
+    Vec3 pos = engine.get_camera_position();
+    engine.set_camera_position({pos.x + 1.0, pos.y, pos.z});
+    engine.update(framebuffer.data(), width, height);
 
-    const Mat4 prev = render_debug_get_previous_vp();
-    const Mat4 curr = render_debug_get_current_vp();
+    const Mat4 prev = engine.previousVP;
+    const Mat4 curr = engine.currentVP;
     INFO("PreviousVP:\n" << mat4_to_string(prev));
     INFO("CurrentVP:\n" << mat4_to_string(curr));
     REQUIRE_FALSE(mat4_near_equal(prev, curr, 1e-9));
 }
 
-TEST_CASE("camera movement blocks entry into terrain")
+TEST_CASE("camera movement ignores terrain collisions")
 {
-    reset_camera();
-    render_set_paused(true);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -2960,75 +3156,50 @@ TEST_CASE("camera movement blocks entry into terrain")
     const double block_y = base_y - (cell_height - 1) * block_size;
 
     const Vec3 start{block_x - half - 0.2, block_y, block_z};
-    render_set_camera_position(start);
-    render_move_camera({0.3, 0.0, 0.0});
-    Vec3 pos = render_get_camera_position();
+    engine.set_camera_position(start);
+    engine.move_camera({0.3, 0.0, 0.0});
+    Vec3 pos = engine.get_camera_position();
 
     const bool inside = std::abs(pos.x - block_x) < half &&
                         std::abs(pos.y - block_y) < half &&
                         std::abs(pos.z - block_z) < half;
-    REQUIRE_FALSE(inside);
+    REQUIRE(inside);
 
-    render_set_camera_position(start);
-    render_move_camera({-0.3, 0.0, 0.0});
-    pos = render_get_camera_position();
+    engine.set_camera_position(start);
+    engine.move_camera({-0.3, 0.0, 0.0});
+    pos = engine.get_camera_position();
     REQUIRE(pos.x == Catch::Approx(start.x - 0.3));
-    render_set_paused(false);
+    engine.set_paused(false);
 }
 
-TEST_CASE("camera forward movement does not climb when blocked by top face")
+TEST_CASE("camera forward movement follows pitch")
 {
-    reset_camera();
-    render_set_paused(true);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_camera_rotation({0.0, -1.2});
 
-    std::vector<int> heights;
-    std::vector<uint32_t> top_colors;
-    build_heightmap(heights, top_colors);
-
-    const int cell_x = 0;
-    const int cell_z = 0;
-    const int cell_height = heights[static_cast<size_t>(cell_z * 16 + cell_x)];
-    REQUIRE(cell_height > 0);
-
-    const double block_size = 2.0;
-    const double half = block_size * 0.5;
-    const double start_x = -(16 - 1) * block_size * 0.5;
-    const double start_z = 4.0;
-    const double base_y = 2.0;
-
-    const double block_x = start_x + cell_x * block_size;
-    const double block_z = start_z + cell_z * block_size;
-    const double block_y = base_y - (cell_height - 1) * block_size;
-    const double top_face = block_y - half;
-
-    render_set_camera_position({block_x, top_face - 0.2, block_z - 1.5});
-    render_set_camera_rotation({0.0, -1.2});
-
-    Vec3 pos = render_get_camera_position();
-    double last_y = pos.y;
-    for (int i = 0; i < 20; ++i)
-    {
-        render_move_camera_local({0.0, 0.0, 0.3});
-        pos = render_get_camera_position();
-        REQUIRE(pos.y + 1e-6 >= last_y);
-        last_y = pos.y;
-    }
-
-    render_set_paused(false);
+    const Vec3 start = engine.get_camera_position();
+    engine.move_camera_local({0.0, 0.0, 1.0});
+    const Vec3 pos = engine.get_camera_position();
+    const Vec3 expected = rotate_yaw_pitch({0.0, 0.0, 1.0}, 0.0, -1.2) + start;
+    REQUIRE(pos.x == Catch::Approx(expected.x));
+    REQUIRE(pos.y == Catch::Approx(expected.y));
+    REQUIRE(pos.z == Catch::Approx(expected.z));
 }
 
-TEST_CASE("render_unproject_point reconstructs world position")
+TEST_CASE("RenderEngine unproject_point reconstructs world position")
 {
-    reset_camera();
+    RenderEngine engine;
+    reset_camera(engine);
     const size_t width = 160;
     const size_t height = 120;
     const Vec3 camera_pos{2.0, -1.5, -3.0};
     const Vec2 camera_rot{0.35, -0.2};
-    render_set_camera_position(camera_pos);
-    render_set_camera_rotation(camera_rot);
+    engine.set_camera_position(camera_pos);
+    engine.set_camera_rotation(camera_rot);
 
     const Vec3 target{10.0, 0.0, 5.0};
-    const Vec2 projected = render_project_point(target, width, height);
+    const Vec2 projected = engine.project_point(target, width, height);
     REQUIRE_FALSE(is_nan_double(projected.x));
     REQUIRE_FALSE(is_nan_double(projected.y));
 
@@ -3038,41 +3209,42 @@ TEST_CASE("render_unproject_point reconstructs world position")
                                        -camera_rot.x, -camera_rot.y);
     REQUIRE(view.z > 0.0);
 
-    const Vec3 reconstructed = render_unproject_point({projected.x, projected.y, view.z},
+    const Vec3 reconstructed = engine.unproject_point({projected.x, projected.y, view.z},
                                                       width, height);
     REQUIRE(reconstructed.x == Catch::Approx(target.x).margin(1e-6));
     REQUIRE(reconstructed.y == Catch::Approx(target.y).margin(1e-6));
     REQUIRE(reconstructed.z == Catch::Approx(target.z).margin(1e-6));
 }
 
-TEST_CASE("render_reproject_point maps world position into previous frame")
+TEST_CASE("RenderEngine reproject_point maps world position into previous frame")
 {
-    reset_camera();
-    render_set_camera_rotation({0.0, 0.0});
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_camera_rotation({0.0, 0.0});
     const size_t width = 160;
     const size_t height = 120;
     std::vector<uint32_t> framebuffer(width * height);
 
-    render_set_camera_position({0.0, 0.0, 0.0});
-    render_update_array(framebuffer.data(), width, height);
+    engine.set_camera_position({0.0, 0.0, 0.0});
+    engine.update(framebuffer.data(), width, height);
 
-    render_set_camera_position({-10.0, 0.0, 0.0});
-    render_update_array(framebuffer.data(), width, height);
+    engine.set_camera_position({-10.0, 0.0, 0.0});
+    engine.update(framebuffer.data(), width, height);
 
     const Vec3 point{0.0, 0.0, 100.0};
-    const Vec2 current = render_project_point(point, width, height);
+    const Vec2 current = engine.project_point(point, width, height);
     REQUIRE(current.x > width / 2.0);
 
-    const Vec3 camera_pos = render_get_camera_position();
+    const Vec3 camera_pos = engine.get_camera_position();
     const double view_z = point.z - camera_pos.z;
     REQUIRE(view_z > 0.0);
 
-    const Vec3 reconstructed = render_unproject_point({current.x, current.y, view_z}, width, height);
+    const Vec3 reconstructed = engine.unproject_point({current.x, current.y, view_z}, width, height);
     REQUIRE(reconstructed.x == Catch::Approx(point.x).margin(1e-6));
     REQUIRE(reconstructed.y == Catch::Approx(point.y).margin(1e-6));
     REQUIRE(reconstructed.z == Catch::Approx(point.z).margin(1e-6));
 
-    const Vec2 prev = render_reproject_point(reconstructed, width, height);
+    const Vec2 prev = engine.reproject_point(reconstructed, width, height);
     REQUIRE(prev.x == Catch::Approx(width / 2.0).margin(1e-6));
     REQUIRE(prev.y == Catch::Approx(height / 2.0).margin(1e-6));
 
@@ -3083,61 +3255,63 @@ TEST_CASE("render_reproject_point maps world position into previous frame")
 
 TEST_CASE("reprojection alignment maps scene points back to previous screen coordinates")
 {
-    reset_camera();
-    render_set_taa_enabled(true);
-    render_set_taa_clamp_enabled(false);
-    render_set_camera_position({0.0, 0.0, -4.0});
-    render_set_camera_rotation({0.0, 0.0});
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_taa_enabled(true);
+    engine.set_taa_clamp_enabled(false);
+    engine.set_camera_position({0.0, 0.0, -4.0});
+    engine.set_camera_rotation({0.0, 0.0});
 
     const size_t width = 160;
     const size_t height = 120;
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    render_update_array(framebuffer.data(), width, height);
+    engine.update(framebuffer.data(), width, height);
 
     const Vec3 point{0.0, 0.0, 12.0};
-    const Vec2 p1 = render_project_point(point, width, height);
+    const Vec2 p1 = engine.project_point(point, width, height);
     REQUIRE(is_finite_double(p1.x));
     REQUIRE(is_finite_double(p1.y));
 
-    Vec3 cam_pos = render_get_camera_position();
-    render_set_camera_position({cam_pos.x + 2.0, cam_pos.y, cam_pos.z});
+    Vec3 cam_pos = engine.get_camera_position();
+    engine.set_camera_position({cam_pos.x + 2.0, cam_pos.y, cam_pos.z});
 
-    render_update_array(framebuffer.data(), width, height);
+    engine.update(framebuffer.data(), width, height);
 
-    const Vec2 p2 = render_project_point(point, width, height);
+    const Vec2 p2 = engine.project_point(point, width, height);
     REQUIRE(is_finite_double(p2.x));
     REQUIRE(is_finite_double(p2.y));
 
-    cam_pos = render_get_camera_position();
-    const Vec2 cam_rot = render_get_camera_rotation();
+    cam_pos = engine.get_camera_position();
+    const Vec2 cam_rot = engine.get_camera_rotation();
     const Vec3 view = rotate_yaw_pitch({point.x - cam_pos.x,
                                         point.y - cam_pos.y,
                                         point.z - cam_pos.z},
                                        -cam_rot.x, -cam_rot.y);
     REQUIRE(view.z > 0.0);
 
-    const Vec3 reconstructed = render_unproject_point({p2.x, p2.y, view.z}, width, height);
-    const Vec2 prev = render_reproject_point(reconstructed, width, height);
+    const Vec3 reconstructed = engine.unproject_point({p2.x, p2.y, view.z}, width, height);
+    const Vec2 prev = engine.reproject_point(reconstructed, width, height);
 
     REQUIRE(prev.x == Catch::Approx(p1.x).margin(1e-4));
     REQUIRE(prev.y == Catch::Approx(p1.y).margin(1e-4));
 
-    render_set_taa_clamp_enabled(true);
+    engine.set_taa_clamp_enabled(true);
 }
 
 TEST_CASE("temporal accumulation rejects history for pixels reprojected outside the frame")
 {
-    reset_camera();
-    render_set_paused(true);
-    render_set_taa_enabled(true);
-    render_set_taa_blend(0.1);
-    render_set_taa_clamp_enabled(false);
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_paused(true);
+    engine.set_taa_enabled(true);
+    engine.set_taa_blend(0.1);
+    engine.set_taa_clamp_enabled(false);
 
     const size_t width = 160;
     const size_t height = 120;
-    const uint32_t sky_top = render_get_sky_top_color();
-    const uint32_t sky_bottom = render_get_sky_bottom_color();
+    const uint32_t sky_top = engine.get_sky_top_color();
+    const uint32_t sky_bottom = engine.get_sky_bottom_color();
 
     std::vector<uint32_t> frame1(width * height, 0u);
     std::vector<uint32_t> frame_with_history(width * height, 0u);
@@ -3172,17 +3346,17 @@ TEST_CASE("temporal accumulation rejects history for pixels reprojected outside 
 
     for (const auto& cfg : configs)
     {
-        render_reset_taa_history();
-        render_set_camera_position(cfg.pos);
-        render_set_camera_rotation(cfg.rot);
-        render_update_array(frame1.data(), width, height);
+        engine.reset_taa_history();
+        engine.set_camera_position(cfg.pos);
+        engine.set_camera_rotation(cfg.rot);
+        engine.update(frame1.data(), width, height);
 
-        render_set_camera_rotation({cfg.rot.x + half_pi, cfg.rot.y});
-        render_update_array(frame_with_history.data(), width, height);
-        const Mat4 prev_vp = render_debug_get_previous_vp();
+        engine.set_camera_rotation({cfg.rot.x + half_pi, cfg.rot.y});
+        engine.update(frame_with_history.data(), width, height);
+        const Mat4 prev_vp = engine.previousVP;
 
-        render_reset_taa_history();
-        render_update_array(frame_current.data(), width, height);
+        engine.reset_taa_history();
+        engine.update(frame_current.data(), width, height);
 
         for (int pass = 0; pass < 2 && !found; ++pass)
         {
@@ -3203,7 +3377,7 @@ TEST_CASE("temporal accumulation rejects history for pixels reprojected outside 
                     const double block_y = base_y - (h - 1) * block_size;
                     const Vec3 world{block_x, block_y - half, block_z};
 
-                    const Vec2 projected = render_project_point(world, width, height);
+                    const Vec2 projected = engine.project_point(world, width, height);
                     if (!is_finite_double(projected.x) || !is_finite_double(projected.y))
                     {
                         continue;
@@ -3220,7 +3394,8 @@ TEST_CASE("temporal accumulation rejects history for pixels reprojected outside 
                         continue;
                     }
 
-                    const uint32_t sky = sky_color_for_row(static_cast<size_t>(py), height, sky_top, sky_bottom);
+                    const uint32_t sky = sky_color_for_row(static_cast<size_t>(py), height, sky_top, sky_bottom,
+                                                           engine.get_exposure());
                     const size_t idx = static_cast<size_t>(py) * width + static_cast<size_t>(px);
                     if (frame_current[idx] == sky)
                     {
@@ -3236,7 +3411,8 @@ TEST_CASE("temporal accumulation rejects history for pixels reprojected outside 
                         }
                     }
 
-                    const Vec2 prev = reproject_with_vp(prev_vp, world, width, height);
+                    const Vec2 prev = reproject_with_vp(prev_vp, world, width, height,
+                                                        engine.get_near_plane());
                     if (!is_finite_double(prev.x) || !is_finite_double(prev.y))
                     {
                         continue;
@@ -3267,8 +3443,8 @@ TEST_CASE("temporal accumulation rejects history for pixels reprojected outside 
     INFO("Output delta: " << output_delta);
     REQUIRE(output_delta <= 2);
 
-    render_set_paused(false);
-    render_set_taa_clamp_enabled(true);
+    engine.set_paused(false);
+    engine.set_taa_clamp_enabled(true);
 }
 
 TEST_CASE("history bilinear sampling blends across top row midpoint")
@@ -3279,7 +3455,7 @@ TEST_CASE("history bilinear sampling blends across top row midpoint")
         {0.0, 0.0, 0.0}, {1.0, 1.0, 1.0},
         {0.0, 0.0, 0.0}, {1.0, 1.0, 1.0}
     }};
-    const Vec3 sample = render_debug_sample_history_bilinear(history.data(), width, height, {1.0, 0.5});
+    const Vec3 sample = sample_history_bilinear(history.data(), width, height, {1.0, 0.5});
     REQUIRE(sample.x == Catch::Approx(0.5));
     REQUIRE(sample.y == Catch::Approx(0.5));
     REQUIRE(sample.z == Catch::Approx(0.5));
@@ -3293,43 +3469,45 @@ TEST_CASE("history bilinear sampling uses fractional weights")
         {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0},
         {0.0, 0.0, 1.0}, {1.0, 1.0, 0.0}
     }};
-    const Vec3 sample = render_debug_sample_history_bilinear(history.data(), width, height, {1.25, 0.75});
+    const Vec3 sample = sample_history_bilinear(history.data(), width, height, {1.25, 0.75});
     REQUIRE(sample.x == Catch::Approx(0.375));
     REQUIRE(sample.y == Catch::Approx(0.75));
     REQUIRE(sample.z == Catch::Approx(0.0625));
 }
 
-TEST_CASE("render_project_point centers consistently")
+TEST_CASE("RenderEngine project_point centers consistently")
 {
-    reset_camera();
+    RenderEngine engine;
+    reset_camera(engine);
     const size_t width = 100;
     const size_t height = 80;
 
-    const Vec2 center = render_project_point({0.0, 0.0, 0.0}, width, height);
+    const Vec2 center = engine.project_point({0.0, 0.0, 0.0}, width, height);
     REQUIRE(center.x == Catch::Approx(width / 2.0));
     REQUIRE(center.y == Catch::Approx(height / 2.0));
 
-    const Vec2 square = render_project_point({1.0, 0.0, 0.0}, 80, 80);
-    const Vec2 wide = render_project_point({1.0, 0.0, 0.0}, 200, 80);
+    const Vec2 square = engine.project_point({1.0, 0.0, 0.0}, 80, 80);
+    const Vec2 wide = engine.project_point({1.0, 0.0, 0.0}, 200, 80);
     const double square_offset = square.x - 40.0;
     const double wide_offset = wide.x - 100.0;
     REQUIRE(wide_offset == Catch::Approx(square_offset));
 }
 
-TEST_CASE("render_project_point returns NaN for points behind camera")
+TEST_CASE("RenderEngine project_point returns NaN for points behind camera")
 {
-    reset_camera();
-    render_set_camera_position({0.0, 0.0, 0.0});
-    render_set_camera_rotation({0.0, 0.0});
+    RenderEngine engine;
+    reset_camera(engine);
+    engine.set_camera_position({0.0, 0.0, 0.0});
+    engine.set_camera_rotation({0.0, 0.0});
     const size_t width = 120;
     const size_t height = 90;
 
-    const Vec2 projected = render_project_point({0.0, 0.0, -1.0}, width, height);
+    const Vec2 projected = engine.project_point({0.0, 0.0, -1.0}, width, height);
     REQUIRE(is_nan_double(projected.x));
     REQUIRE(is_nan_double(projected.y));
 }
 
-TEST_CASE("render_debug_depth_at_sample uses perspective-correct interpolation")
+TEST_CASE("depth_at_sample uses perspective-correct interpolation")
 {
     const Vec3 v0{10.0, 10.0, 1.0};
     const Vec3 v1{30.0, 10.0, 4.0};
@@ -3337,7 +3515,7 @@ TEST_CASE("render_debug_depth_at_sample uses perspective-correct interpolation")
     const Vec2 p{15.0, 15.0};
 
     float depth = 0.0f;
-    REQUIRE(render_debug_depth_at_sample(v0, v1, v2, p, &depth));
+    REQUIRE(depth_at_sample(v0, v1, v2, p, &depth));
 
     auto edge = [](const Vec3& a, const Vec3& b, const Vec2& c) {
         return static_cast<float>((c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x));
@@ -3357,52 +3535,55 @@ TEST_CASE("render_debug_depth_at_sample uses perspective-correct interpolation")
     REQUIRE(depth == Catch::Approx(expected).margin(1e-4f));
 }
 
-TEST_CASE("render_should_rasterize_triangle allows near-plane clipping")
+TEST_CASE("RenderEngine should_rasterize_triangle allows near-plane clipping")
 {
+    RenderEngine engine;
     const Vec3 in_front{0.0, 0.0, 0.2};
     const Vec3 behind{0.0, 0.0, 0.01};
 
-    REQUIRE(render_should_rasterize_triangle(in_front, in_front, in_front));
-    REQUIRE(render_should_rasterize_triangle(behind, in_front, in_front));
-    REQUIRE_FALSE(render_should_rasterize_triangle(behind, behind, behind));
+    REQUIRE(engine.should_rasterize_triangle(in_front, in_front, in_front));
+    REQUIRE(engine.should_rasterize_triangle(behind, in_front, in_front));
+    REQUIRE_FALSE(engine.should_rasterize_triangle(behind, behind, behind));
 }
 
-TEST_CASE("render_clip_triangle_to_near_plane clips partially occluded triangles")
+TEST_CASE("RenderEngine clip_triangle_to_near_plane clips partially occluded triangles")
 {
-    const double near_plane = render_get_near_plane();
+    RenderEngine engine;
+    const double near_plane = engine.get_near_plane();
     const Vec3 in_front{0.0, 0.0, near_plane + 0.1};
     const Vec3 behind{0.0, 0.0, near_plane * 0.5};
 
     Vec3 clipped[4]{};
-    const size_t count = render_clip_triangle_to_near_plane(behind, in_front, in_front, clipped, 4);
+    const size_t count = engine.clip_triangle_to_near_plane(behind, in_front, in_front, clipped, 4);
     REQUIRE(count == 4);
     for (size_t i = 0; i < count; ++i)
     {
         REQUIRE(clipped[i].z >= Catch::Approx(near_plane).margin(1e-6));
     }
 
-    const size_t count_inside = render_clip_triangle_to_near_plane(in_front, in_front, in_front, clipped, 4);
+    const size_t count_inside = engine.clip_triangle_to_near_plane(in_front, in_front, in_front, clipped, 4);
     REQUIRE(count_inside == 3);
 
-    const size_t count_outside = render_clip_triangle_to_near_plane(behind, behind, behind, clipped, 4);
+    const size_t count_outside = engine.clip_triangle_to_near_plane(behind, behind, behind, clipped, 4);
     REQUIRE(count_outside == 0);
 }
 
-TEST_CASE("render_project_point responds to yaw rotation")
+TEST_CASE("RenderEngine project_point responds to yaw rotation")
 {
-    reset_camera();
+    RenderEngine engine;
+    reset_camera(engine);
     const size_t width = 120;
     const size_t height = 90;
-    render_set_camera_position({0.0, 0.0, 0.0});
+    engine.set_camera_position({0.0, 0.0, 0.0});
 
     const Vec3 point{10.0, 0.0, 10.0};
 
-    render_set_camera_rotation({0.0, 0.0});
-    const Vec2 no_yaw = render_project_point(point, width, height);
+    engine.set_camera_rotation({0.0, 0.0});
+    const Vec2 no_yaw = engine.project_point(point, width, height);
     REQUIRE(no_yaw.x > width / 2.0);
 
     const double quarter_pi = 0.7853981633974483;
-    render_set_camera_rotation({quarter_pi, 0.0});
-    const Vec2 rotated = render_project_point(point, width, height);
+    engine.set_camera_rotation({quarter_pi, 0.0});
+    const Vec2 rotated = engine.project_point(point, width, height);
     REQUIRE(rotated.x == Catch::Approx(width / 2.0).margin(1e-6));
 }

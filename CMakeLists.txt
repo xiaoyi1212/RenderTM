@@ -8,17 +8,25 @@ include(CTest)
 include(FetchContent)
 
 add_library(core STATIC)
-target_sources(core
-    PUBLIC
+target_sources(core PUBLIC
     FILE_SET cxx_modules TYPE CXX_MODULES FILES
     src/controls.cppm
     src/input.cppm
     src/keyboard.cppm
     src/terminal.cppm
     src/render/math.cppm
+    src/render/camera.cppm
+    src/render/world.cppm
     src/render/noise.cppm
     src/render/terrain.cppm
     src/render/render.cppm
+)
+target_sources(core PRIVATE
+    src/render/rasterizer.cppm
+    src/render/lighting.cppm
+    src/render/post.cppm
+    src/render/engine.cppm
+    src/render/settings.cppm
 )
 target_compile_features(core PUBLIC cxx_std_26)
 target_compile_options(core PRIVATE
