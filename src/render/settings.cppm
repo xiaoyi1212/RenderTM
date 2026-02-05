@@ -2,225 +2,172 @@ module;
 
 #include "../prelude.hpp"
 
-module render;
+export module settings;
 
-void RenderEngine::set_paused(const bool paused)
-{
-    rotationPaused.store(paused, std::memory_order_relaxed);
-}
+import math;
 
-bool RenderEngine::is_paused() const
+export struct TaaSettings
 {
-    return rotationPaused.load(std::memory_order_relaxed);
-}
+    bool enabled = true;
+    double blend = 0.05;
+    bool clamp_enabled = true;
+};
 
-void RenderEngine::toggle_pause()
+export struct GiSettings
 {
-    rotationPaused.store(!rotationPaused.load(std::memory_order_relaxed),
-                                       std::memory_order_relaxed);
-}
+    bool enabled = false;
+    double strength = 0.0;
+    int bounce_count = 2;
+    double ray_bias = 0.04;
+    double max_distance = 12.0;
+    int noise_salt = 73;
+    int sample_count = 1;
+    float clamp = 4.0f;
+    float ao_lift = 0.15f;
+};
 
-void RenderEngine::set_light_direction(const Vec3 dir)
+export struct ShadowSettings
 {
-    world.sun.direction = dir;
-    mark_state_dirty();
-}
+    double ray_bias = 0.05;
+    int sun_salt = 17;
+    int moon_salt = 19;
+    bool filter_enabled = true;
+    float filter_depth_threshold = 1.0f;
+    float filter_normal_threshold = 0.5f;
+    float filter_center_weight = 4.0f;
+    float filter_neighbor_weight = 1.0f;
+};
 
-Vec3 RenderEngine::get_light_direction() const
+export struct LightingSettings
 {
-    return world.sun.direction;
-}
+    double sun_intensity_boost = 1.2;
+    double hemisphere_bounce_strength = 0.35;
+    LinearColor hemisphere_bounce_color{1.0f, 0.9046612f, 0.7758222f};
+};
 
-void RenderEngine::set_light_intensity(const double intensity)
+export struct RenderSettings
 {
-    world.sun.intensity = intensity;
-    mark_state_dirty();
-}
+    bool paused = false;
+    double ambient_light = 0.13;
+    bool ambient_occlusion_enabled = true;
+    bool shadow_enabled = true;
+    TaaSettings taa{};
+    GiSettings gi{};
+    ShadowSettings shadow{};
+    LightingSettings lighting{};
 
-double RenderEngine::get_light_intensity() const
-{
-    return world.sun.intensity;
-}
-
-void RenderEngine::set_sun_orbit_enabled(const bool enabled)
-{
-    world.sun.orbit_enabled = enabled;
-    mark_state_dirty();
-}
-
-bool RenderEngine::get_sun_orbit_enabled() const
-{
-    return world.sun.orbit_enabled;
-}
-
-void RenderEngine::set_sun_orbit_angle(const double angle)
-{
-    world.sun.orbit_angle = angle;
-    mark_state_dirty();
-}
-
-double RenderEngine::get_sun_orbit_angle() const
-{
-    return world.sun.orbit_angle;
-}
-
-void RenderEngine::set_moon_direction(const Vec3 dir)
-{
-    world.moon.direction = dir;
-    mark_state_dirty();
-}
-
-void RenderEngine::set_moon_intensity(const double intensity)
-{
-    world.moon.intensity = intensity;
-    mark_state_dirty();
-}
-
-void RenderEngine::set_sky_top_color(const uint32_t color)
-{
-    world.sky.day_zenith = ColorSrgb::from_hex(color).to_linear();
-    mark_state_dirty();
-}
-
-uint32_t RenderEngine::get_sky_top_color() const
-{
-    return pack_color(world.sky.day_zenith.to_srgb());
-}
-
-void RenderEngine::set_sky_bottom_color(const uint32_t color)
-{
-    world.sky.day_horizon = ColorSrgb::from_hex(color).to_linear();
-    mark_state_dirty();
-}
-
-uint32_t RenderEngine::get_sky_bottom_color() const
-{
-    return pack_color(world.sky.day_horizon.to_srgb());
-}
-
-void RenderEngine::set_sky_light_intensity(const double intensity)
-{
-    world.sky.sky_intensity = intensity;
-    mark_state_dirty();
-}
-
-double RenderEngine::get_sky_light_intensity() const
-{
-    return world.sky.sky_intensity;
-}
-
-void RenderEngine::set_exposure(const double value)
-{
-    world.sky.exposure = std::max(0.0, value);
-    mark_state_dirty();
-}
-
-double RenderEngine::get_exposure() const
-{
-    return world.sky.exposure;
-}
-
-void RenderEngine::set_taa_enabled(const bool enabled)
-{
-    taaEnabled.store(enabled, std::memory_order_relaxed);
-    mark_state_dirty();
-}
-
-bool RenderEngine::get_taa_enabled() const
-{
-    return taaEnabled.load(std::memory_order_relaxed);
-}
-
-void RenderEngine::set_taa_blend(const double blend)
-{
-    taaBlend.store(std::clamp(blend, 0.0, 1.0), std::memory_order_relaxed);
-    mark_state_dirty();
-}
-
-double RenderEngine::get_taa_blend() const
-{
-    return taaBlend.load(std::memory_order_relaxed);
-}
-
-void RenderEngine::set_taa_clamp_enabled(const bool enabled)
-{
-    taaClampEnabled.store(enabled, std::memory_order_relaxed);
-    mark_state_dirty();
-}
-
-bool RenderEngine::get_taa_clamp_enabled() const
-{
-    return taaClampEnabled.load(std::memory_order_relaxed);
-}
-
-void RenderEngine::set_gi_enabled(const bool enabled)
-{
-    giEnabled.store(enabled, std::memory_order_relaxed);
-    mark_state_dirty();
-}
-
-bool RenderEngine::get_gi_enabled() const
-{
-    return giEnabled.load(std::memory_order_relaxed);
-}
-
-void RenderEngine::set_gi_strength(const double strength)
-{
-    giStrength.store(std::max(0.0, strength), std::memory_order_relaxed);
-    mark_state_dirty();
-}
-
-double RenderEngine::get_gi_strength() const
-{
-    return giStrength.load(std::memory_order_relaxed);
-}
-
-void RenderEngine::set_gi_bounce_count(const int count)
-{
-    giBounceCount.store(count, std::memory_order_relaxed);
-    mark_state_dirty();
-}
-
-int RenderEngine::get_gi_bounce_count() const
-{
-    return giBounceCount.load(std::memory_order_relaxed);
-}
-
-void RenderEngine::reset_taa_history()
-{
-    mark_state_dirty();
-}
-
-void RenderEngine::set_ambient_occlusion_enabled(const bool enabled)
-{
-    ambientOcclusionEnabled.store(enabled, std::memory_order_relaxed);
-    mark_state_dirty();
-}
-
-void RenderEngine::set_shadow_enabled(const bool enabled)
-{
-    shadowEnabled.store(enabled, std::memory_order_relaxed);
-    mark_state_dirty();
-}
-
-double RenderEngine::taa_sharpen_strength() const
-{
-    return taaSharpenStrength.load(std::memory_order_relaxed);
-}
-
-double RenderEngine::taa_sharpen_percent() const
-{
-    const double max_strength = kTaaSharpenMax;
-    if (max_strength <= 0.0)
+    auto set_paused(const bool value) -> void
     {
-        return 0.0;
+        paused = value;
     }
-    const double strength = taa_sharpen_strength();
-    const double ratio = std::clamp(strength / max_strength, 0.0, 1.0);
-    return ratio * 100.0;
-}
 
-void RenderEngine::mark_state_dirty()
-{
-    renderStateVersion.fetch_add(1u, std::memory_order_relaxed);
-}
+    [[nodiscard]]
+    auto is_paused() const -> bool
+    {
+        return paused;
+    }
+
+    auto toggle_pause() -> void
+    {
+        paused = !paused;
+    }
+
+    auto set_ambient_light(const double value) -> void
+    {
+        ambient_light = std::max(0.0, value);
+    }
+
+    [[nodiscard]]
+    auto get_ambient_light() const -> double
+    {
+        return ambient_light;
+    }
+
+    auto set_ambient_occlusion_enabled(const bool value) -> void
+    {
+        ambient_occlusion_enabled = value;
+    }
+
+    [[nodiscard]]
+    auto get_ambient_occlusion_enabled() const -> bool
+    {
+        return ambient_occlusion_enabled;
+    }
+
+    auto set_shadow_enabled(const bool value) -> void
+    {
+        shadow_enabled = value;
+    }
+
+    [[nodiscard]]
+    auto get_shadow_enabled() const -> bool
+    {
+        return shadow_enabled;
+    }
+
+    auto set_taa_enabled(const bool value) -> void
+    {
+        taa.enabled = value;
+    }
+
+    [[nodiscard]]
+    auto get_taa_enabled() const -> bool
+    {
+        return taa.enabled;
+    }
+
+    auto set_taa_blend(const double value) -> void
+    {
+        taa.blend = std::clamp(value, 0.0, 1.0);
+    }
+
+    [[nodiscard]]
+    auto get_taa_blend() const -> double
+    {
+        return taa.blend;
+    }
+
+    auto set_taa_clamp_enabled(const bool value) -> void
+    {
+        taa.clamp_enabled = value;
+    }
+
+    [[nodiscard]]
+    auto get_taa_clamp_enabled() const -> bool
+    {
+        return taa.clamp_enabled;
+    }
+
+    auto set_gi_enabled(const bool value) -> void
+    {
+        gi.enabled = value;
+    }
+
+    [[nodiscard]]
+    auto get_gi_enabled() const -> bool
+    {
+        return gi.enabled;
+    }
+
+    auto set_gi_strength(const double value) -> void
+    {
+        gi.strength = std::max(0.0, value);
+    }
+
+    [[nodiscard]]
+    auto get_gi_strength() const -> double
+    {
+        return gi.strength;
+    }
+
+    auto set_gi_bounce_count(const int count) -> void
+    {
+        gi.bounce_count = count;
+    }
+
+    [[nodiscard]]
+    auto get_gi_bounce_count() const -> int
+    {
+        return gi.bounce_count;
+    }
+};

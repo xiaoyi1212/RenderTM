@@ -115,9 +115,9 @@ TEST_CASE("mouse_look_velocity scales with distance and direction")
     const auto far = InputParser::mouse_look_velocity(params);
 
     REQUIRE(near.yaw < 0.0);
-    REQUIRE(near.pitch > 0.0);
+    REQUIRE(near.pitch < 0.0);
     REQUIRE(far.yaw < 0.0);
-    REQUIRE(far.pitch > 0.0);
+    REQUIRE(far.pitch < 0.0);
 
     REQUIRE(std::abs(far.yaw) > std::abs(near.yaw));
     REQUIRE(std::abs(far.pitch) > std::abs(near.pitch));

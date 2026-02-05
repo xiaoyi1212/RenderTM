@@ -31,10 +31,10 @@ export struct MoveIntent
                 return {MoveSpace::Local, {0.0, 0.0, -step}};
 
             case InputAction::MoveUp:
-                return {MoveSpace::World, {0.0, -step, 0.0}};
+                return {MoveSpace::World, {0.0, step, 0.0}};
 
             case InputAction::MoveDown:
-                return {MoveSpace::World, {0.0, step, 0.0}};
+                return {MoveSpace::World, {0.0, -step, 0.0}};
 
             case InputAction::MoveLeft:
             case InputAction::MoveRight:
@@ -47,7 +47,9 @@ export struct MoveIntent
 
             case InputAction::None:
             case InputAction::Quit:
-            case InputAction::TogglePause: break;
+            case InputAction::TogglePause:
+            case InputAction::ToggleGI:
+            case InputAction::ToggleAO: break;
         }
 
         return {MoveSpace::None, {}};

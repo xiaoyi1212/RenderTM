@@ -2,111 +2,90 @@ module;
 
 #include "../prelude.hpp"
 
-export module render:terrain;
+export module terrain;
 
-import :math;
-import :noise;
+import math;
+import noise;
 
-export enum FaceIndex
+export struct BlockGeometry
 {
-    FaceTop = 0,    // normal -Y
-    FaceBottom = 1, // normal +Y
-    FaceLeft = 2,   // normal -X
-    FaceRight = 3,  // normal +X
-    FaceBack = 4,   // normal -Z
-    FaceFront = 5   // normal +Z
+    static constexpr int FaceTop = 0;
+    static constexpr int FaceBottom = 1;
+    static constexpr int FaceLeft = 2;
+    static constexpr int FaceRight = 3;
+    static constexpr int FaceBack = 4;
+    static constexpr int FaceFront = 5;
+
+    static constexpr std::array<Vec3, 8> vertices = {{
+        {-1, -1, -1}, {1, -1, -1}, {1,  1, -1}, {-1,  1, -1},
+        {-1, -1,  1}, {1, -1,  1}, {1,  1,  1}, {-1,  1,  1}
+    }};
+
+    static constexpr std::array<std::array<int, 4>, 6> face_vertices = {{
+        {{3, 2, 6, 7}}, // top (+y)
+        {{0, 1, 5, 4}}, // bottom (-y)
+        {{0, 3, 7, 4}}, // left (-x)
+        {{1, 2, 6, 5}}, // right (+x)
+        {{0, 1, 2, 3}}, // back (-z)
+        {{4, 5, 6, 7}}  // front (+z)
+    }};
+
+    static constexpr std::array<std::array<int, 4>, 6> quad_order = {{
+        {{3, 7, 6, 2}}, // top (+y)
+        {{0, 1, 5, 4}}, // bottom (-y)
+        {{0, 4, 7, 3}}, // left (-x)
+        {{1, 2, 6, 5}}, // right (+x)
+        {{0, 3, 2, 1}}, // back (-z)
+        {{4, 5, 6, 7}}  // front (+z)
+    }};
+
+    static constexpr std::array<std::array<int, 3>, 6> face_normals = {{
+        {{0, 1, 0}},   // top (+y)
+        {{0, -1, 0}},  // bottom (-y)
+        {{-1, 0, 0}},  // left (-x)
+        {{1, 0, 0}},   // right (+x)
+        {{0, 0, -1}},  // back (-z)
+        {{0, 0, 1}}    // front (+z)
+    }};
+
+    static constexpr std::array<Vec3, 8> vertices_grid = {{
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {1.0, 1.0, 0.0},
+        {0.0, 1.0, 0.0},
+        {0.0, 0.0, 1.0},
+        {1.0, 0.0, 1.0},
+        {1.0, 1.0, 1.0},
+        {0.0, 1.0, 1.0}
+    }};
+
+    [[nodiscard]]
+    static constexpr auto face_normal_world(const int face) -> Vec3
+    {
+        const double x = static_cast<double>(face_normals[face][0]);
+        const double y = static_cast<double>(face_normals[face][1]);
+        const double z = static_cast<double>(face_normals[face][2]);
+        return {x, y, z};
+    }
 };
 
-constexpr std::array<Vec3, 8> cubeVertices = {{
-    {-1, -1, -1}, {1, -1, -1}, {1,  1, -1}, {-1,  1, -1},
-    {-1, -1,  1}, {1, -1,  1}, {1,  1,  1}, {-1,  1,  1}
-}};
-
-constexpr std::array<std::array<int, 4>, 6> cubeFaceVertices = {{
-    {{0, 1, 5, 4}}, // top (-y)
-    {{3, 2, 6, 7}}, // bottom (+y)
-    {{0, 3, 7, 4}}, // left (-x)
-    {{1, 2, 6, 5}}, // right (+x)
-    {{0, 1, 2, 3}}, // back (-z)
-    {{4, 5, 6, 7}}  // front (+z)
-}};
-
-constexpr std::array<std::array<int, 4>, 6> cubeFaceQuadOrder = {{
-    {{0, 1, 5, 4}}, // top (-y)
-    {{3, 7, 6, 2}}, // bottom (+y)
-    {{0, 4, 7, 3}}, // left (-x)
-    {{1, 2, 6, 5}}, // right (+x)
-    {{0, 3, 2, 1}}, // back (-z)
-    {{4, 5, 6, 7}}  // front (+z)
-}};
-
-constexpr std::array<std::array<int, 3>, 6> cubeFaceNormal = {{
-    {{0, 1, 0}},   // top (-y world, +y grid)
-    {{0, -1, 0}},  // bottom (+y world, -y grid)
-    {{-1, 0, 0}},  // left (-x)
-    {{1, 0, 0}},   // right (+x)
-    {{0, 0, -1}},  // back (-z)
-    {{0, 0, 1}}    // front (+z)
-}};
-
-constexpr std::array<Vec3, 8> cubeVerticesGrid = {{
-    {0.0, 1.0, 0.0},
-    {1.0, 1.0, 0.0},
-    {1.0, 0.0, 0.0},
-    {0.0, 0.0, 0.0},
-    {0.0, 1.0, 1.0},
-    {1.0, 1.0, 1.0},
-    {1.0, 0.0, 1.0},
-    {0.0, 0.0, 1.0}
-}};
-
-constexpr int kTerrainChunkSize = 16;
-constexpr double kTerrainBlockSize = 2.0;
-constexpr double kTerrainStartZ = 4.0;
-constexpr double kTerrainBaseY = 2.0;
-constexpr size_t kSkyRayCount = 128;
-constexpr double kSkyRayStep = 0.25;
-constexpr double kSkyRayMaxDistance = 6.0;
-constexpr double kSkyRayBias = 0.02;
-constexpr double kSkyRayCenterBias = 0.02;
-
-static Vec3 face_normal_world(const int face)
+export struct TerrainConfig
 {
-    const double x = static_cast<double>(cubeFaceNormal[face][0]);
-    const double y = static_cast<double>(-cubeFaceNormal[face][1]);
-    const double z = static_cast<double>(cubeFaceNormal[face][2]);
-    return {x, y, z};
-}
+    int chunk_size = 16;
+    double block_size = 2.0;
+    double start_z = 4.0;
+    double base_y = 2.0;
+    int base_height = 4;
+    int dirt_thickness = 2;
+    int height_variation = 6;
+    double height_freq = 0.12;
+    double surface_freq = 0.4;
 
-static double radical_inverse_vdc(uint32_t bits)
-{
-    bits = (bits << 16u) | (bits >> 16u);
-    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
-    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
-    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
-    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
-    return static_cast<double>(bits) * 2.3283064365386963e-10;
-}
-
-static auto sky_sample_dirs() -> const std::array<Vec3, kSkyRayCount>&
-{
-    static const std::array<Vec3, kSkyRayCount> dirs = [] {
-        std::array<Vec3, kSkyRayCount> samples{};
-        for (size_t i = 0; i < kSkyRayCount; ++i)
-        {
-            const double u = (static_cast<double>(i) + 0.5) / static_cast<double>(kSkyRayCount);
-            const double v = radical_inverse_vdc(static_cast<uint32_t>(i));
-            const double r = std::sqrt(u);
-            const double theta = 2.0 * std::numbers::pi_v<double> * v;
-            const double x = r * std::cos(theta);
-            const double y = r * std::sin(theta);
-            const double z = std::sqrt(std::max(0.0, 1.0 - u));
-            samples[i] = {x, y, z};
-        }
-        return samples;
-    }();
-    return dirs;
-}
+    uint32_t stone_color = 0xFF7A7A7A;
+    uint32_t dirt_color  = 0xFF7D4714;
+    uint32_t grass_color = 0xFF3B8A38;
+    uint32_t water_color = 0xFF2B5FA8;
+};
 
 export struct VoxelBlock
 {
@@ -114,7 +93,7 @@ export struct VoxelBlock
     uint32_t color;
     LinearColor albedo_linear;
     std::array<std::array<Vec3, 4>, 6> face_normals;
-    std::array<std::array<float, 4>, 6> face_sky_visibility;
+    std::array<std::array<float, 4>, 6> sky_visibility;
 };
 
 export struct RenderQuad
@@ -125,449 +104,506 @@ export struct RenderQuad
     uint32_t color;
 };
 
-export struct Terrain
+struct BlockTopology
 {
-    std::vector<VoxelBlock> blocks;
-    std::vector<RenderQuad> mesh;
-    int chunk_size = kTerrainChunkSize;
+    int chunk_size = 0;
+    int max_height = 0;
+    std::vector<int> heights;
+    std::vector<int> block_index;
 
-    auto generate() -> void
+    [[nodiscard]]
+    constexpr auto index(const int gx, const int gz) const -> size_t
     {
-        std::call_once(init_flag, [&]() { build_chunk(); });
+        return static_cast<size_t>(gz * chunk_size + gx);
     }
 
-    auto triangle_count() const -> size_t
+    [[nodiscard]]
+    constexpr auto block_slot(const int gx, const int gy, const int gz) const -> size_t
     {
-        return mesh.size() * 2;
+        const size_t x = static_cast<size_t>(gx);
+        const size_t y = static_cast<size_t>(gy);
+        const size_t z = static_cast<size_t>(gz);
+
+        const size_t width  = static_cast<size_t>(chunk_size);
+        const size_t height = static_cast<size_t>(max_height);
+
+        const size_t z_stride = height * width;
+        const size_t y_stride = width;
+        return (z * z_stride) + (y * y_stride) + x;
     }
 
-    auto block_count() const -> size_t
-    {
-        return blocks.size();
-    }
-
-    auto visible_face_count() const -> size_t
-    {
-        return visible_faces;
-    }
-
-    auto max_height() const -> int
-    {
-        return max_height_value;
-    }
-
-    auto block_size() const -> double
-    {
-        return kTerrainBlockSize;
-    }
-
-    auto start_z() const -> double
-    {
-        return kTerrainStartZ;
-    }
-
-    auto base_y() const -> double
-    {
-        return kTerrainBaseY;
-    }
-
-    auto start_x() const -> double
-    {
-        return -(static_cast<double>(chunk_size) - 1.0) * block_size() * 0.5;
-    }
-
+    [[nodiscard]]
     auto has_block(const int gx, const int gy, const int gz) const -> bool
     {
         if (gx < 0 || gx >= chunk_size || gz < 0 || gz >= chunk_size)
         {
             return false;
         }
-        if (gy < 0)
-        {
-            return false;
-        }
-        const size_t idx = static_cast<size_t>(gz * chunk_size + gx);
+        if (gy < 0) return false;
+
+        const size_t idx = index(gx, gz);
         if (idx >= heights.size())
         {
             return false;
         }
+
         return gy < heights[idx];
     }
 
-    auto block_at(const int gx, const int gy, const int gz) const -> const VoxelBlock*
+    [[nodiscard]]
+    auto block_at(std::span<const VoxelBlock> blocks,
+                  const int gx, const int gy, const int gz) const
+        -> std::optional<std::reference_wrapper<const VoxelBlock>>
     {
         if (gx < 0 || gx >= chunk_size || gz < 0 || gz >= chunk_size)
         {
-            return nullptr;
+            return std::nullopt;
         }
-        if (gy < 0 || gy >= max_height_value)
+        if (gy < 0 || gy >= max_height)
         {
-            return nullptr;
+            return std::nullopt;
         }
         const size_t slot = block_slot(gx, gy, gz);
         if (slot >= block_index.size())
         {
-            return nullptr;
+            return std::nullopt;
         }
         const int index = block_index[slot];
         if (index < 0 || static_cast<size_t>(index) >= blocks.size())
         {
-            return nullptr;
+            return std::nullopt;
         }
-        return &blocks[static_cast<size_t>(index)];
+        return std::cref(blocks[static_cast<size_t>(index)]);
     }
+};
 
-    auto get_sky_visibility_at(const int x, const int y, const int z,
-                               const int face, const int corner) const -> std::optional<float>
-    {
-        if (face < 0 || face >= 6 || corner < 0 || corner >= 4)
-        {
-            return std::nullopt;
-        }
-        if (x < 0 || z < 0 || x >= chunk_size || z >= chunk_size)
-        {
-            return std::nullopt;
-        }
-        const size_t idx = static_cast<size_t>(z * chunk_size + x);
-        if (idx >= heights.size())
-        {
-            return std::nullopt;
-        }
-        const int height = heights[idx];
-        if (y < 0 || y >= height)
-        {
-            return std::nullopt;
-        }
-        const VoxelBlock* block = block_at(x, y, z);
-        if (!block)
-        {
-            return std::nullopt;
-        }
-        return block->face_sky_visibility[static_cast<size_t>(face)][static_cast<size_t>(corner)];
-    }
+struct Occlusion
+{
+    Occlusion() = delete;
 
-    auto intersects_block(const Vec3& pos) const -> bool
-    {
-        const double block = block_size();
-        const double half = block * 0.5;
-        const double gx_f = (pos.x - start_x() + half) / block;
-        const double gz_f = (pos.z - start_z() + half) / block;
-        const double gy_f = (base_y() - pos.y + half) / block;
-
-        const int gx = static_cast<int>(std::floor(gx_f));
-        const int gz = static_cast<int>(std::floor(gz_f));
-        const int gy = static_cast<int>(std::floor(gy_f));
-
-        if (!has_block(gx, gy, gz))
-        {
-            return false;
-        }
-
-        const double center_x = start_x() + gx * block;
-        const double center_z = start_z() + gz * block;
-        const double center_y = base_y() - gy * block;
-
-        return std::abs(pos.x - center_x) < half &&
-               std::abs(pos.y - center_y) < half &&
-               std::abs(pos.z - center_z) < half;
-    }
-
-private:
-    std::vector<int> heights;
-    std::vector<uint32_t> top_colors;
-    std::vector<int> block_index;
-    int max_height_value = 0;
-    bool mesh_ready = false;
-    size_t visible_faces = 0;
-    std::once_flag init_flag;
-
-    auto block_slot(const int gx, const int gy, const int gz) const -> size_t
-    {
-        return (static_cast<size_t>(gz) * static_cast<size_t>(max_height_value) +
-                static_cast<size_t>(gy)) * static_cast<size_t>(chunk_size) +
-               static_cast<size_t>(gx);
-    }
-
-    auto compute_vertex_sky_visibility(const int gx, const int gy, const int gz,
-                                       const int face, const int corner) const -> float
+    [[nodiscard]]
+    static auto sample(const BlockTopology& topology, 
+                       const int gx, const int gy, const int gz,
+                       const int face, const int corner) -> float
     {
         Vec3 normal{
-            static_cast<double>(cubeFaceNormal[face][0]),
-            static_cast<double>(cubeFaceNormal[face][1]),
-            static_cast<double>(cubeFaceNormal[face][2])
+            static_cast<double>(BlockGeometry::face_normals[face][0]),
+            static_cast<double>(BlockGeometry::face_normals[face][1]),
+            static_cast<double>(BlockGeometry::face_normals[face][2])
         };
         auto [tangent, bitangent, forward] = Vec3::get_basis(normal);
         normal = forward;
 
-        const int vi = cubeFaceVertices[face][corner];
-        const Vec3 offset = cubeVerticesGrid[vi];
-        const Vec3 vertex{
-            static_cast<double>(gx) + offset.x,
-            static_cast<double>(gy) + offset.y,
-            static_cast<double>(gz) + offset.z
+        const Vec3 grid_pos{
+            static_cast<double>(gx),
+            static_cast<double>(gy),
+            static_cast<double>(gz)
         };
-        const Vec3 center{
-            static_cast<double>(gx) + 0.5,
-            static_cast<double>(gy) + 0.5,
-            static_cast<double>(gz) + 0.5
-        };
+        const int vi = BlockGeometry::face_vertices[face][corner];
+        const Vec3 vertex = grid_pos + BlockGeometry::vertices_grid[vi];
+        const Vec3 center = grid_pos + Vec3{0.5, 0.5, 0.5};
 
-        Vec3 origin = vertex;
-        origin.x += normal.x * kSkyRayBias;
-        origin.y += normal.y * kSkyRayBias;
-        origin.z += normal.z * kSkyRayBias;
-        origin.x += (center.x - vertex.x) * kSkyRayCenterBias;
-        origin.y += (center.y - vertex.y) * kSkyRayCenterBias;
-        origin.z += (center.z - vertex.z) * kSkyRayCenterBias;
+        const Vec3 origin = vertex + 
+                            normal * kRayBias + 
+                            (center - vertex) * kRayCenterBias;
 
-        const auto& samples = sky_sample_dirs();
+        const auto& samples = sample_dirs();
         size_t occluded = 0;
         for (const auto& sample : samples)
         {
-            Vec3 dir{
-                tangent.x * sample.x + bitangent.x * sample.y + normal.x * sample.z,
-                tangent.y * sample.x + bitangent.y * sample.y + normal.y * sample.z,
-                tangent.z * sample.x + bitangent.z * sample.y + normal.z * sample.z
-            };
+            const Vec3 dir = tangent * sample.x +
+                             bitangent * sample.y +
+                             normal * sample.z;
 
             bool hit = false;
-            for (double t = kSkyRayStep; t <= kSkyRayMaxDistance; t += kSkyRayStep)
+            for (double t = kRayStep; t <= kRayMaxDistance; t += kRayStep)
             {
-                const Vec3 p{
-                    origin.x + dir.x * t,
-                    origin.y + dir.y * t,
-                    origin.z + dir.z * t
-                };
+                const Vec3 p = origin + dir * t;
                 const int vx = static_cast<int>(std::floor(p.x));
                 const int vy = static_cast<int>(std::floor(p.y));
                 const int vz = static_cast<int>(std::floor(p.z));
-                if (has_block(vx, vy, vz))
+                if (topology.has_block(vx, vy, vz))
                 {
                     hit = true;
                     break;
                 }
             }
-            if (hit)
-            {
-                occluded++;
-            }
+            if (hit) occluded++;
         }
 
-        const double visibility = 1.0 - static_cast<double>(occluded) /
-                                          static_cast<double>(samples.size());
-        return static_cast<float>(std::clamp(visibility, 0.0, 1.0));
+        const double total_samples = static_cast<double>(samples.size());
+        const double occlusion_ratio = static_cast<double>(occluded) / total_samples;
+        const double raw_visibility = 1.0 - occlusion_ratio;
+
+        return static_cast<float>(std::clamp(raw_visibility, 0.0, 1.0));
     }
 
-    auto emit_block_face_quad(const VoxelBlock& block, const int face) -> void
+private:
+    static constexpr size_t kRayCount = 128;
+    static constexpr double kRayStep = 0.25;
+    static constexpr double kRayMaxDistance = 6.0;
+    static constexpr double kRayBias = 0.02;
+    static constexpr double kRayCenterBias = 0.02;
+
+    [[nodiscard]]
+    static auto sample_dirs() -> const std::array<Vec3, kRayCount>&
     {
-        RenderQuad quad{};
-        quad.color = block.color;
-        auto corner_index = [&](const int vertex_index) -> int {
-            for (int i = 0; i < 4; ++i)
+        static const auto dirs = [] {
+            std::array<Vec3, kRayCount> samples{};
+            constexpr double total_rays = static_cast<double>(kRayCount);
+
+            for (size_t i = 0; i < kRayCount; ++i)
             {
-                if (cubeFaceVertices[face][i] == vertex_index)
-                {
-                    return i;
-                }
+                const double index = static_cast<double>(i);
+                const double u = (index + 0.5) / total_rays;
+                const double v = radical_inverse_vdc(static_cast<uint32_t>(i));
+
+                const double r = std::sqrt(u);
+                const double theta = 2.0 * std::numbers::pi_v<double> * v;
+
+                const double x = r * std::cos(theta);
+                const double y = r * std::sin(theta);
+                const double z = std::sqrt(std::max(0.0, 1.0 - u));
+                samples[i] = {x, y, z};
             }
-            return -1;
-        };
-        for (int corner = 0; corner < 4; ++corner)
-        {
-            const int vi = cubeFaceQuadOrder[face][corner];
-            quad.v[corner] = block.position + cubeVertices[vi];
-            const int face_corner = corner_index(vi);
-            const int attr_corner = face_corner < 0 ? corner : face_corner;
-            quad.sky_visibility[corner] = block.face_sky_visibility[static_cast<size_t>(face)][static_cast<size_t>(attr_corner)];
-            quad.n[corner] = block.face_normals[static_cast<size_t>(face)][static_cast<size_t>(attr_corner)];
-        }
-        mesh.push_back(quad);
+            return samples;
+        }();
+        return dirs;
     }
 
-    auto build_mesh() -> void
+    static double radical_inverse_vdc(uint32_t bits)
     {
-        if (mesh_ready)
-        {
-            return;
-        }
-        mesh_ready = true;
+        bits = (bits << 16u) | (bits >> 16u);
+        bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+        bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+        bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+        bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+        return static_cast<double>(bits) * 2.3283064365386963e-10;
+    }
+};
+
+struct TerrainGrid
+{
+    double block_size = 0.0;
+    double start_x = 0.0;
+    double start_z = 0.0;
+    double base_y = 0.0;
+};
+
+struct TerrainMeshBuilder
+{
+    TerrainMeshBuilder() = delete;
+    using FaceOrder = std::array<int, 6>;
+    
+    static auto build_mesh(const BlockTopology& topology,
+                           std::span<const VoxelBlock> blocks,
+                           std::vector<RenderQuad>& mesh,
+                           size_t& visible_faces) -> void
+    {
+        const int chunk_size = topology.chunk_size;
         mesh.clear();
         visible_faces = 0;
 
-        if (chunk_size <= 0 || max_height_value <= 0)
-        {
-            return;
-        }
+        if (chunk_size <= 0 || topology.max_height <= 0) return;
 
-        static constexpr std::array<int, 6> face_order = {{
-            FaceFront,
-            FaceBack,
-            FaceLeft,
-            FaceRight,
-            FaceBottom,
-            FaceTop
+        static constexpr std::array<int, 6> kFaceOrder{{
+            BlockGeometry::FaceFront, BlockGeometry::FaceBack,
+            BlockGeometry::FaceLeft, BlockGeometry::FaceRight,
+            BlockGeometry::FaceBottom, BlockGeometry::FaceTop
         }};
+
+        const auto append_quad = [&](const VoxelBlock& block, int face) 
+        {
+            RenderQuad quad{};
+            quad.color = block.color;
+            
+            auto face_corner_index = [&](int v_idx) {
+                for (int i = 0; i < 4; ++i)
+                    if (BlockGeometry::face_vertices[face][i] == v_idx)
+                        return i;
+                return -1;
+            };
+
+            for (int corner = 0; corner < 4; ++corner)
+            {
+                const int vi = BlockGeometry::quad_order[face][corner];
+                quad.v[corner] = block.position + BlockGeometry::vertices[vi];
+                
+                const int face_corner_raw = face_corner_index(vi);
+                const int attr_corner = (face_corner_raw < 0) ? corner : face_corner_raw;
+                
+                quad.sky_visibility[corner] = block.sky_visibility[face][attr_corner];
+                quad.n[corner] = block.face_normals[face][attr_corner];
+            }
+            mesh.push_back(quad);
+        };
+
+        const auto process_voxel = [&](int x, int y, int z) 
+        {
+            const size_t slot = topology.block_slot(x, y, z);
+            const int index = topology.block_index[slot];
+            const VoxelBlock& block = blocks[static_cast<size_t>(index)];
+
+            for (const int face : kFaceOrder)
+            {
+                const int nx = x + BlockGeometry::face_normals[face][0];
+                const int ny = y + BlockGeometry::face_normals[face][1];
+                const int nz = z + BlockGeometry::face_normals[face][2];
+
+                if (!topology.has_block(nx, ny, nz))
+                {
+                    append_quad(block, face);
+                    visible_faces++;
+                }
+            }
+        };
+
+        const size_t total_columns = static_cast<size_t>(chunk_size * chunk_size);
+        for (size_t i = 0; i < total_columns; ++i)
+        {
+            const int height = topology.heights[i];
+            if (height <= 0) continue;
+
+            const int z = static_cast<int>(i / chunk_size);
+            const int x = static_cast<int>(i % chunk_size);
+
+            for (int y = 0; y < height; ++y)
+            {
+                process_voxel(x, y, z);
+            }
+        }
+    }
+};
+
+struct TerrainGenerator
+{
+    TerrainGenerator() = delete;
+
+    static auto build_chunk(const TerrainConfig& config,
+                            BlockTopology& topology,
+                            std::vector<VoxelBlock>& blocks) -> void
+    {
+        const int chunk_size = config.chunk_size;
+        const auto grid = grid_for(config, config.chunk_size);
+        const auto& normals = normals_table();
+        std::vector<uint32_t> top_colors;
+
+        init_storage(config, topology, blocks, top_colors);
+        fill_heights(config, topology, top_colors);
+        finalize_topology(config, topology);
+
+        const auto add_voxel = [&](const int x, const int y, const int z, 
+                                   const int height, const uint32_t top_color) 
+        {
+            const uint32_t color = block_color(config, y, height, top_color);
+            const auto sky = face_sky(topology, x, y, z);
+
+            const Vec3 pos{
+                grid.start_x + x * grid.block_size,
+                grid.base_y + y * grid.block_size,
+                grid.start_z + z * grid.block_size
+            };
+
+            blocks.push_back({
+                pos,
+                color,
+                ColorSrgb::from_hex(color).to_linear(),
+                normals,
+                sky
+            });
+
+            const size_t slot = topology.block_slot(x, y, z);
+            topology.block_index[slot] = static_cast<int>(blocks.size() - 1);
+        };
+
+        const auto process_column = [&](const size_t col_index) 
+        {
+            const int height = topology.heights[col_index];
+            if (height <= 0) return;
+
+            const int z = static_cast<int>(col_index / chunk_size);
+            const int x = static_cast<int>(col_index % chunk_size);
+            const uint32_t top_color = top_colors[col_index];
+
+            for (int y = 0; y < height; ++y)
+            {
+                add_voxel(x, y, z, height, top_color);
+            }
+        };
+
+        for (size_t i = 0; i < chunk_size * chunk_size; ++i) process_column(i);
+    }
+
+private:
+    using FaceNormals = std::array<std::array<Vec3, 4>, 6>;
+    using FaceSky = std::array<std::array<float, 4>, 6>;
+
+    static auto grid_for(const TerrainConfig& cfg, const int chunk_size) -> TerrainGrid
+    {
+        const double max_index = static_cast<double>(chunk_size) - 1.0;
+        return {
+            .block_size = cfg.block_size,
+            .start_x = -max_index * cfg.block_size * 0.5,
+            .start_z = cfg.start_z,
+            .base_y = cfg.base_y
+        };
+    }
+
+    static auto normals_table() -> const FaceNormals&
+    {
+        const auto build_normals = [] {
+            FaceNormals out{};
+            for (int face = 0; face < 6; ++face)
+            {
+                const Vec3 base = BlockGeometry::face_normal_world(face);
+                for (int corner = 0; corner < 4; ++corner)
+                {
+                    out[face][corner] = base;
+                }
+            }
+            return out;
+        };
+        static const FaceNormals normals = build_normals();
+        return normals;
+    }
+
+    static auto init_storage(const TerrainConfig& config,
+                             BlockTopology& topology,
+                             std::vector<VoxelBlock>& blocks,
+                             std::vector<uint32_t>& top_colors) -> void
+    {
+        const int chunk_size = config.chunk_size;
+        topology.chunk_size = chunk_size;
+
+        const auto grid_cells = chunk_size * chunk_size;
+        topology.heights.assign(grid_cells, 0);
+        top_colors.assign(grid_cells, config.grass_color);
+        blocks.clear();
+
+        const auto reserve_rows = config.base_height + config.height_variation + 3;
+        blocks.reserve(grid_cells * static_cast<size_t>(reserve_rows));
+    }
+
+    static auto fill_heights(const TerrainConfig& config,
+                             BlockTopology& topology,
+                             std::vector<uint32_t>& top_colors) -> void
+    {
+        const int chunk_size = config.chunk_size;
         for (int z = 0; z < chunk_size; ++z)
         {
             for (int x = 0; x < chunk_size; ++x)
             {
-                const int height = heights[static_cast<size_t>(z * chunk_size + x)];
-                for (int y = 0; y < height; ++y)
-                {
-                    const VoxelBlock* block = block_at(x, y, z);
-                    if (!block)
-                    {
-                        continue;
-                    }
-                    for (int i = 0; i < 6; ++i)
-                    {
-                        const int face = face_order[i];
-                        const int nx = x + cubeFaceNormal[face][0];
-                        const int ny = y + cubeFaceNormal[face][1];
-                        const int nz = z + cubeFaceNormal[face][2];
-                        if (!has_block(nx, ny, nz))
-                        {
-                            visible_faces++;
-                            emit_block_face_quad(*block, face);
-                        }
-                    }
-                }
+                const size_t idx = topology.index(x, z);
+                topology.heights[idx] = height_at(config, x, z);
+                top_colors[idx] = top_color_at(config, x, z);
             }
         }
     }
 
-    auto build_chunk() -> void
+    static auto finalize_topology(const TerrainConfig& config,
+                                  BlockTopology& topology) -> void
     {
-        const int base_height = 4;
-        const int dirt_thickness = 2;
-        const int height_variation = 6;
-        const double height_freq = 0.12;
-        const double surface_freq = 0.4;
+        topology.max_height = 0;
+        for (int value : topology.heights)
+        {
+            topology.max_height = std::max(topology.max_height, value);
+        }
+        if (topology.max_height < 0)
+        {
+            topology.max_height = 0;
+        }
+        const size_t stride = static_cast<size_t>(config.chunk_size);
+        const size_t height = static_cast<size_t>(std::max(topology.max_height, 1));
+        const size_t slots = stride * height * stride;
+        topology.block_index.assign(slots, -1);
+    }
 
-        const double block_size = kTerrainBlockSize;
-        const double start_x = -(chunk_size - 1) * block_size * 0.5;
-        const double start_z = kTerrainStartZ;
-        const double base_y = kTerrainBaseY;
+    [[nodiscard]]
+    static auto height_at(const TerrainConfig& cfg, const int x, const int z) -> int
+    {
+        const double h = SimplexNoise::sample(x * cfg.height_freq, z * cfg.height_freq);
+        const double scaled = (h + 1.0) * 0.5 * static_cast<double>(cfg.height_variation);
+        return std::max(cfg.base_height + static_cast<int>(scaled + 0.5), 3);
+    }
 
-        const uint32_t stone_color = 0xFF7A7A7A;
-        const uint32_t dirt_color = 0xFF7D4714;
-        const uint32_t grass_color = 0xFF3B8A38;
-        const uint32_t water_color = 0xFF2B5FA8;
+    [[nodiscard]]
+    static auto top_color_at(const TerrainConfig& cfg, const int x, const int z) -> uint32_t
+    {
+        const double surface = SimplexNoise::sample(x * cfg.surface_freq + 100.0,
+                                                    z * cfg.surface_freq - 100.0);
+        if (surface > 0.55)
+        {
+            return cfg.water_color;
+        }
+        if (surface < -0.35)
+        {
+            return cfg.dirt_color;
+        }
+        return cfg.grass_color;
+    }
 
-        heights.assign(static_cast<size_t>(chunk_size * chunk_size), 0);
-        top_colors.assign(static_cast<size_t>(chunk_size * chunk_size), grass_color);
+    [[nodiscard]]
+    static auto block_color(const TerrainConfig& cfg, const int y, const int height,
+                            const uint32_t top_color) -> uint32_t
+    {
+        if (y >= height - 1)
+        {
+            return top_color;
+        }
+        if (y >= height - 1 - cfg.dirt_thickness)
+        {
+            return cfg.dirt_color;
+        }
+        return cfg.stone_color;
+    }
 
-        auto index = [this](int x, int z) {
-            return static_cast<size_t>(z * chunk_size + x);
+    [[nodiscard]]
+    static auto face_sky(const BlockTopology& topology,
+                         const int x, const int y, const int z) -> FaceSky
+    {
+        auto sky = FaceSky{};
+        for (auto& face_visibility : sky)
+        {
+            face_visibility.fill(0.0f);
+        }
+
+        auto fill_corners = [&](const int face) {
+            for (int corner = 0; corner < 4; ++corner)
+            {
+                sky[face][corner] = Occlusion::sample(topology, x, y, z, face, corner);
+            }
         };
-        blocks.reserve(static_cast<size_t>(chunk_size * chunk_size * (base_height + height_variation + 3)));
 
-        for (int z = 0; z < chunk_size; ++z)
-        {
-            for (int x = 0; x < chunk_size; ++x)
+        auto fill_face = [&](const int face) {
+            const int nx = x + BlockGeometry::face_normals[face][0];
+            const int ny = y + BlockGeometry::face_normals[face][1];
+            const int nz = z + BlockGeometry::face_normals[face][2];
+            if (topology.has_block(nx, ny, nz))
             {
-                const double h = SimplexNoise::sample(x * height_freq, z * height_freq);
-                int height = base_height + static_cast<int>(((h + 1.0) * 0.5 * height_variation) + 0.5);
-                if (height < 3)
-                {
-                    height = 3;
-                }
-
-                const double surface = SimplexNoise::sample(x * surface_freq + 100.0, z * surface_freq - 100.0);
-                uint32_t top_color = grass_color;
-                if (surface > 0.55)
-                {
-                    top_color = water_color;
-                }
-                else if (surface < -0.35)
-                {
-                    top_color = dirt_color;
-                }
-
-                heights[index(x, z)] = height;
-                top_colors[index(x, z)] = top_color;
+                return;
             }
-        }
+            fill_corners(face);
+        };
 
-        blocks.clear();
-        max_height_value = 0;
-        for (int value : heights)
-        {
-            if (value > max_height_value)
-            {
-                max_height_value = value;
-            }
-        }
-        if (max_height_value < 0)
-        {
-            max_height_value = 0;
-        }
-        block_index.assign(static_cast<size_t>(chunk_size * std::max(max_height_value, 1) * chunk_size), -1);
-        mesh_ready = false;
+        for (int face = 0; face < 6; ++face) fill_face(face);
 
-        for (int z = 0; z < chunk_size; ++z)
-        {
-            for (int x = 0; x < chunk_size; ++x)
-            {
-                const int height = heights[index(x, z)];
-                const uint32_t top_color = top_colors[index(x, z)];
-                for (int y = 0; y < height; ++y)
-                {
-                    uint32_t color = stone_color;
-                    if (y >= height - 1)
-                    {
-                        color = top_color;
-                    }
-                    else if (y >= height - 1 - dirt_thickness)
-                    {
-                        color = dirt_color;
-                    }
+        return sky;
+    }
+};
 
-                    std::array<std::array<Vec3, 4>, 6> face_normals{};
-                    for (int face = 0; face < 6; ++face)
-                    {
-                        const Vec3 base = face_normal_world(face);
-                        for (int corner = 0; corner < 4; ++corner)
-                        {
-                            face_normals[face][corner] = base;
-                        }
-                    }
-                    std::array<std::array<float, 4>, 6> face_sky_visibility{};
-                    for (auto& face_visibility : face_sky_visibility)
-                    {
-                        face_visibility.fill(0.0f);
-                    }
-                    for (int face = 0; face < 6; ++face)
-                    {
-                        const int nx = x + cubeFaceNormal[face][0];
-                        const int ny = y + cubeFaceNormal[face][1];
-                        const int nz = z + cubeFaceNormal[face][2];
-                        if (!has_block(nx, ny, nz))
-                        {
-                            for (int corner = 0; corner < 4; ++corner)
-                            {
-                                face_sky_visibility[face][corner] = compute_vertex_sky_visibility(x, y, z, face, corner);
-                            }
-                        }
-                    }
-                    const LinearColor albedo_linear = ColorSrgb::from_hex(color).to_linear();
-                    blocks.push_back({
-                        {start_x + x * block_size, base_y - y * block_size, start_z + z * block_size},
-                        color,
-                        albedo_linear,
-                        face_normals,
-                        face_sky_visibility
-                    });
-                    const size_t block_idx = blocks.size() - 1;
-                    const size_t slot = block_slot(x, y, z);
-                    if (slot < block_index.size())
-                    {
-                        block_index[slot] = static_cast<int>(block_idx);
-                    }
-                }
-            }
-        }
+export struct Terrain
+{
+    int chunk_size = 16;
+    size_t visible_faces = 0;
+    TerrainConfig config{};
+    BlockTopology topology;
+    std::vector<VoxelBlock> blocks;
+    std::vector<RenderQuad> mesh;
 
-        build_mesh();
+    auto generate() -> void
+    {
+        chunk_size = config.chunk_size;
+        TerrainGenerator::build_chunk(config, topology, blocks);
+        TerrainMeshBuilder::build_mesh(topology, blocks, mesh, visible_faces);
     }
 };

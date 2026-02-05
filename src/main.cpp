@@ -6,8 +6,6 @@ import keyboard;
 import render;
 import terminal;
 
-namespace {
-
 struct SignalState
 {
     static auto install() -> void
@@ -76,14 +74,14 @@ private:
 
 struct RenderThreads
 {
-    explicit RenderThreads(RenderEngine& engine):
+    RenderThreads(RenderEngine& engine, RenderInputMailbox& mailbox):
         output_thread([](std::stop_token token) {
             TerminalRender::output_loop(token);
         }),
-        render_thread([&engine](std::stop_token token) {
+        render_thread([&engine, &mailbox](std::stop_token token) {
             while (!token.stop_requested())
             {
-                TerminalRender::submit_frame(engine);
+                TerminalRender::submit_frame(engine, mailbox);
             }
         })
     {}
@@ -112,6 +110,7 @@ struct App
 {
     auto run() -> int
     {
+        input_camera_rotation = engine.camera.rotation;
         auto read_keyboard = [&]() -> void
         {
             auto ch = session.read_char();
@@ -149,6 +148,15 @@ private:
     static constexpr double kMoveStep = 0.2;
     static constexpr double kMouseMaxSpeed = 1.2;
     static constexpr int kMouseDeadzone = 8;
+
+    RenderEngine engine;
+    RenderInputMailbox mailbox;
+    Vec2 input_camera_rotation{0.0, 0.0};
+    TerminalSession session;
+    RenderThreads threads{engine, mailbox};
+    std::string input_buffer;
+    std::optional<MousePos> mouse_pos;
+    std::chrono::steady_clock::time_point last_look_time = std::chrono::steady_clock::now();
 
     [[nodiscard]]
     auto process_input() -> bool
@@ -199,21 +207,22 @@ private:
         auto perform_movement = [&](const MoveIntent& move)
         {
             if (move.space == MoveSpace::Local)
-                engine.move_camera_local(move.delta);
+                mailbox.push_move_local(move.delta);
             else if (move.space == MoveSpace::World)
-                engine.move_camera(move.delta);
+                mailbox.push_move_world(move.delta);
         };
 
         switch (action)
         {
             case InputAction::Quit: return false;
             case InputAction::None: return true;
-            case InputAction::TogglePause: engine.toggle_pause(); return true;
-            case InputAction::ToggleGI: toggle_gi(); return true;
+            case InputAction::ToggleAO: mailbox.push_toggle_ao(); return true;
+            case InputAction::ToggleGI: mailbox.push_toggle_gi(); return true;
+            case InputAction::TogglePause: mailbox.push_toggle_pause(); return true;
             default: break;
         }
 
-        const Vec2 rot = engine.get_camera_rotation();
+        const Vec2 rot = input_camera_rotation;
         perform_movement(MoveIntent::from_action(action, kMoveStep, rot.x));
         return true;
     }
@@ -253,29 +262,13 @@ private:
 
         if (velocity.yaw != 0.0 || velocity.pitch != 0.0)
         {
-            engine.rotate_camera({velocity.yaw * dt, velocity.pitch * dt});
+            const Vec2 delta{velocity.yaw * dt, velocity.pitch * dt};
+            mailbox.push_rotate(delta);
+            input_camera_rotation.x += delta.x;
+            input_camera_rotation.y = std::clamp(input_camera_rotation.y + delta.y, -1.4, 1.4);
         }
     }
-
-    auto toggle_gi() -> void
-    {
-        const bool enabled = engine.get_gi_enabled();
-        engine.set_gi_enabled(!enabled);
-        if (!enabled && engine.get_gi_strength() <= 0.0)
-        {
-            engine.set_gi_strength(1.0);
-        }
-    }
-
-    RenderEngine engine;
-    TerminalSession session;
-    RenderThreads threads{engine};
-    std::string input_buffer;
-    std::optional<MousePos> mouse_pos;
-    std::chrono::steady_clock::time_point last_look_time = std::chrono::steady_clock::now();
 };
-
-} // namespace
 
 auto main() -> int
 {

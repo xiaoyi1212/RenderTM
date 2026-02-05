@@ -19,14 +19,12 @@ target_sources(core PUBLIC
     src/render/world.cppm
     src/render/noise.cppm
     src/render/terrain.cppm
-    src/render/render.cppm
-)
-target_sources(core PRIVATE
-    src/render/rasterizer.cppm
-    src/render/lighting.cppm
-    src/render/post.cppm
-    src/render/engine.cppm
     src/render/settings.cppm
+    src/render/lighting.cppm
+    src/render/framebuffer.cppm
+    src/render/rasterizer.cppm
+    src/render/post.cppm
+    src/render/render.cppm
 )
 target_compile_features(core PUBLIC cxx_std_26)
 target_compile_options(core PRIVATE

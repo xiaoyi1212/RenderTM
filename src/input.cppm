@@ -10,6 +10,7 @@ export enum class InputAction
     Quit,
     TogglePause,
     ToggleGI,
+    ToggleAO,
     MoveForward,
     MoveBackward,
     MoveLeft,
@@ -84,6 +85,7 @@ auto InputParser::key_to_action(const int ch) -> InputAction
         case 'q': return InputAction::Quit;
         case 'p': return InputAction::TogglePause;
         case 'g': return InputAction::ToggleGI;
+        case 'o': return InputAction::ToggleAO;
         case 'w': return InputAction::MoveForward;
         case 's': return InputAction::MoveBackward;
         case 'a': return InputAction::MoveLeft;
@@ -281,7 +283,7 @@ auto InputParser::mouse_look_velocity(const MouseLookParams& params) -> MouseLoo
     const double mag_x = std::clamp((std::abs(dx) - params.deadzone_radius) / avail_x, 0.0, 1.0);
     const double mag_y = std::clamp((std::abs(dy) - params.deadzone_radius) / avail_y, 0.0, 1.0);
     const double yaw = std::copysign(mag_x * params.max_speed, dx);
-    const double pitch = -std::copysign(mag_y * params.max_speed, dy);
+    const double pitch = std::copysign(mag_y * params.max_speed, dy);
 
     return {yaw, pitch};
 }

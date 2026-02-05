@@ -9,9 +9,9 @@ TEST_CASE("MoveIntent::from_action maps vertical movement directions")
     const MoveIntent down = MoveIntent::from_action(InputAction::MoveDown, step, 0.0);
 
     REQUIRE(up.space == MoveSpace::World);
-    REQUIRE(up.delta.y == Catch::Approx(-step));
+    REQUIRE(up.delta.y == Catch::Approx(step));
     REQUIRE(down.space == MoveSpace::World);
-    REQUIRE(down.delta.y == Catch::Approx(step));
+    REQUIRE(down.delta.y == Catch::Approx(-step));
 }
 
 TEST_CASE("MoveIntent::from_action maps forward and backward in local space")

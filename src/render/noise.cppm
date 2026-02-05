@@ -2,7 +2,7 @@ module;
 
 #include "../prelude.hpp"
 
-export module render:noise;
+export module noise;
 
 export struct BlueNoise
 {

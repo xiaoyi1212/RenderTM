@@ -2,7 +2,7 @@ module;
 
 #include "../prelude.hpp"
 
-export module render:math;
+export module math;
 
 export template<bool IsLinear>
 struct ColorBase {
@@ -77,6 +77,20 @@ struct ColorBase {
 export using LinearColor = ColorBase<true>;
 export using ColorSrgb   = ColorBase<false>;
 
+export struct Scalar
+{
+    [[nodiscard]]
+    static constexpr auto smoothstep(const float edge0, const float edge1, const float x) -> float
+    {
+        if (edge0 == edge1)
+        {
+            return x < edge0 ? 0.0f : 1.0f;
+        }
+        const float t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    }
+};
+
 export struct Vec2
 {
     double x, y;
@@ -108,6 +122,12 @@ export struct Vec3
     constexpr auto operator-(const Vec3& rhs) const -> Vec3
     {
         return {x - rhs.x, y - rhs.y, z - rhs.z};
+    }
+
+    [[nodiscard]]
+    constexpr auto operator*(double scalar) const -> Vec3
+    {
+        return {x * scalar, y * scalar, z * scalar};
     }
 
     [[nodiscard]]
@@ -268,4 +288,5 @@ export struct Mat4
         }
         return out;
     }
+
 };

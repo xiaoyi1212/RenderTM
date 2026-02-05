@@ -2,13 +2,13 @@ module;
 
 #include "../prelude.hpp"
 
-export module render:camera;
+export module camera;
 
-import :math;
+import math;
 
 export struct Camera {
-    Vec3 position{16.0, -19.72, -1.93};
-    Vec2 rotation{-0.69, -0.60};
+    Vec3 position{17.42, 26.26, -2.76};
+    Vec2 rotation{-0.69, 0.60};
 
     static constexpr double near_plane = 0.05;
     static constexpr double far_plane = 1000.0;
@@ -70,6 +70,88 @@ export struct Camera {
         m.m[2][3] = -(m.m[2][0] * position.x + m.m[2][1] * position.y + m.m[2][2] * position.z);
 
         return m;
+    }
+
+    [[nodiscard]]
+    static auto projection(const double width, const double height,
+                           const double proj_scale_x, const double proj_scale_y) -> Mat4
+    {
+        if (width <= 0.0 || height <= 0.0 || far_plane <= near_plane)
+        {
+            return Mat4::identity();
+        }
+        const double sx = 2.0 * proj_scale_x / width;
+        const double sy = 2.0 * proj_scale_y / height;
+        const double inv_range = 1.0 / (far_plane - near_plane);
+        const double a = far_plane * inv_range;
+        const double b = -near_plane * far_plane * inv_range;
+
+        Mat4 m{};
+        m.m[0][0] = sx;
+        m.m[1][1] = -sy;
+        m.m[2][2] = a;
+        m.m[2][3] = b;
+        m.m[3][2] = 1.0;
+        return m;
+    }
+
+    [[nodiscard]]
+    static auto screen_to_world(const double screen_x, const double screen_y, const double depth,
+                                const Mat4& inv_vp, const double width, const double height,
+                                const double proj_a, const double proj_b) -> Vec3
+    {
+        const double ndc_x = (screen_x / width - 0.5) * 2.0;
+        const double ndc_y = (screen_y / height - 0.5) * 2.0;
+
+        const double view_z = depth;
+        const double ndc_z = proj_a + proj_b / view_z;
+
+        const double clip_w = view_z;
+        const double clip_x = ndc_x * clip_w;
+        const double clip_y = ndc_y * clip_w;
+        const double clip_z = ndc_z * clip_w;
+
+        double wx = inv_vp.m[0][0] * clip_x + inv_vp.m[0][1] * clip_y + inv_vp.m[0][2] * clip_z + inv_vp.m[0][3] * clip_w;
+        double wy = inv_vp.m[1][0] * clip_x + inv_vp.m[1][1] * clip_y + inv_vp.m[1][2] * clip_z + inv_vp.m[1][3] * clip_w;
+        double wz = inv_vp.m[2][0] * clip_x + inv_vp.m[2][1] * clip_y + inv_vp.m[2][2] * clip_z + inv_vp.m[2][3] * clip_w;
+        double ww = inv_vp.m[3][0] * clip_x + inv_vp.m[3][1] * clip_y + inv_vp.m[3][2] * clip_z + inv_vp.m[3][3] * clip_w;
+
+        if (std::abs(ww) > 1e-6)
+        {
+            const double inv_ww = 1.0 / ww;
+            wx *= inv_ww;
+            wy *= inv_ww;
+            wz *= inv_ww;
+        }
+
+        return {wx, wy, wz};
+    }
+
+    [[nodiscard]]
+    static auto world_to_screen(const Mat4& vp, const Vec3& world,
+                                const size_t width, const size_t height) -> Vec2
+    {
+        if (width == 0 || height == 0)
+        {
+            return {0.0, 0.0};
+        }
+
+        const double clip_x = vp.m[0][0] * world.x + vp.m[0][1] * world.y + vp.m[0][2] * world.z + vp.m[0][3];
+        const double clip_y = vp.m[1][0] * world.x + vp.m[1][1] * world.y + vp.m[1][2] * world.z + vp.m[1][3];
+        const double clip_w = vp.m[3][0] * world.x + vp.m[3][1] * world.y + vp.m[3][2] * world.z + vp.m[3][3];
+
+        if (clip_w <= near_plane)
+        {
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            return {nan, nan};
+        }
+
+        const double inv_w = 1.0 / clip_w;
+        const double ndc_x = clip_x * inv_w;
+        const double ndc_y = clip_y * inv_w;
+        const double screen_x_out = (ndc_x * 0.5 + 0.5) * static_cast<double>(width);
+        const double screen_y_out = (ndc_y * 0.5 + 0.5) * static_cast<double>(height);
+        return {screen_x_out, screen_y_out};
     }
 
 private:

@@ -12,12 +12,73 @@ export struct TerminalSize
     size_t height = 0;
 };
 
+export struct RenderInput
+{
+    Vec3 move_world{0.0, 0.0, 0.0};
+    Vec3 move_local{0.0, 0.0, 0.0};
+    Vec2 rotate{0.0, 0.0};
+    bool toggle_pause = false;
+    bool toggle_gi = false;
+    bool toggle_ao = false;
+};
+
+export struct RenderInputMailbox
+{
+    auto push_move_world(const Vec3& delta) -> void
+    {
+        std::scoped_lock lock(mutex);
+        pending.move_world = pending.move_world + delta;
+    }
+
+    auto push_move_local(const Vec3& delta) -> void
+    {
+        std::scoped_lock lock(mutex);
+        pending.move_local = pending.move_local + delta;
+    }
+
+    auto push_rotate(const Vec2& delta) -> void
+    {
+        std::scoped_lock lock(mutex);
+        pending.rotate = {pending.rotate.x + delta.x, pending.rotate.y + delta.y};
+    }
+
+    auto push_toggle_pause() -> void
+    {
+        std::scoped_lock lock(mutex);
+        pending.toggle_pause = !pending.toggle_pause;
+    }
+
+    auto push_toggle_gi() -> void
+    {
+        std::scoped_lock lock(mutex);
+        pending.toggle_gi = !pending.toggle_gi;
+    }
+
+    auto push_toggle_ao() -> void
+    {
+        std::scoped_lock lock(mutex);
+        pending.toggle_ao = !pending.toggle_ao;
+    }
+
+    auto drain() -> RenderInput
+    {
+        std::scoped_lock lock(mutex);
+        RenderInput out = pending;
+        pending = {};
+        return out;
+    }
+
+private:
+    std::mutex mutex;
+    RenderInput pending{};
+};
+
 export struct TerminalRender
 {
     static void init();
     static void shutdown();
     static void update_size(int sig);
-    static void submit_frame(RenderEngine& engine);
+    static void submit_frame(RenderEngine& engine, RenderInputMailbox& mailbox);
     static void output_loop(std::stop_token token);
     static auto size() -> TerminalSize; 
 };
@@ -334,7 +395,7 @@ void TerminalRender::init() {
     (void)::write(STDOUT_FILENO, kEnterAlt.data(), kEnterAlt.size());
 }
 
-void TerminalRender::submit_frame(RenderEngine& engine) {
+void TerminalRender::submit_frame(RenderEngine& engine, RenderInputMailbox& mailbox) {
     const size_t term_width = raw_width.load(std::memory_order_relaxed);
     const size_t term_height = raw_height.load(std::memory_order_relaxed);
     if (term_width == 0 || term_height < 2) return;
@@ -345,6 +406,38 @@ void TerminalRender::submit_frame(RenderEngine& engine) {
 
     const double render_fps = render_fps_counter.tick();
 
+    const RenderInput input = mailbox.drain();
+    if (input.toggle_pause)
+    {
+        engine.settings.toggle_pause();
+    }
+    if (input.toggle_gi)
+    {
+        const bool enabled = engine.settings.get_gi_enabled();
+        engine.settings.set_gi_enabled(!enabled);
+        if (!enabled && engine.settings.get_gi_strength() <= 0.0)
+        {
+            engine.settings.set_gi_strength(1.0);
+        }
+    }
+    if (input.toggle_ao)
+    {
+        const bool enabled = engine.settings.get_ambient_occlusion_enabled();
+        engine.settings.set_ambient_occlusion_enabled(!enabled);
+    }
+    if (input.move_world.x != 0.0 || input.move_world.y != 0.0 || input.move_world.z != 0.0)
+    {
+        engine.camera.position = engine.camera.position + input.move_world;
+    }
+    if (input.move_local.x != 0.0 || input.move_local.y != 0.0 || input.move_local.z != 0.0)
+    {
+        engine.camera.move_local(input.move_local);
+    }
+    if (input.rotate.x != 0.0 || input.rotate.y != 0.0)
+    {
+        engine.camera.rotate(input.rotate);
+    }
+
     std::vector<uint32_t> framebuffer = frame_queue.take_recycled();
     if (framebuffer.size() != width * height) framebuffer.resize(width * height);
     engine.update(framebuffer.data(), width, height);
@@ -353,10 +446,10 @@ void TerminalRender::submit_frame(RenderEngine& engine) {
     frame.width = width;
     frame.height = height;
     frame.render_fps = render_fps;
-    frame.cam_pos = engine.get_camera_position();
-    frame.cam_rot = engine.get_camera_rotation();
-    frame.sharpen = engine.taa_sharpen_strength();
-    frame.sharpen_pct = engine.taa_sharpen_percent();
+    frame.cam_pos = engine.camera.position;
+    frame.cam_rot = engine.camera.rotation;
+    frame.sharpen = engine.post.sharpen_strength;
+    frame.sharpen_pct = engine.post.sharpen_percent();
     frame.pixels = std::move(framebuffer);
     frame_queue.submit(std::move(frame));
 }
