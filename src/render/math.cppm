@@ -67,9 +67,9 @@ struct ColorBase {
     static constexpr auto lerp(const Color& a, const Color& b, const float t) -> Color
     {
         return {
-            std::lerp(a.r, b.r, t),
-            std::lerp(a.g, b.g, t),
-            std::lerp(a.b, b.b, t)
+            a.r + (b.r - a.r) * t,
+            a.g + (b.g - a.g) * t,
+            a.b + (b.b - a.b) * t
         };
     }
 };
