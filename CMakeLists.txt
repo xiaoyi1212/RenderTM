@@ -30,6 +30,7 @@ target_compile_features(core PUBLIC cxx_std_26)
 target_compile_options(core PRIVATE
     "$<$<CONFIG:Release>:-O3>"
     "$<$<CONFIG:Release>:-ffast-math>"
+    "$<$<CONFIG:RelWithDebInfo>:-fno-omit-frame-pointer>"
 )
 
 add_executable(render_tm src/main.cpp)
@@ -53,7 +54,6 @@ if(BUILD_TESTING)
     )
     target_link_libraries(tests PRIVATE core Catch2::Catch2WithMain)
     target_precompile_headers(tests PRIVATE tests/test_prelude.hpp)
-    target_compile_options(tests PRIVATE -fno-omit-frame-pointer)
 
     include(${Catch2_SOURCE_DIR}/extras/Catch.cmake)
     catch_discover_tests(tests)
