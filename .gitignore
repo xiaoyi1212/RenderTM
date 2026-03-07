@@ -1,11 +1,10 @@
 # Build cache
-/cmake-build-debug
-/cmake-build-release
+/build
 
 # Other files
 AGENTS.md
 /.idea
 
 # Perf related files
-perf.data
+perf.*
 report.txt

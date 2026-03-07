@@ -1,43 +1,60 @@
 cmake_minimum_required(VERSION 4.0)
-project(untitled)
+project(RenderTM)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 
 include(CTest)
-enable_testing()
 include(FetchContent)
 
-add_executable(untitled main.cpp
-        terminal_render.cpp
-        terminal_render.h
-        render.cpp
-        render.h
-        input.cpp
-        input.h
-        controls.cpp
-        controls.h
-        keyboard.h
-        keyboard.cpp)
+add_library(core STATIC)
+target_sources(core PUBLIC
+    FILE_SET cxx_modules TYPE CXX_MODULES FILES
+    src/controls.cppm
+    src/input.cppm
+    src/keyboard.cppm
+    src/terminal.cppm
+    src/render/math.cppm
+    src/render/camera.cppm
+    src/render/world.cppm
+    src/render/noise.cppm
+    src/render/terrain.cppm
+    src/render/settings.cppm
+    src/render/lighting.cppm
+    src/render/framebuffer.cppm
+    src/render/rasterizer.cppm
+    src/render/post.cppm
+    src/render/render.cppm
+)
+target_compile_features(core PUBLIC cxx_std_26)
+target_compile_options(core PRIVATE
+    "$<$<CONFIG:Release>:-O3>"
+    "$<$<CONFIG:Release>:-ffast-math>"
+    "$<$<CONFIG:RelWithDebInfo>:-fno-omit-frame-pointer>"
+)
 
-FetchContent_Declare(
+add_executable(render_tm src/main.cpp)
+target_link_libraries(render_tm PRIVATE core)
+target_precompile_headers(render_tm PRIVATE src/prelude.hpp)
+
+if(BUILD_TESTING)
+    FetchContent_Declare(
         Catch2
         GIT_REPOSITORY https://github.com/catchorg/Catch2.git
         GIT_TAG v3.12.0
         GIT_SHALLOW TRUE
         GIT_PROGRESS TRUE
-)
-FetchContent_MakeAvailable(Catch2)
+    )
+    FetchContent_MakeAvailable(Catch2)
 
-add_executable(untitled_tests
+    add_executable(tests
         tests/test_controls.cpp
         tests/test_input.cpp
         tests/test_render.cpp
-        input.cpp
-        controls.cpp
-        render.cpp)
-target_link_libraries(untitled_tests PRIVATE Catch2::Catch2WithMain)
-target_include_directories(untitled_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_features(untitled_tests PRIVATE cxx_std_20)
+    )
+    target_link_libraries(tests PRIVATE core Catch2::Catch2WithMain)
+    target_precompile_headers(tests PRIVATE tests/test_prelude.hpp)
 
-include(${Catch2_SOURCE_DIR}/extras/Catch.cmake)
-catch_discover_tests(untitled_tests)
+    include(${Catch2_SOURCE_DIR}/extras/Catch.cmake)
+    catch_discover_tests(tests)
+endif()
