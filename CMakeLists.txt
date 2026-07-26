@@ -10,7 +10,6 @@ include(FetchContent)
 add_library(core STATIC)
 target_sources(core PUBLIC
     FILE_SET cxx_modules TYPE CXX_MODULES FILES
-    src/controls.cppm
     src/input.cppm
     src/keyboard.cppm
     src/terminal.cppm
@@ -48,7 +47,6 @@ if(BUILD_TESTING)
     FetchContent_MakeAvailable(Catch2)
 
     add_executable(tests
-        tests/test_controls.cpp
         tests/test_input.cpp
         tests/test_render.cpp
     )

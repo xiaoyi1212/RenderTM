@@ -32,52 +32,106 @@ TEST_CASE("key_to_action maps camera movement keys")
     REQUIRE(InputParser::key_to_action('f') == InputAction::MoveDown);
 }
 
-TEST_CASE("parse_sgr_mouse parses motion event")
+TEST_CASE("parse decodes plain keys one byte at a time")
 {
-    const auto result = InputParser::parse_sgr_mouse(std::string_view("\x1b[<35;12;8M"));
-    REQUIRE(result.result == ParseResult::Parsed);
-    REQUIRE(result.consumed == 11);
-    REQUIRE(result.event.x == 12);
-    REQUIRE(result.event.y == 8);
-    REQUIRE(result.event.motion);
+    const InputEvent event = InputParser::parse(std::string_view("wq"));
+    REQUIRE(event.consumed == 1);
+    REQUIRE(event.action == InputAction::MoveForward);
+    REQUIRE_FALSE(event.mouse.has_value());
 }
 
-TEST_CASE("parse_sgr_mouse detects incomplete sequence")
+TEST_CASE("parse decodes SGR mouse motion event")
 {
-    const auto result = InputParser::parse_sgr_mouse(std::string_view("\x1b[<35;12;"));
-    REQUIRE(result.result == ParseResult::NeedMore);
+    const InputEvent event = InputParser::parse(std::string_view("\x1b[<35;12;8M"));
+    REQUIRE(event.consumed == 11);
+    REQUIRE(event.action == InputAction::None);
+    REQUIRE(event.mouse.has_value());
+    REQUIRE(event.mouse->x == 12);
+    REQUIRE(event.mouse->y == 8);
 }
 
-TEST_CASE("parse_sgr_mouse rejects non-mouse input")
+TEST_CASE("parse reports incomplete escape sequences")
 {
-    const auto result = InputParser::parse_sgr_mouse(std::string_view("abc"));
-    REQUIRE(result.result == ParseResult::Invalid);
+    REQUIRE(InputParser::parse(std::string_view("\x1b")).consumed == 0);
+    REQUIRE(InputParser::parse(std::string_view("\x1b[")).consumed == 0);
+    REQUIRE(InputParser::parse(std::string_view("\x1b[<35;12;")).consumed == 0);
 }
 
-TEST_CASE("parse_csi_key parses arrow keys")
+TEST_CASE("parse decodes arrow keys")
 {
-    const auto up = InputParser::parse_csi_key(std::string_view("\x1b[A"));
-    REQUIRE(up.result == ParseResult::Parsed);
+    const InputEvent up = InputParser::parse(std::string_view("\x1b[A"));
     REQUIRE(up.consumed == 3);
     REQUIRE(up.action == InputAction::MoveForward);
 
-    const auto down = InputParser::parse_csi_key(std::string_view("\x1b[B"));
-    REQUIRE(down.result == ParseResult::Parsed);
-    REQUIRE(down.action == InputAction::MoveBackward);
-
-    const auto right = InputParser::parse_csi_key(std::string_view("\x1b[C"));
-    REQUIRE(right.result == ParseResult::Parsed);
-    REQUIRE(right.action == InputAction::MoveRight);
-
-    const auto left = InputParser::parse_csi_key(std::string_view("\x1b[D"));
-    REQUIRE(left.result == ParseResult::Parsed);
-    REQUIRE(left.action == InputAction::MoveLeft);
+    REQUIRE(InputParser::parse(std::string_view("\x1b[B")).action == InputAction::MoveBackward);
+    REQUIRE(InputParser::parse(std::string_view("\x1b[C")).action == InputAction::MoveRight);
+    REQUIRE(InputParser::parse(std::string_view("\x1b[D")).action == InputAction::MoveLeft);
 }
 
-TEST_CASE("parse_csi_key handles incomplete sequence")
+TEST_CASE("parse decodes SS3 application-mode arrows")
 {
-    const auto result = InputParser::parse_csi_key(std::string_view("\x1b["));
-    REQUIRE(result.result == ParseResult::NeedMore);
+    const InputEvent up = InputParser::parse(std::string_view("\x1bOA"));
+    REQUIRE(up.consumed == 3);
+    REQUIRE(up.action == InputAction::MoveForward);
+}
+
+TEST_CASE("parse consumes unknown CSI sequences without emitting actions")
+{
+    const InputEvent modified = InputParser::parse(std::string_view("\x1b[1;5D"));
+    REQUIRE(modified.consumed == 6);
+    REQUIRE(modified.action == InputAction::None);
+    REQUIRE_FALSE(modified.mouse.has_value());
+
+    const InputEvent del = InputParser::parse(std::string_view("\x1b[3~"));
+    REQUIRE(del.consumed == 4);
+    REQUIRE(del.action == InputAction::None);
+}
+
+TEST_CASE("parse ignores alt-modified keys")
+{
+    const InputEvent event = InputParser::parse(std::string_view("\x1b" "a"));
+    REQUIRE(event.consumed == 2);
+    REQUIRE(event.action == InputAction::None);
+}
+
+TEST_CASE("parse rejects malformed SGR mouse parameters")
+{
+    const InputEvent event = InputParser::parse(std::string_view("\x1b[<35;;8M"));
+    REQUIRE(event.consumed == 9);
+    REQUIRE(event.action == InputAction::None);
+    REQUIRE_FALSE(event.mouse.has_value());
+}
+
+TEST_CASE("movement_intent maps vertical movement directions")
+{
+    const Vec3 up = InputParser::movement_intent(InputAction::MoveUp);
+    const Vec3 down = InputParser::movement_intent(InputAction::MoveDown);
+
+    REQUIRE(up.y == Catch::Approx(1.0));
+    REQUIRE(down.y == Catch::Approx(-1.0));
+    REQUIRE(up.x == Catch::Approx(0.0));
+    REQUIRE(up.z == Catch::Approx(0.0));
+}
+
+TEST_CASE("movement_intent maps forward and strafe axes")
+{
+    REQUIRE(InputParser::movement_intent(InputAction::MoveForward).z == Catch::Approx(1.0));
+    REQUIRE(InputParser::movement_intent(InputAction::MoveBackward).z == Catch::Approx(-1.0));
+    REQUIRE(InputParser::movement_intent(InputAction::MoveRight).x == Catch::Approx(1.0));
+    REQUIRE(InputParser::movement_intent(InputAction::MoveLeft).x == Catch::Approx(-1.0));
+}
+
+TEST_CASE("movement_intent is zero for non-movement actions")
+{
+    for (const InputAction action : {InputAction::None, InputAction::Quit,
+                                     InputAction::TogglePause, InputAction::ToggleGI,
+                                     InputAction::ToggleAO})
+    {
+        const Vec3 intent = InputParser::movement_intent(action);
+        REQUIRE(intent.x == Catch::Approx(0.0));
+        REQUIRE(intent.y == Catch::Approx(0.0));
+        REQUIRE(intent.z == Catch::Approx(0.0));
+    }
 }
 
 TEST_CASE("mouse_look_velocity respects deadzone")

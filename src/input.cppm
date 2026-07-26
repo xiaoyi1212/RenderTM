@@ -4,6 +4,8 @@ module;
 
 export module input;
 
+export import math;
+
 export enum class InputAction
 {
     None,
@@ -19,34 +21,17 @@ export enum class InputAction
     MoveDown
 };
 
-export enum class ParseResult
+export struct MousePosition
 {
-    Parsed,
-    NeedMore,
-    Invalid
-};
-
-export struct MouseEvent
-{
-    int button = 0;
     int x = 0;
     int y = 0;
-    bool motion = false;
-    bool pressed = false;
 };
 
-export struct MouseParse
+export struct InputEvent
 {
-    ParseResult result = ParseResult::Invalid;
-    size_t consumed = 0;
-    MouseEvent event{};
-};
-
-export struct InputParse
-{
-    ParseResult result = ParseResult::Invalid;
     size_t consumed = 0;
     InputAction action = InputAction::None;
+    std::optional<MousePosition> mouse{};
 };
 
 export struct MouseLookDelta
@@ -67,9 +52,9 @@ export struct MouseLookParams
 
 export struct InputParser
 {
-    static auto key_to_action(const int ch) -> InputAction;
-    static auto parse_sgr_mouse(const std::string_view buffer) -> MouseParse;
-    static auto parse_csi_key(const std::string_view buffer) -> InputParse;
+    static auto key_to_action(int ch) -> InputAction;
+    static auto parse(std::string_view buffer) -> InputEvent;
+    static constexpr auto movement_intent(InputAction action) -> Vec3;
     static auto mouse_look_velocity(const MouseLookParams& params) -> MouseLookDelta;
 };
 
@@ -96,163 +81,129 @@ auto InputParser::key_to_action(const int ch) -> InputAction
     }
 }
 
+[[nodiscard]]
+constexpr auto InputParser::movement_intent(const InputAction action) -> Vec3
+{
+    switch (action)
+    {
+        case InputAction::MoveForward: return {0.0, 0.0, 1.0};
+        case InputAction::MoveBackward: return {0.0, 0.0, -1.0};
+        case InputAction::MoveRight: return {1.0, 0.0, 0.0};
+        case InputAction::MoveLeft: return {-1.0, 0.0, 0.0};
+        case InputAction::MoveUp: return {0.0, 1.0, 0.0};
+        case InputAction::MoveDown: return {0.0, -1.0, 0.0};
+        default: return {0.0, 0.0, 0.0};
+    }
+}
+
 namespace {
 
-struct ParseCursor
-{
-    std::string_view buffer;
-    size_t idx = 0;
-
-    [[nodiscard]]
-    constexpr auto has(size_t count = 1) const -> bool
-    {
-        return idx + count <= buffer.size();
-    }
-
-    [[nodiscard]]
-    auto parse_int(int& value) -> ParseResult
-    {
-        if (!has())
-        {
-            return ParseResult::NeedMore;
-        }
-        const char* begin = buffer.data() + idx;
-        const char* end = buffer.data() + buffer.size();
-        const auto result = std::from_chars(begin, end, value);
-        if (result.ptr == begin)
-        {
-            return ParseResult::Invalid;
-        }
-        idx = static_cast<size_t>(result.ptr - buffer.data());
-        return ParseResult::Parsed;
-    }
-
-    [[nodiscard]]
-    constexpr auto expect(char ch) -> ParseResult
-    {
-        if (!has())
-        {
-            return ParseResult::NeedMore;
-        }
-        if (buffer[idx] != ch)
-        {
-            return ParseResult::Invalid;
-        }
-        ++idx;
-        return ParseResult::Parsed;
-    }
-};
-
-} // namespace
+constexpr char kEsc = '\x1b';
 
 [[nodiscard]]
-auto InputParser::parse_sgr_mouse(const std::string_view buffer) -> MouseParse
+auto arrow_action(const char ch) -> InputAction
 {
-    MouseParse parsed{};
-    if (buffer.size() < 3)
+    switch (ch)
     {
-        parsed.result = ParseResult::NeedMore;
-        return parsed;
+        case 'A': return InputAction::MoveForward;
+        case 'B': return InputAction::MoveBackward;
+        case 'C': return InputAction::MoveRight;
+        case 'D': return InputAction::MoveLeft;
+        default: return InputAction::None;
     }
-    if (buffer[0] != '\x1b' || buffer[1] != '[' || buffer[2] != '<')
-    {
-        parsed.result = ParseResult::Invalid;
-        return parsed;
-    }
-
-    ParseCursor cursor{buffer, 3};
-    int button = 0;
-    int x = 0;
-    int y = 0;
-
-    ParseResult result = cursor.parse_int(button);
-    if (result != ParseResult::Parsed)
-    {
-        parsed.result = result;
-        return parsed;
-    }
-    result = cursor.expect(';');
-    if (result != ParseResult::Parsed)
-    {
-        parsed.result = result;
-        return parsed;
-    }
-    result = cursor.parse_int(x);
-    if (result != ParseResult::Parsed)
-    {
-        parsed.result = result;
-        return parsed;
-    }
-    result = cursor.expect(';');
-    if (result != ParseResult::Parsed)
-    {
-        parsed.result = result;
-        return parsed;
-    }
-    result = cursor.parse_int(y);
-    if (result != ParseResult::Parsed)
-    {
-        parsed.result = result;
-        return parsed;
-    }
-    if (!cursor.has())
-    {
-        parsed.result = ParseResult::NeedMore;
-        return parsed;
-    }
-
-    const char terminator = buffer[cursor.idx];
-    if (terminator != 'M' && terminator != 'm')
-    {
-        parsed.result = ParseResult::Invalid;
-        return parsed;
-    }
-    ++cursor.idx;
-
-    parsed.result = ParseResult::Parsed;
-    parsed.consumed = cursor.idx;
-    parsed.event.button = button;
-    parsed.event.x = x;
-    parsed.event.y = y;
-    parsed.event.motion = (button & 32) != 0;
-    parsed.event.pressed = (terminator == 'M');
-    return parsed;
 }
 
 [[nodiscard]]
-auto InputParser::parse_csi_key(const std::string_view buffer) -> InputParse
+auto parse_sgr_mouse(const std::string_view params) -> std::optional<MousePosition>
 {
-    InputParse parsed{};
+    std::array<int, 3> values{};
+    size_t begin = 0;
+    for (size_t field = 0; field < values.size(); ++field)
+    {
+        const size_t end = field + 1 < values.size() ? params.find(';', begin) : params.size();
+        if (end == std::string_view::npos || end < begin)
+        {
+            return std::nullopt;
+        }
+        const char* first = params.data() + begin;
+        const char* last = params.data() + end;
+        const auto result = std::from_chars(first, last, values[field]);
+        if (result.ec != std::errc{} || result.ptr != last)
+        {
+            return std::nullopt;
+        }
+        begin = end + 1;
+    }
+    return MousePosition{values[1], values[2]};
+}
+
+[[nodiscard]]
+auto parse_csi(const std::string_view buffer) -> InputEvent
+{
+    size_t i = 2;
+    while (i < buffer.size() &&
+           static_cast<unsigned char>(buffer[i]) >= 0x20 &&
+           static_cast<unsigned char>(buffer[i]) <= 0x3F)
+    {
+        ++i;
+    }
+    if (i >= buffer.size())
+    {
+        return {};
+    }
+
+    const char final_byte = buffer[i];
+    const size_t consumed = i + 1;
+    if (static_cast<unsigned char>(final_byte) < 0x40 ||
+        static_cast<unsigned char>(final_byte) > 0x7E)
+    {
+        return {consumed, InputAction::None, {}};
+    }
+    if (buffer[2] == '<' && (final_byte == 'M' || final_byte == 'm'))
+    {
+        return {consumed, InputAction::None, parse_sgr_mouse(buffer.substr(3, i - 3))};
+    }
+    if (i == 2)
+    {
+        return {consumed, arrow_action(final_byte), {}};
+    }
+    return {consumed, InputAction::None, {}};
+}
+
+}
+
+[[nodiscard]]
+auto InputParser::parse(const std::string_view buffer) -> InputEvent
+{
+    if (buffer.empty())
+    {
+        return {};
+    }
+    if (buffer[0] != kEsc)
+    {
+        return {1, key_to_action(static_cast<unsigned char>(buffer[0])), {}};
+    }
     if (buffer.size() < 2)
     {
-        parsed.result = ParseResult::NeedMore;
-        return parsed;
+        return {};
     }
-    if (buffer[0] != '\x1b' || buffer[1] != '[')
+    if (buffer[1] == '[')
     {
-        parsed.result = ParseResult::Invalid;
-        return parsed;
+        return parse_csi(buffer);
     }
-    if (buffer.size() < 3)
+    if (buffer[1] == 'O')
     {
-        parsed.result = ParseResult::NeedMore;
-        return parsed;
+        if (buffer.size() < 3)
+        {
+            return {};
+        }
+        return {3, arrow_action(buffer[2]), {}};
     }
-    InputAction action = InputAction::None;
-    switch (buffer[2])
+    if (buffer[1] == kEsc)
     {
-        case 'A': action = InputAction::MoveForward; break;
-        case 'B': action = InputAction::MoveBackward; break;
-        case 'C': action = InputAction::MoveRight; break;
-        case 'D': action = InputAction::MoveLeft; break;
-        default:
-            parsed.result = ParseResult::Invalid;
-            return parsed;
+        return {1, InputAction::None, {}};
     }
-    parsed.result = ParseResult::Parsed;
-    parsed.consumed = 3;
-    parsed.action = action;
-    return parsed;
+    return {2, InputAction::None, {}};
 }
 
 [[nodiscard]]
@@ -277,7 +228,7 @@ auto InputParser::mouse_look_velocity(const MouseLookParams& params) -> MouseLoo
     const double max_dy = std::max(center_y - 1.0, static_cast<double>(params.term_height) - center_y);
     const double avail_x = max_dx - static_cast<double>(params.deadzone_radius);
     const double avail_y = max_dy - static_cast<double>(params.deadzone_radius);
-    
+
     if (avail_x <= 0.0 || avail_y <= 0.0) return {0.0, 0.0};
 
     const double mag_x = std::clamp((std::abs(dx) - params.deadzone_radius) / avail_x, 0.0, 1.0);

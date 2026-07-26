@@ -7,6 +7,25 @@ export module world;
 import math;
 import noise;
 
+export struct DirectionalLight
+{
+    Vec3 dir{0.0, 1.0, 0.0};
+    double intensity = 0.0;
+    LinearColor color{1.0f, 1.0f, 1.0f};
+    double angular_radius = 0.0;
+};
+
+export struct FrameLighting
+{
+    std::array<DirectionalLight, 2> lights{};
+    LinearColor sky_zenith{};
+    LinearColor sky_horizon{};
+    LinearColor ambient_zenith{};
+    LinearColor ambient_horizon{};
+    float sky_scale = 0.0f;
+    float star_visibility = 0.0f;
+};
+
 export struct Celestial
 {
     Vec3 direction{0.0, 0.0, 0.0};
@@ -62,8 +81,7 @@ export struct Celestial
         {
             return 0.0;
         }
-        const double height = dir.y / max_y;
-        return std::clamp(height, -1.0, 1.0);
+        return std::clamp(dir.y / max_y, -1.0, 1.0);
     }
 
     [[nodiscard]]
@@ -75,11 +93,7 @@ export struct Celestial
         const double alt = max_alt * std::sin(phase);
         const double az = phase - kPi * 0.5;
         const double cos_alt = std::cos(alt);
-        const double sin_alt = std::sin(alt);
-        const double x = cos_alt * std::sin(az);
-        const double z = cos_alt * std::cos(az);
-        const double y = sin_alt;
-        return Vec3{x, y, z}.normalize();
+        return Vec3{cos_alt * std::sin(az), std::sin(alt), cos_alt * std::cos(az)}.normalize();
     }
 
 private:
@@ -167,7 +181,6 @@ export struct Skybox
     double star_tint_r = 0.95;
     double star_tint_g = 0.98;
     double star_tint_b = 1.05;
-    int star_noise_salt = 911;
 
     [[nodiscard]]
     auto sample(const float sun_height) const -> std::pair<LinearColor, LinearColor>
@@ -187,30 +200,26 @@ export struct Skybox
         if (h >= golden_lo)
         {
             const float t = Scalar::smoothstep(golden_lo, golden_hi, h);
-            const auto zenith = LinearColor::lerp(golden_zenith, day_zenith, t);
-            const auto horizon = LinearColor::lerp(golden_horizon, day_horizon, t);
-            return {zenith, horizon};
+            return {LinearColor::lerp(golden_zenith, day_zenith, t),
+                    LinearColor::lerp(golden_horizon, day_horizon, t)};
         }
         if (h >= 0.0f)
         {
             const float t = Scalar::smoothstep(0.0f, golden_lo, h);
-            const auto zenith = LinearColor::lerp(dawn_zenith, golden_zenith, t);
-            const auto horizon = LinearColor::lerp(dawn_horizon, golden_horizon, t);
-            return {zenith, horizon};
+            return {LinearColor::lerp(dawn_zenith, golden_zenith, t),
+                    LinearColor::lerp(dawn_horizon, golden_horizon, t)};
         }
         if (h >= blue)
         {
             const float t = Scalar::smoothstep(blue, 0.0f, h);
-            const auto zenith = LinearColor::lerp(blue_zenith, dawn_zenith, t);
-            const auto horizon = LinearColor::lerp(blue_horizon, dawn_horizon, t);
-            return {zenith, horizon};
+            return {LinearColor::lerp(blue_zenith, dawn_zenith, t),
+                    LinearColor::lerp(blue_horizon, dawn_horizon, t)};
         }
         if (h >= night)
         {
             const float t = Scalar::smoothstep(night, blue, h);
-            const auto zenith = LinearColor::lerp(night_zenith, blue_zenith, t);
-            const auto horizon = LinearColor::lerp(night_horizon, blue_horizon, t);
-            return {zenith, horizon};
+            return {LinearColor::lerp(night_zenith, blue_zenith, t),
+                    LinearColor::lerp(night_horizon, blue_horizon, t)};
         }
         return {night_zenith, night_horizon};
     }
@@ -299,21 +308,19 @@ export struct Skybox
     {
         const auto [zenith, horizon] = sample(sun_height);
         const float t = star_visibility(sun_height);
-        const auto ambient_zenith = LinearColor::lerp(zenith, ambient_night_zenith, t);
-        const auto ambient_horizon = LinearColor::lerp(horizon, ambient_night_horizon, t);
-        return {ambient_zenith, ambient_horizon};
+        return {LinearColor::lerp(zenith, ambient_night_zenith, t),
+                LinearColor::lerp(horizon, ambient_night_horizon, t)};
     }
 
     [[nodiscard]]
-    auto apply_stars(const LinearColor& sky, const size_t x, const size_t y,
-                     const size_t width, const size_t height,
+    auto apply_stars(const LinearColor& sky, const Vec3& view_dir,
                      const float visibility) const -> LinearColor
     {
-        if (visibility <= 0.0f || width == 0 || height == 0)
+        if (visibility <= 0.0f)
         {
             return sky;
         }
-        const float star = star_intensity(x, y, width, height);
+        const float star = star_intensity(view_dir);
         if (star <= 0.0f)
         {
             return sky;
@@ -327,41 +334,30 @@ export struct Skybox
     }
 
     [[nodiscard]]
-    auto gradient(const float sun_height) const -> Gradient
-    {
-        const auto [zenith, horizon] = sample(sun_height);
-        return {zenith, horizon};
-    }
-
-    [[nodiscard]]
     auto state(const float sun_height, const float moon_intensity) const -> State
     {
         const auto [zenith, horizon] = sample(sun_height);
-        const float scale = intensity(sun_height, moon_intensity);
-        return {zenith, horizon, scale, sun_height};
+        return {zenith, horizon, intensity(sun_height, moon_intensity), sun_height};
     }
 
 private:
     [[nodiscard]]
-    auto star_intensity(const size_t x, const size_t y,
-                        const size_t width, const size_t height) const -> float
+    auto star_intensity(const Vec3& dir) const -> float
     {
-        const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(width);
-        const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(height);
+        constexpr double pi = std::numbers::pi_v<double>;
+        const double u = std::atan2(dir.x, dir.z) / (2.0 * pi);
+        const double v = std::asin(std::clamp(dir.y, -1.0, 1.0)) / pi;
         const double n_fine = SimplexNoise::sample(u * star_fine_scale, v * star_fine_scale);
         const double n_big = SimplexNoise::sample(u * star_big_scale + star_big_offset_u,
                                                   v * star_big_scale + star_big_offset_v);
         const float fine = static_cast<float>(n_fine * 0.5 + 0.5);
         const float big = static_cast<float>(n_big * 0.5 + 0.5);
-        const float sparkle = BlueNoise::sample(static_cast<int>(x), static_cast<int>(y),
-                                                0, star_noise_salt);
         const float small_star = Scalar::smoothstep(static_cast<float>(star_small_threshold),
-                                                    1.0f, fine) * (0.6f + 0.4f * sparkle);
+                                                    1.0f, fine);
         const float large_star = Scalar::smoothstep(static_cast<float>(star_large_threshold),
                                                     1.0f, big);
         return std::max(small_star, large_star);
     }
-
 };
 
 export struct World
@@ -396,4 +392,39 @@ export struct World
         moon.update_orbit(paused);
     }
 
+    [[nodiscard]]
+    auto evaluate_lighting(const double sun_intensity_boost) const -> FrameLighting
+    {
+        Vec3 sun_dir = sun.direction.normalize();
+        double sun_intensity = sun.intensity;
+        if (sun.orbit_enabled)
+        {
+            sun_dir = sun.direction_at(sun.orbit_angle);
+            sun_intensity *= sun.height_factor(sun_dir);
+        }
+        sun_intensity *= sun_intensity_boost;
+
+        Vec3 moon_dir = moon.orbit_enabled ? moon.direction_at(moon.orbit_angle) : -sun_dir;
+        moon_dir = (moon_dir.x == 0.0 && moon_dir.y == 0.0 && moon_dir.z == 0.0)
+                       ? moon.direction.normalize()
+                       : moon_dir.normalize();
+        double moon_intensity = std::max(0.0, moon.intensity) * moon.height_factor(moon_dir);
+
+        const float sun_height = static_cast<float>(sun.height_signed(sun_dir));
+        const float sky_height = sun.orbit_enabled ? sun_height : 1.0f;
+        const auto state = sky.state(sky_height, static_cast<float>(moon_intensity));
+        const auto ambient = sky.ambient_gradient(sky_height);
+        moon_intensity *= static_cast<double>(sky.moon_weight(sun_height));
+
+        return {
+            .lights = {DirectionalLight{sun_dir, sun_intensity, sun.color, sun.angular_radius},
+                       DirectionalLight{moon_dir, moon_intensity, moon.color, moon.angular_radius}},
+            .sky_zenith = state.zenith,
+            .sky_horizon = state.horizon,
+            .ambient_zenith = ambient.zenith,
+            .ambient_horizon = ambient.horizon,
+            .sky_scale = state.intensity,
+            .star_visibility = sky.star_visibility(sun_height),
+        };
+    }
 };

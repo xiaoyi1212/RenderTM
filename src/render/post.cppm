@@ -10,6 +10,22 @@ import settings;
 import framebuffer;
 import camera;
 
+export struct PostFrame
+{
+    LinearColor sky_top{};
+    LinearColor sky_bottom{};
+    bool taa_on = false;
+    bool clamp_history = false;
+    float taa_factor = 0.0f;
+    bool gi_active = false;
+    uint32_t frame_index = 0;
+    float jitter_x = 0.0f;
+    float jitter_y = 0.0f;
+    float exposure = 1.0f;
+    float star_visibility = 0.0f;
+    Vec3 camera_pos{0.0, 0.0, 0.0};
+};
+
 export struct PostProcessor
 {
     std::array<std::vector<LinearColor>, 2> taa_history;
@@ -146,12 +162,8 @@ export struct PostProcessor
     }
 
     auto resolve_frame(uint32_t* framebuffer, const RenderBuffers& buffers,
-                       const LinearColor& sky_top, const LinearColor& sky_bottom,
-                       const Skybox& skybox,
-                       bool taa_on, bool clamp_history, float taa_factor,
-                       bool gi_active, const GiSettings& gi_settings, uint32_t frame_index,
-                       float jitter_x, float jitter_y,
-                       float exposure_factor, float star_visibility) -> void
+                       const PostFrame& frame, const Skybox& skybox,
+                       const GiSettings& gi_settings) -> void
     {
         static constexpr std::array<std::array<int, 4>, 4> bayer4 = {{
             {{0, 8, 2, 10}},
@@ -165,17 +177,14 @@ export struct PostProcessor
         const float depth_max = std::numeric_limits<float>::max();
         const double width_d = static_cast<double>(width);
         const double height_d = static_cast<double>(height);
-        const double jitter_x_d = static_cast<double>(jitter_x);
-        const double jitter_y_d = static_cast<double>(jitter_y);
-        const double inv_dist = 1.0 / (Camera::far_plane - Camera::near_plane);
-        const double proj_a = Camera::far_plane * inv_dist;
-        const double proj_b = -Camera::near_plane * Camera::far_plane * inv_dist;
+        const double jitter_x_d = static_cast<double>(frame.jitter_x);
+        const double jitter_y_d = static_cast<double>(frame.jitter_y);
         const Mat4& inv_vp = inverseCurrentVP;
         const Mat4& prev_vp = previousVP;
 
         const float dither_strength = 2.0f;
         const float dither_scale = dither_strength / 16.0f;
-        const bool use_history = taa_on && taa_history_valid;
+        const bool use_history = frame.taa_on && taa_history_valid;
         const float sharpen = static_cast<float>(sharpen_strength);
 
         const int read_idx = (taa_ping_pong + 1) % 2;
@@ -184,12 +193,12 @@ export struct PostProcessor
         LinearColor* history_write_ptr = taa_history[write_idx].data();
         const std::span<const LinearColor> history_read_span(history_read_ptr, sample_count);
 
-        const float star_strength = std::clamp(star_visibility, 0.0f, 1.0f);
+        const float star_strength = std::clamp(frame.star_visibility, 0.0f, 1.0f);
 
         for (size_t y = 0; y < height; ++y)
         {
             const float sky_t = height > 1 ? static_cast<float>(y) / static_cast<float>(height - 1) : 0.0f;
-            const LinearColor sky_row = LinearColor::lerp(sky_top, sky_bottom, sky_t);
+            const LinearColor sky_row = LinearColor::lerp(frame.sky_top, frame.sky_bottom, sky_t);
             for (size_t x = 0; x < width; ++x)
             {
                 const size_t idx = y * width + x;
@@ -198,7 +207,11 @@ export struct PostProcessor
                     LinearColor sky = sky_row;
                     if (star_strength > 0.0f)
                     {
-                        sky = skybox.apply_stars(sky, x, y, width, height, star_strength);
+                        const Vec3 point = Camera::screen_to_world(
+                            static_cast<double>(x) + 0.5, static_cast<double>(y) + 0.5,
+                            1.0, inv_vp, width_d, height_d);
+                        const Vec3 view_dir = (point - frame.camera_pos).normalize();
+                        sky = skybox.apply_stars(sky, view_dir, star_strength);
                     }
                     current_linear_buffer[idx] = sky;
                     continue;
@@ -208,7 +221,7 @@ export struct PostProcessor
                 accum.r += direct.r;
                 accum.g += direct.g;
                 accum.b += direct.b;
-                if (gi_active)
+                if (frame.gi_active)
                 {
                     const LinearColor indirect = buffers.sample_indirect[idx];
                     const float gi_ao = std::min(1.0f, buffers.sample_ao[idx] + gi_settings.ao_lift);
@@ -235,7 +248,7 @@ export struct PostProcessor
 
                 LinearColor blended = current_linear;
                 bool history_used = false;
-                if (taa_on)
+                if (frame.taa_on)
                 {
                     bool history_valid = use_history;
                     LinearColor prev = current_linear;
@@ -246,23 +259,22 @@ export struct PostProcessor
                         {
                             const double screen_x = static_cast<double>(x) + 0.5 + jitter_x_d;
                             Vec3 world;
-                            if (buffers.world_stamp[pixel] == frame_index)
+                            if (buffers.world_stamp[pixel] == frame.frame_index)
                             {
                                 world = buffers.world_positions[pixel];
                             }
                             else
                             {
                                 world = Camera::screen_to_world(screen_x, screen_y, depth,
-                                                                inv_vp, width_d, height_d,
-                                                                proj_a, proj_b);
+                                                                inv_vp, width_d, height_d);
                             }
 
                             Vec2 prev_screen = Camera::world_to_screen(prev_vp, world, width, height);
 
                             if (std::isfinite(prev_screen.x) && std::isfinite(prev_screen.y))
                             {
-                                prev_screen.x -= static_cast<double>(jitter_x);
-                                prev_screen.y -= static_cast<double>(jitter_y);
+                                prev_screen.x -= static_cast<double>(frame.jitter_x);
+                                prev_screen.y -= static_cast<double>(frame.jitter_y);
                             }
                             if (std::isfinite(prev_screen.x) && std::isfinite(prev_screen.y) &&
                                 prev_screen.x >= 0.0 && prev_screen.x <= static_cast<double>(width) &&
@@ -278,7 +290,7 @@ export struct PostProcessor
                         }
                     }
 
-                    if (history_valid && clamp_history)
+                    if (history_valid && frame.clamp_history)
                     {
                         LinearColor minc = current_linear;
                         LinearColor maxc = current_linear;
@@ -304,9 +316,9 @@ export struct PostProcessor
 
                     if (history_valid)
                     {
-                        blended.r = prev.r + (current_linear.r - prev.r) * taa_factor;
-                        blended.g = prev.g + (current_linear.g - prev.g) * taa_factor;
-                        blended.b = prev.b + (current_linear.b - prev.b) * taa_factor;
+                        blended.r = prev.r + (current_linear.r - prev.r) * frame.taa_factor;
+                        blended.g = prev.g + (current_linear.g - prev.g) * frame.taa_factor;
+                        blended.b = prev.b + (current_linear.b - prev.b) * frame.taa_factor;
                         history_used = true;
                     }
                     else
@@ -351,15 +363,12 @@ export struct PostProcessor
                         (center.g * 4.0f + north.g + south.g + west.g + east.g) * inv,
                         (center.b * 4.0f + north.b + south.b + west.b + east.b) * inv
                     };
-                    resolved.r = center.r + (center.r - blur.r) * sharpen;
-                    resolved.g = center.g + (center.g - blur.g) * sharpen;
-                    resolved.b = center.b + (center.b - blur.b) * sharpen;
-                    resolved.r = std::max(0.0f, resolved.r);
-                    resolved.g = std::max(0.0f, resolved.g);
-                    resolved.b = std::max(0.0f, resolved.b);
+                    resolved.r = std::max(0.0f, center.r + (center.r - blur.r) * sharpen);
+                    resolved.g = std::max(0.0f, center.g + (center.g - blur.g) * sharpen);
+                    resolved.b = std::max(0.0f, center.b + (center.b - blur.b) * sharpen);
                 }
 
-                const LinearColor mapped = tonemap_reinhard(resolved, exposure_factor);
+                const LinearColor mapped = tonemap_reinhard(resolved, frame.exposure);
                 ColorSrgb srgb = mapped.to_srgb();
                 if (!is_sky)
                 {
@@ -373,7 +382,7 @@ export struct PostProcessor
             }
         }
 
-        if (taa_on)
+        if (frame.taa_on)
         {
             taa_history_valid = true;
             taa_ping_pong = (taa_ping_pong + 1) % 2;
@@ -395,15 +404,7 @@ private:
     static auto pack_color(const ColorSrgb& color) -> uint32_t
     {
         auto clamp_channel = [](float value) -> uint32_t {
-            if (value < 0.0f)
-            {
-                value = 0.0f;
-            }
-            if (value > 255.0f)
-            {
-                value = 255.0f;
-            }
-            return static_cast<uint32_t>(std::lround(value));
+            return static_cast<uint32_t>(std::lround(std::clamp(value, 0.0f, 255.0f)));
         };
         const uint32_t r = clamp_channel(color.r);
         const uint32_t g = clamp_channel(color.g);

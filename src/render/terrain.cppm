@@ -7,6 +7,15 @@ export module terrain;
 import math;
 import noise;
 
+export struct Material
+{
+    uint32_t color = 0xFFFFFFFF;
+    double ambient = 0.25;
+    double diffuse = 1.0;
+    double specular = 0.15;
+    double shininess = 24.0;
+};
+
 export struct BlockGeometry
 {
     static constexpr int FaceTop = 0;
@@ -15,22 +24,15 @@ export struct BlockGeometry
     static constexpr int FaceRight = 3;
     static constexpr int FaceBack = 4;
     static constexpr int FaceFront = 5;
+    static constexpr int kFaceCount = 6;
+    static constexpr int kCornersPerFace = 4;
 
-    static constexpr std::array<Vec3, 8> vertices = {{
-        {-1, -1, -1}, {1, -1, -1}, {1,  1, -1}, {-1,  1, -1},
-        {-1, -1,  1}, {1, -1,  1}, {1,  1,  1}, {-1,  1,  1}
+    static constexpr std::array<Vec3, 8> corners = {{
+        {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {1.0, 1.0, 0.0}, {0.0, 1.0, 0.0},
+        {0.0, 0.0, 1.0}, {1.0, 0.0, 1.0}, {1.0, 1.0, 1.0}, {0.0, 1.0, 1.0}
     }};
 
-    static constexpr std::array<std::array<int, 4>, 6> face_vertices = {{
-        {{3, 2, 6, 7}}, // top (+y)
-        {{0, 1, 5, 4}}, // bottom (-y)
-        {{0, 3, 7, 4}}, // left (-x)
-        {{1, 2, 6, 5}}, // right (+x)
-        {{0, 1, 2, 3}}, // back (-z)
-        {{4, 5, 6, 7}}  // front (+z)
-    }};
-
-    static constexpr std::array<std::array<int, 4>, 6> quad_order = {{
+    static constexpr std::array<std::array<int, 4>, 6> face_corners = {{
         {{3, 7, 6, 2}}, // top (+y)
         {{0, 1, 5, 4}}, // bottom (-y)
         {{0, 4, 7, 3}}, // left (-x)
@@ -39,7 +41,7 @@ export struct BlockGeometry
         {{4, 5, 6, 7}}  // front (+z)
     }};
 
-    static constexpr std::array<std::array<int, 3>, 6> face_normals = {{
+    static constexpr std::array<std::array<int, 3>, 6> steps = {{
         {{0, 1, 0}},   // top (+y)
         {{0, -1, 0}},  // bottom (-y)
         {{-1, 0, 0}},  // left (-x)
@@ -48,24 +50,12 @@ export struct BlockGeometry
         {{0, 0, 1}}    // front (+z)
     }};
 
-    static constexpr std::array<Vec3, 8> vertices_grid = {{
-        {0.0, 0.0, 0.0},
-        {1.0, 0.0, 0.0},
-        {1.0, 1.0, 0.0},
-        {0.0, 1.0, 0.0},
-        {0.0, 0.0, 1.0},
-        {1.0, 0.0, 1.0},
-        {1.0, 1.0, 1.0},
-        {0.0, 1.0, 1.0}
-    }};
-
     [[nodiscard]]
-    static constexpr auto face_normal_world(const int face) -> Vec3
+    static constexpr auto normal(const int face) -> Vec3
     {
-        const double x = static_cast<double>(face_normals[face][0]);
-        const double y = static_cast<double>(face_normals[face][1]);
-        const double z = static_cast<double>(face_normals[face][2]);
-        return {x, y, z};
+        return {static_cast<double>(steps[face][0]),
+                static_cast<double>(steps[face][1]),
+                static_cast<double>(steps[face][2])};
     }
 };
 
@@ -81,30 +71,50 @@ export struct TerrainConfig
     double height_freq = 0.12;
     double surface_freq = 0.4;
 
-    uint32_t stone_color = 0xFF7A7A7A;
-    uint32_t dirt_color  = 0xFF7D4714;
-    uint32_t grass_color = 0xFF3B8A38;
-    uint32_t water_color = 0xFF2B5FA8;
+    std::vector<Material> palette{
+        {.color = 0xFF7A7A7A},  // stone
+        {.color = 0xFF7D4714},  // dirt
+        {.color = 0xFF3B8A38},  // grass
+        {.color = 0xFF2B5FA8},  // water
+    };
+    uint8_t stone = 0;
+    uint8_t dirt = 1;
+    uint8_t grass = 2;
+    uint8_t water = 3;
 };
 
 export struct VoxelBlock
 {
     Vec3 position;
-    uint32_t color;
-    LinearColor albedo_linear;
-    std::array<std::array<Vec3, 4>, 6> face_normals;
+    uint8_t material;
     std::array<std::array<float, 4>, 6> sky_visibility;
+
+    [[nodiscard]]
+    auto face_visibility(const int face) const -> float
+    {
+        const auto& corners = sky_visibility[static_cast<size_t>(face)];
+        return (corners[0] + corners[1] + corners[2] + corners[3]) * 0.25f;
+    }
 };
 
 export struct RenderQuad
 {
     std::array<Vec3, 4> v;
-    std::array<Vec3, 4> n;
     std::array<float, 4> sky_visibility;
-    uint32_t color;
+    Vec3 normal;
+    uint8_t material;
 };
 
-struct BlockTopology
+export struct RayHit
+{
+    Vec3 position;
+    Vec3 normal;
+    int face;
+    const VoxelBlock* block;
+    double distance;
+};
+
+export struct BlockTopology
 {
     int chunk_size = 0;
     int max_height = 0;
@@ -120,91 +130,71 @@ struct BlockTopology
     [[nodiscard]]
     constexpr auto block_slot(const int gx, const int gy, const int gz) const -> size_t
     {
-        const size_t x = static_cast<size_t>(gx);
-        const size_t y = static_cast<size_t>(gy);
-        const size_t z = static_cast<size_t>(gz);
-
-        const size_t width  = static_cast<size_t>(chunk_size);
+        const size_t width = static_cast<size_t>(chunk_size);
         const size_t height = static_cast<size_t>(max_height);
-
-        const size_t z_stride = height * width;
-        const size_t y_stride = width;
-        return (z * z_stride) + (y * y_stride) + x;
+        return (static_cast<size_t>(gz) * height + static_cast<size_t>(gy)) * width
+               + static_cast<size_t>(gx);
     }
 
     [[nodiscard]]
     auto has_block(const int gx, const int gy, const int gz) const -> bool
     {
-        if (gx < 0 || gx >= chunk_size || gz < 0 || gz >= chunk_size)
+        if (gx < 0 || gx >= chunk_size || gz < 0 || gz >= chunk_size || gy < 0)
         {
             return false;
         }
-        if (gy < 0) return false;
-
         const size_t idx = index(gx, gz);
-        if (idx >= heights.size())
-        {
-            return false;
-        }
-
-        return gy < heights[idx];
+        return idx < heights.size() && gy < heights[idx];
     }
 
     [[nodiscard]]
     auto block_at(std::span<const VoxelBlock> blocks,
-                  const int gx, const int gy, const int gz) const
-        -> std::optional<std::reference_wrapper<const VoxelBlock>>
+                  const int gx, const int gy, const int gz) const -> const VoxelBlock*
     {
-        if (gx < 0 || gx >= chunk_size || gz < 0 || gz >= chunk_size)
+        if (gx < 0 || gx >= chunk_size || gz < 0 || gz >= chunk_size ||
+            gy < 0 || gy >= max_height)
         {
-            return std::nullopt;
-        }
-        if (gy < 0 || gy >= max_height)
-        {
-            return std::nullopt;
+            return nullptr;
         }
         const size_t slot = block_slot(gx, gy, gz);
         if (slot >= block_index.size())
         {
-            return std::nullopt;
+            return nullptr;
         }
-        const int index = block_index[slot];
-        if (index < 0 || static_cast<size_t>(index) >= blocks.size())
+        const int idx = block_index[slot];
+        if (idx < 0 || static_cast<size_t>(idx) >= blocks.size())
         {
-            return std::nullopt;
+            return nullptr;
         }
-        return std::cref(blocks[static_cast<size_t>(index)]);
+        return &blocks[static_cast<size_t>(idx)];
     }
 };
+
+namespace {
 
 struct Occlusion
 {
     Occlusion() = delete;
 
     [[nodiscard]]
-    static auto sample(const BlockTopology& topology, 
+    static auto sample(const BlockTopology& topology,
                        const int gx, const int gy, const int gz,
                        const int face, const int corner) -> float
     {
-        Vec3 normal{
-            static_cast<double>(BlockGeometry::face_normals[face][0]),
-            static_cast<double>(BlockGeometry::face_normals[face][1]),
-            static_cast<double>(BlockGeometry::face_normals[face][2])
-        };
+        const Vec3 normal = BlockGeometry::normal(face);
         auto [tangent, bitangent, forward] = Vec3::get_basis(normal);
-        normal = forward;
 
         const Vec3 grid_pos{
             static_cast<double>(gx),
             static_cast<double>(gy),
             static_cast<double>(gz)
         };
-        const int vi = BlockGeometry::face_vertices[face][corner];
-        const Vec3 vertex = grid_pos + BlockGeometry::vertices_grid[vi];
+        const int vi = BlockGeometry::face_corners[face][corner];
+        const Vec3 vertex = grid_pos + BlockGeometry::corners[vi];
         const Vec3 center = grid_pos + Vec3{0.5, 0.5, 0.5};
 
-        const Vec3 origin = vertex + 
-                            normal * kRayBias + 
+        const Vec3 origin = vertex +
+                            forward * kRayBias +
                             (center - vertex) * kRayCenterBias;
 
         const auto& samples = sample_dirs();
@@ -213,7 +203,7 @@ struct Occlusion
         {
             const Vec3 dir = tangent * sample.x +
                              bitangent * sample.y +
-                             normal * sample.z;
+                             forward * sample.z;
 
             bool hit = false;
             for (double t = kRayStep; t <= kRayMaxDistance; t += kRayStep)
@@ -231,11 +221,9 @@ struct Occlusion
             if (hit) occluded++;
         }
 
-        const double total_samples = static_cast<double>(samples.size());
-        const double occlusion_ratio = static_cast<double>(occluded) / total_samples;
-        const double raw_visibility = 1.0 - occlusion_ratio;
-
-        return static_cast<float>(std::clamp(raw_visibility, 0.0, 1.0));
+        const double occlusion_ratio = static_cast<double>(occluded)
+                                       / static_cast<double>(samples.size());
+        return static_cast<float>(std::clamp(1.0 - occlusion_ratio, 0.0, 1.0));
     }
 
 private:
@@ -254,24 +242,20 @@ private:
 
             for (size_t i = 0; i < kRayCount; ++i)
             {
-                const double index = static_cast<double>(i);
-                const double u = (index + 0.5) / total_rays;
+                const double u = (static_cast<double>(i) + 0.5) / total_rays;
                 const double v = radical_inverse_vdc(static_cast<uint32_t>(i));
 
                 const double r = std::sqrt(u);
                 const double theta = 2.0 * std::numbers::pi_v<double> * v;
-
-                const double x = r * std::cos(theta);
-                const double y = r * std::sin(theta);
-                const double z = std::sqrt(std::max(0.0, 1.0 - u));
-                samples[i] = {x, y, z};
+                samples[i] = {r * std::cos(theta), r * std::sin(theta),
+                              std::sqrt(std::max(0.0, 1.0 - u))};
             }
             return samples;
         }();
         return dirs;
     }
 
-    static double radical_inverse_vdc(uint32_t bits)
+    static auto radical_inverse_vdc(uint32_t bits) -> double
     {
         bits = (bits << 16u) | (bits >> 16u);
         bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
@@ -282,328 +266,255 @@ private:
     }
 };
 
-struct TerrainGrid
-{
-    double block_size = 0.0;
-    double start_x = 0.0;
-    double start_z = 0.0;
-    double base_y = 0.0;
-};
+}
 
-struct TerrainMeshBuilder
+export struct Terrain
 {
-    TerrainMeshBuilder() = delete;
-    using FaceOrder = std::array<int, 6>;
-    
-    static auto build_mesh(const BlockTopology& topology,
-                           std::span<const VoxelBlock> blocks,
-                           std::vector<RenderQuad>& mesh,
-                           size_t& visible_faces) -> void
+    TerrainConfig config{};
+    BlockTopology topology;
+    std::vector<VoxelBlock> blocks;
+    std::vector<RenderQuad> mesh;
+    std::vector<LinearColor> albedo;
+    size_t visible_faces = 0;
+
+    auto generate() -> void
     {
-        const int chunk_size = topology.chunk_size;
-        mesh.clear();
-        visible_faces = 0;
+        albedo.clear();
+        albedo.reserve(config.palette.size());
+        for (const Material& material : config.palette)
+        {
+            albedo.push_back(ColorSrgb::from_hex(material.color).to_linear());
+        }
+        build_chunk();
+        build_mesh();
+    }
 
-        if (chunk_size <= 0 || topology.max_height <= 0) return;
+    [[nodiscard]]
+    auto grid_origin() const -> Vec3
+    {
+        const double half = config.block_size * 0.5;
+        const double start_x = -(static_cast<double>(topology.chunk_size) - 1.0) * half;
+        return {start_x - half, config.base_y - half, config.start_z - half};
+    }
 
-        static constexpr std::array<int, 6> kFaceOrder{{
-            BlockGeometry::FaceFront, BlockGeometry::FaceBack,
-            BlockGeometry::FaceLeft, BlockGeometry::FaceRight,
-            BlockGeometry::FaceBottom, BlockGeometry::FaceTop
+    [[nodiscard]]
+    auto raycast(const Vec3& origin, const Vec3& dir,
+                 const double max_distance = std::numeric_limits<double>::infinity()) const
+        -> std::optional<RayHit>
+    {
+        const int size = topology.chunk_size;
+        const int max_height = topology.max_height;
+        if (size <= 0 || max_height <= 0 ||
+            (dir.x == 0.0 && dir.y == 0.0 && dir.z == 0.0))
+        {
+            return std::nullopt;
+        }
+
+        constexpr double inf = std::numeric_limits<double>::infinity();
+        const Vec3 grid = (origin - grid_origin()) * (1.0 / config.block_size);
+        const std::array<double, 3> g{grid.x, grid.y, grid.z};
+        const std::array<double, 3> d{dir.x, dir.y, dir.z};
+
+        std::array<int, 3> cell{};
+        std::array<int, 3> step{};
+        std::array<double, 3> t_delta{};
+        std::array<double, 3> t_max{};
+        for (int i = 0; i < 3; ++i)
+        {
+            cell[i] = static_cast<int>(std::floor(g[i]));
+            step[i] = (d[i] > 0.0) - (d[i] < 0.0);
+            t_delta[i] = step[i] != 0 ? config.block_size / std::abs(d[i]) : inf;
+            const double boundary = std::floor(g[i]) + (step[i] > 0 ? 1.0 : 0.0);
+            t_max[i] = step[i] != 0 ? (boundary - g[i]) * config.block_size / d[i] : inf;
+        }
+
+        const auto in_bounds = [&] {
+            return cell[0] >= 0 && cell[0] < size &&
+                   cell[1] >= 0 && cell[1] < max_height &&
+                   cell[2] >= 0 && cell[2] < size;
+        };
+        if (!in_bounds())
+        {
+            return std::nullopt;
+        }
+
+        static constexpr std::array<std::array<int, 2>, 3> kEnteredFace{{
+            {BlockGeometry::FaceRight, BlockGeometry::FaceLeft},
+            {BlockGeometry::FaceTop, BlockGeometry::FaceBottom},
+            {BlockGeometry::FaceFront, BlockGeometry::FaceBack}
         }};
 
-        const auto append_quad = [&](const VoxelBlock& block, int face) 
+        while (true)
         {
-            RenderQuad quad{};
-            quad.color = block.color;
-            
-            auto face_corner_index = [&](int v_idx) {
-                for (int i = 0; i < 4; ++i)
-                    if (BlockGeometry::face_vertices[face][i] == v_idx)
-                        return i;
-                return -1;
-            };
-
-            for (int corner = 0; corner < 4; ++corner)
+            const int axis = t_max[0] < t_max[1]
+                                 ? (t_max[0] < t_max[2] ? 0 : 2)
+                                 : (t_max[1] < t_max[2] ? 1 : 2);
+            const double t = t_max[axis];
+            if (t > max_distance)
             {
-                const int vi = BlockGeometry::quad_order[face][corner];
-                quad.v[corner] = block.position + BlockGeometry::vertices[vi];
-                
-                const int face_corner_raw = face_corner_index(vi);
-                const int attr_corner = (face_corner_raw < 0) ? corner : face_corner_raw;
-                
-                quad.sky_visibility[corner] = block.sky_visibility[face][attr_corner];
-                quad.n[corner] = block.face_normals[face][attr_corner];
+                return std::nullopt;
             }
-            mesh.push_back(quad);
-        };
-
-        const auto process_voxel = [&](int x, int y, int z) 
-        {
-            const size_t slot = topology.block_slot(x, y, z);
-            const int index = topology.block_index[slot];
-            const VoxelBlock& block = blocks[static_cast<size_t>(index)];
-
-            for (const int face : kFaceOrder)
+            t_max[axis] += t_delta[axis];
+            cell[axis] += step[axis];
+            if (!in_bounds())
             {
-                const int nx = x + BlockGeometry::face_normals[face][0];
-                const int ny = y + BlockGeometry::face_normals[face][1];
-                const int nz = z + BlockGeometry::face_normals[face][2];
-
-                if (!topology.has_block(nx, ny, nz))
-                {
-                    append_quad(block, face);
-                    visible_faces++;
-                }
+                return std::nullopt;
             }
-        };
-
-        const size_t total_columns = static_cast<size_t>(chunk_size * chunk_size);
-        for (size_t i = 0; i < total_columns; ++i)
-        {
-            const int height = topology.heights[i];
-            if (height <= 0) continue;
-
-            const int z = static_cast<int>(i / chunk_size);
-            const int x = static_cast<int>(i % chunk_size);
-
-            for (int y = 0; y < height; ++y)
+            if (!topology.has_block(cell[0], cell[1], cell[2]))
             {
-                process_voxel(x, y, z);
+                continue;
             }
+
+            const int face = kEnteredFace[axis][step[axis] > 0 ? 1 : 0];
+            const VoxelBlock* block = topology.block_at(blocks, cell[0], cell[1], cell[2]);
+            if (!block)
+            {
+                return std::nullopt;
+            }
+            return RayHit{origin + dir * t, BlockGeometry::normal(face), face, block, t};
         }
-    }
-};
-
-struct TerrainGenerator
-{
-    TerrainGenerator() = delete;
-
-    static auto build_chunk(const TerrainConfig& config,
-                            BlockTopology& topology,
-                            std::vector<VoxelBlock>& blocks) -> void
-    {
-        const int chunk_size = config.chunk_size;
-        const auto grid = grid_for(config, config.chunk_size);
-        const auto& normals = normals_table();
-        std::vector<uint32_t> top_colors;
-
-        init_storage(config, topology, blocks, top_colors);
-        fill_heights(config, topology, top_colors);
-        finalize_topology(config, topology);
-
-        const auto add_voxel = [&](const int x, const int y, const int z, 
-                                   const int height, const uint32_t top_color) 
-        {
-            const uint32_t color = block_color(config, y, height, top_color);
-            const auto sky = face_sky(topology, x, y, z);
-
-            const Vec3 pos{
-                grid.start_x + x * grid.block_size,
-                grid.base_y + y * grid.block_size,
-                grid.start_z + z * grid.block_size
-            };
-
-            blocks.push_back({
-                pos,
-                color,
-                ColorSrgb::from_hex(color).to_linear(),
-                normals,
-                sky
-            });
-
-            const size_t slot = topology.block_slot(x, y, z);
-            topology.block_index[slot] = static_cast<int>(blocks.size() - 1);
-        };
-
-        const auto process_column = [&](const size_t col_index) 
-        {
-            const int height = topology.heights[col_index];
-            if (height <= 0) return;
-
-            const int z = static_cast<int>(col_index / chunk_size);
-            const int x = static_cast<int>(col_index % chunk_size);
-            const uint32_t top_color = top_colors[col_index];
-
-            for (int y = 0; y < height; ++y)
-            {
-                add_voxel(x, y, z, height, top_color);
-            }
-        };
-
-        for (size_t i = 0; i < chunk_size * chunk_size; ++i) process_column(i);
     }
 
 private:
-    using FaceNormals = std::array<std::array<Vec3, 4>, 6>;
-    using FaceSky = std::array<std::array<float, 4>, 6>;
-
-    static auto grid_for(const TerrainConfig& cfg, const int chunk_size) -> TerrainGrid
-    {
-        const double max_index = static_cast<double>(chunk_size) - 1.0;
-        return {
-            .block_size = cfg.block_size,
-            .start_x = -max_index * cfg.block_size * 0.5,
-            .start_z = cfg.start_z,
-            .base_y = cfg.base_y
-        };
-    }
-
-    static auto normals_table() -> const FaceNormals&
-    {
-        const auto build_normals = [] {
-            FaceNormals out{};
-            for (int face = 0; face < 6; ++face)
-            {
-                const Vec3 base = BlockGeometry::face_normal_world(face);
-                for (int corner = 0; corner < 4; ++corner)
-                {
-                    out[face][corner] = base;
-                }
-            }
-            return out;
-        };
-        static const FaceNormals normals = build_normals();
-        return normals;
-    }
-
-    static auto init_storage(const TerrainConfig& config,
-                             BlockTopology& topology,
-                             std::vector<VoxelBlock>& blocks,
-                             std::vector<uint32_t>& top_colors) -> void
+    auto build_chunk() -> void
     {
         const int chunk_size = config.chunk_size;
         topology.chunk_size = chunk_size;
 
-        const auto grid_cells = chunk_size * chunk_size;
+        const size_t grid_cells = static_cast<size_t>(chunk_size) * chunk_size;
         topology.heights.assign(grid_cells, 0);
-        top_colors.assign(grid_cells, config.grass_color);
+        std::vector<uint8_t> surface(grid_cells, config.grass);
         blocks.clear();
+        blocks.reserve(grid_cells * static_cast<size_t>(config.base_height
+                                                        + config.height_variation + 3));
 
-        const auto reserve_rows = config.base_height + config.height_variation + 3;
-        blocks.reserve(grid_cells * static_cast<size_t>(reserve_rows));
-    }
-
-    static auto fill_heights(const TerrainConfig& config,
-                             BlockTopology& topology,
-                             std::vector<uint32_t>& top_colors) -> void
-    {
-        const int chunk_size = config.chunk_size;
+        topology.max_height = 0;
         for (int z = 0; z < chunk_size; ++z)
         {
             for (int x = 0; x < chunk_size; ++x)
             {
                 const size_t idx = topology.index(x, z);
-                topology.heights[idx] = height_at(config, x, z);
-                top_colors[idx] = top_color_at(config, x, z);
+                topology.heights[idx] = height_at(x, z);
+                surface[idx] = surface_material_at(x, z);
+                topology.max_height = std::max(topology.max_height, topology.heights[idx]);
+            }
+        }
+
+        const size_t slots = grid_cells * static_cast<size_t>(std::max(topology.max_height, 1));
+        topology.block_index.assign(slots, -1);
+
+        const Vec3 base = grid_origin();
+        for (size_t i = 0; i < grid_cells; ++i)
+        {
+            const int height = topology.heights[i];
+            const int z = static_cast<int>(i) / chunk_size;
+            const int x = static_cast<int>(i) % chunk_size;
+
+            for (int y = 0; y < height; ++y)
+            {
+                const Vec3 center{0.5 + x, 0.5 + y, 0.5 + z};
+                blocks.push_back({
+                    base + center * config.block_size,
+                    material_at(y, height, surface[i]),
+                    face_sky(x, y, z)
+                });
+                topology.block_index[topology.block_slot(x, y, z)] =
+                    static_cast<int>(blocks.size() - 1);
             }
         }
     }
 
-    static auto finalize_topology(const TerrainConfig& config,
-                                  BlockTopology& topology) -> void
+    auto build_mesh() -> void
     {
-        topology.max_height = 0;
-        for (int value : topology.heights)
+        mesh.clear();
+        visible_faces = 0;
+
+        for (const VoxelBlock& block : blocks)
         {
-            topology.max_height = std::max(topology.max_height, value);
+            const Vec3 grid = (block.position - grid_origin()) * (1.0 / config.block_size);
+            const int x = static_cast<int>(std::floor(grid.x));
+            const int y = static_cast<int>(std::floor(grid.y));
+            const int z = static_cast<int>(std::floor(grid.z));
+
+            for (int face = 0; face < BlockGeometry::kFaceCount; ++face)
+            {
+                const auto& step = BlockGeometry::steps[face];
+                if (topology.has_block(x + step[0], y + step[1], z + step[2]))
+                {
+                    continue;
+                }
+
+                RenderQuad quad{};
+                quad.material = block.material;
+                quad.normal = BlockGeometry::normal(face);
+                quad.sky_visibility = block.sky_visibility[static_cast<size_t>(face)];
+                for (int corner = 0; corner < BlockGeometry::kCornersPerFace; ++corner)
+                {
+                    const int vi = BlockGeometry::face_corners[face][corner];
+                    const Vec3 offset = BlockGeometry::corners[vi] - Vec3{0.5, 0.5, 0.5};
+                    quad.v[corner] = block.position + offset * config.block_size;
+                }
+                mesh.push_back(quad);
+                visible_faces++;
+            }
         }
-        if (topology.max_height < 0)
-        {
-            topology.max_height = 0;
-        }
-        const size_t stride = static_cast<size_t>(config.chunk_size);
-        const size_t height = static_cast<size_t>(std::max(topology.max_height, 1));
-        const size_t slots = stride * height * stride;
-        topology.block_index.assign(slots, -1);
     }
 
     [[nodiscard]]
-    static auto height_at(const TerrainConfig& cfg, const int x, const int z) -> int
+    auto height_at(const int x, const int z) const -> int
     {
-        const double h = SimplexNoise::sample(x * cfg.height_freq, z * cfg.height_freq);
-        const double scaled = (h + 1.0) * 0.5 * static_cast<double>(cfg.height_variation);
-        return std::max(cfg.base_height + static_cast<int>(scaled + 0.5), 3);
+        const double h = SimplexNoise::sample(x * config.height_freq, z * config.height_freq);
+        const double scaled = (h + 1.0) * 0.5 * static_cast<double>(config.height_variation);
+        return std::max(config.base_height + static_cast<int>(scaled + 0.5), 3);
     }
 
     [[nodiscard]]
-    static auto top_color_at(const TerrainConfig& cfg, const int x, const int z) -> uint32_t
+    auto surface_material_at(const int x, const int z) const -> uint8_t
     {
-        const double surface = SimplexNoise::sample(x * cfg.surface_freq + 100.0,
-                                                    z * cfg.surface_freq - 100.0);
+        const double surface = SimplexNoise::sample(x * config.surface_freq + 100.0,
+                                                    z * config.surface_freq - 100.0);
         if (surface > 0.55)
         {
-            return cfg.water_color;
+            return config.water;
         }
         if (surface < -0.35)
         {
-            return cfg.dirt_color;
+            return config.dirt;
         }
-        return cfg.grass_color;
+        return config.grass;
     }
 
     [[nodiscard]]
-    static auto block_color(const TerrainConfig& cfg, const int y, const int height,
-                            const uint32_t top_color) -> uint32_t
+    auto material_at(const int y, const int height, const uint8_t surface) const -> uint8_t
     {
         if (y >= height - 1)
         {
-            return top_color;
+            return surface;
         }
-        if (y >= height - 1 - cfg.dirt_thickness)
+        if (y >= height - 1 - config.dirt_thickness)
         {
-            return cfg.dirt_color;
+            return config.dirt;
         }
-        return cfg.stone_color;
+        return config.stone;
     }
 
     [[nodiscard]]
-    static auto face_sky(const BlockTopology& topology,
-                         const int x, const int y, const int z) -> FaceSky
+    auto face_sky(const int x, const int y, const int z) const
+        -> std::array<std::array<float, 4>, 6>
     {
-        auto sky = FaceSky{};
-        for (auto& face_visibility : sky)
+        std::array<std::array<float, 4>, 6> sky{};
+        for (int face = 0; face < BlockGeometry::kFaceCount; ++face)
         {
-            face_visibility.fill(0.0f);
-        }
-
-        auto fill_corners = [&](const int face) {
-            for (int corner = 0; corner < 4; ++corner)
+            const auto& step = BlockGeometry::steps[face];
+            if (topology.has_block(x + step[0], y + step[1], z + step[2]))
+            {
+                continue;
+            }
+            for (int corner = 0; corner < BlockGeometry::kCornersPerFace; ++corner)
             {
                 sky[face][corner] = Occlusion::sample(topology, x, y, z, face, corner);
             }
-        };
-
-        auto fill_face = [&](const int face) {
-            const int nx = x + BlockGeometry::face_normals[face][0];
-            const int ny = y + BlockGeometry::face_normals[face][1];
-            const int nz = z + BlockGeometry::face_normals[face][2];
-            if (topology.has_block(nx, ny, nz))
-            {
-                return;
-            }
-            fill_corners(face);
-        };
-
-        for (int face = 0; face < 6; ++face) fill_face(face);
-
+        }
         return sky;
-    }
-};
-
-export struct Terrain
-{
-    int chunk_size = 16;
-    size_t visible_faces = 0;
-    TerrainConfig config{};
-    BlockTopology topology;
-    std::vector<VoxelBlock> blocks;
-    std::vector<RenderQuad> mesh;
-
-    auto generate() -> void
-    {
-        chunk_size = config.chunk_size;
-        TerrainGenerator::build_chunk(config, topology, blocks);
-        TerrainMeshBuilder::build_mesh(topology, blocks, mesh, visible_faces);
     }
 };

@@ -12,63 +12,74 @@ export struct Camera {
 
     static constexpr double near_plane = 0.05;
     static constexpr double far_plane = 1000.0;
+    static constexpr double max_pitch = 1.4;
+    static constexpr double fov_scale = 0.8;
+
+    static constexpr double proj_a = far_plane / (far_plane - near_plane);
+    static constexpr double proj_b = -near_plane * far_plane / (far_plane - near_plane);
+
+    [[nodiscard]]
+    auto orientation() const -> YawPitch
+    {
+        return YawPitch::from_angles(rotation.x, rotation.y);
+    }
 
     auto move_local(const Vec3& delta) -> void
     {
-        position = position + rotate_yaw_pitch(delta, rotation.x, rotation.y);
+        position = position + orientation().apply(delta);
+    }
+
+    auto move(const Vec3& intent) -> void
+    {
+        const YawPitch rot = orientation();
+        const YawPitch yaw_only{rot.cy, rot.sy, 1.0, 0.0};
+        position = position
+                 + rot.apply({0.0, 0.0, intent.z})
+                 + yaw_only.apply({intent.x, 0.0, 0.0})
+                 + Vec3{0.0, intent.y, 0.0};
     }
 
     auto rotate(const Vec2& delta) -> void
     {
-        rotation.x += delta.x;
-        rotation.y = clamp_pitch(rotation.y + delta.y);
+        set_rotation(rotation + delta);
     }
 
     auto set_rotation(const Vec2& rot) -> void
     {
         rotation.x = rot.x;
-        rotation.y = clamp_pitch(rot.y);
+        rotation.y = std::clamp(rot.y, -max_pitch, max_pitch);
     }
 
     [[nodiscard]]
     auto from_camera_space(const Vec3& view) const -> Vec3
     {
-        return position + rotate_pitch_yaw(view, rotation.x, rotation.y);
+        return position + orientation().apply(view);
     }
 
     [[nodiscard]]
     auto to_camera_space(const Vec3& world) const -> Vec3
     {
-        return rotate_yaw_pitch(world - position, -rotation.x, -rotation.y);
+        return orientation().apply_inverse(world - position);
     }
 
     [[nodiscard]]
     auto view_matrix() const -> Mat4
     {
-        const double yaw = -rotation.x;
-        const double pitch = -rotation.y;
-        const double cy = std::cos(yaw);
-        const double sy = std::sin(yaw);
-        const double cp = std::cos(pitch);
-        const double sp = std::sin(pitch);
+        const YawPitch rot = orientation();
+        const std::array<Vec3, 3> rows{{
+            {rot.cy, 0.0, -rot.sy},
+            {rot.sy * rot.sp, rot.cp, rot.cy * rot.sp},
+            {rot.sy * rot.cp, -rot.sp, rot.cy * rot.cp}
+        }};
 
         Mat4 m = Mat4::identity();
-        m.m[0][0] = cy;
-        m.m[0][1] = 0.0;
-        m.m[0][2] = sy;
-
-        m.m[1][0] = sy * sp;
-        m.m[1][1] = cp;
-        m.m[1][2] = -cy * sp;
-
-        m.m[2][0] = -sy * cp;
-        m.m[2][1] = sp;
-        m.m[2][2] = cy * cp;
-
-        m.m[0][3] = -(m.m[0][0] * position.x + m.m[0][1] * position.y + m.m[0][2] * position.z);
-        m.m[1][3] = -(m.m[1][0] * position.x + m.m[1][1] * position.y + m.m[1][2] * position.z);
-        m.m[2][3] = -(m.m[2][0] * position.x + m.m[2][1] * position.y + m.m[2][2] * position.z);
-
+        for (int i = 0; i < 3; ++i)
+        {
+            m.m[i][0] = rows[i].x;
+            m.m[i][1] = rows[i].y;
+            m.m[i][2] = rows[i].z;
+            m.m[i][3] = -rows[i].dot(position);
+        }
         return m;
     }
 
@@ -76,37 +87,29 @@ export struct Camera {
     static auto projection(const double width, const double height,
                            const double proj_scale_x, const double proj_scale_y) -> Mat4
     {
-        if (width <= 0.0 || height <= 0.0 || far_plane <= near_plane)
+        if (width <= 0.0 || height <= 0.0)
         {
             return Mat4::identity();
         }
-        const double sx = 2.0 * proj_scale_x / width;
-        const double sy = 2.0 * proj_scale_y / height;
-        const double inv_range = 1.0 / (far_plane - near_plane);
-        const double a = far_plane * inv_range;
-        const double b = -near_plane * far_plane * inv_range;
 
         Mat4 m{};
-        m.m[0][0] = sx;
-        m.m[1][1] = -sy;
-        m.m[2][2] = a;
-        m.m[2][3] = b;
+        m.m[0][0] = 2.0 * proj_scale_x / width;
+        m.m[1][1] = -2.0 * proj_scale_y / height;
+        m.m[2][2] = proj_a;
+        m.m[2][3] = proj_b;
         m.m[3][2] = 1.0;
         return m;
     }
 
     [[nodiscard]]
     static auto screen_to_world(const double screen_x, const double screen_y, const double depth,
-                                const Mat4& inv_vp, const double width, const double height,
-                                const double proj_a, const double proj_b) -> Vec3
+                                const Mat4& inv_vp, const double width, const double height) -> Vec3
     {
         const double ndc_x = (screen_x / width - 0.5) * 2.0;
         const double ndc_y = (screen_y / height - 0.5) * 2.0;
+        const double ndc_z = proj_a + proj_b / depth;
 
-        const double view_z = depth;
-        const double ndc_z = proj_a + proj_b / view_z;
-
-        const double clip_w = view_z;
+        const double clip_w = depth;
         const double clip_x = ndc_x * clip_w;
         const double clip_y = ndc_y * clip_w;
         const double clip_z = ndc_z * clip_w;
@@ -114,7 +117,7 @@ export struct Camera {
         double wx = inv_vp.m[0][0] * clip_x + inv_vp.m[0][1] * clip_y + inv_vp.m[0][2] * clip_z + inv_vp.m[0][3] * clip_w;
         double wy = inv_vp.m[1][0] * clip_x + inv_vp.m[1][1] * clip_y + inv_vp.m[1][2] * clip_z + inv_vp.m[1][3] * clip_w;
         double wz = inv_vp.m[2][0] * clip_x + inv_vp.m[2][1] * clip_y + inv_vp.m[2][2] * clip_z + inv_vp.m[2][3] * clip_w;
-        double ww = inv_vp.m[3][0] * clip_x + inv_vp.m[3][1] * clip_y + inv_vp.m[3][2] * clip_z + inv_vp.m[3][3] * clip_w;
+        const double ww = inv_vp.m[3][0] * clip_x + inv_vp.m[3][1] * clip_y + inv_vp.m[3][2] * clip_z + inv_vp.m[3][3] * clip_w;
 
         if (std::abs(ww) > 1e-6)
         {
@@ -147,53 +150,7 @@ export struct Camera {
         }
 
         const double inv_w = 1.0 / clip_w;
-        const double ndc_x = clip_x * inv_w;
-        const double ndc_y = clip_y * inv_w;
-        const double screen_x_out = (ndc_x * 0.5 + 0.5) * static_cast<double>(width);
-        const double screen_y_out = (ndc_y * 0.5 + 0.5) * static_cast<double>(height);
-        return {screen_x_out, screen_y_out};
-    }
-
-private:
-    [[nodiscard]]
-    static constexpr auto clamp_pitch(const double pitch) -> double
-    {
-        return std::clamp(pitch, -1.4, 1.4);
-    }
-
-    [[nodiscard]]
-    static auto rotate_yaw_pitch(const Vec3& v, const double yaw, const double pitch) -> Vec3
-    {
-        const double cy = std::cos(yaw);
-        const double sy = std::sin(yaw);
-        const double cp = std::cos(pitch);
-        const double sp = std::sin(pitch);
-
-        const double x1 = v.x * cy + v.z * sy;
-        const double z1 = -v.x * sy + v.z * cy;
-        const double y1 = v.y;
-
-        const double y2 = y1 * cp - z1 * sp;
-        const double z2 = y1 * sp + z1 * cp;
-
-        return {x1, y2, z2};
-    }
-
-    [[nodiscard]]
-    static auto rotate_pitch_yaw(const Vec3& v, const double yaw, const double pitch) -> Vec3
-    {
-        const double cy = std::cos(yaw);
-        const double sy = std::sin(yaw);
-        const double cp = std::cos(pitch);
-        const double sp = std::sin(pitch);
-
-        const double x1 = v.x;
-        const double y1 = v.y * cp - v.z * sp;
-        const double z1 = v.y * sp + v.z * cp;
-
-        const double x2 = x1 * cy + z1 * sy;
-        const double z2 = -x1 * sy + z1 * cy;
-
-        return {x2, y1, z2};
+        return {(clip_x * inv_w * 0.5 + 0.5) * static_cast<double>(width),
+                (clip_y * inv_w * 0.5 + 0.5) * static_cast<double>(height)};
     }
 };

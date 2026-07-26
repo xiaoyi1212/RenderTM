@@ -147,11 +147,14 @@ float shadow_filter(const LightingEngine& lighting, const ShadowSettings& shadow
     }
     const float depth_max = std::numeric_limits<float>::max();
     constexpr size_t kDebugShadowFilterSize = 3 * 3;
+    std::array<float, kDebugShadowFilterSize> out_a{};
+    std::array<float, kDebugShadowFilterSize> out_b{};
     const std::span<const float> mask_span(mask, kDebugShadowFilterSize);
     const std::span<const float> depth_span(depth, kDebugShadowFilterSize);
     const std::span<const Vec3> normals_span(normals, kDebugShadowFilterSize);
-    return lighting.shadow_filter(mask_span, depth_span, normals_span, 3, 3, 1, 1, depth_max,
-                                     shadow_settings);
+    lighting.filter_shadows(mask_span, mask_span, out_a, out_b,
+                            depth_span, normals_span, 3, 3, depth_max, shadow_settings);
+    return out_a[4];
 }
 
 uint32_t pack_color(const ColorSrgb& color)
@@ -248,9 +251,9 @@ size_t clip_near(const Rasterizer& rasterizer,
         return 0;
     }
     const std::array<ClipVertex, 3> input{{
-        {v0, v0, {0.0, 0.0, 0.0}, 0.0f},
-        {v1, v1, {0.0, 0.0, 0.0}, 0.0f},
-        {v2, v2, {0.0, 0.0, 0.0}, 0.0f}
+        {v0, v0, 0.0f},
+        {v1, v1, 0.0f},
+        {v2, v2, 0.0f}
     }};
     std::array<ClipVertex, 4> clipped{};
     const size_t count = rasterizer.clip_to_near(Camera::near_plane, input, clipped);
@@ -261,7 +264,7 @@ size_t clip_near(const Rasterizer& rasterizer,
     }
     return out_count;
 }
-} // namespace
+}
 
 static void reset_camera(RenderEngine& engine)
 {
@@ -270,18 +273,18 @@ static void reset_camera(RenderEngine& engine)
     engine.world.sky.day_zenith = ColorSrgb::from_hex(0xFF6FB7FF).to_linear();
     engine.world.sky.day_horizon = ColorSrgb::from_hex(0xFFBFDFFF).to_linear();
     engine.world.sky.sky_light_scale = 0.0;
-    engine.settings.set_ambient_occlusion_enabled(true);
+    engine.settings.ambient_occlusion_enabled = true;
     engine.world.sun.orbit_enabled = false;
     engine.world.sun.orbit_angle = 0.0;
     engine.world.moon.direction = {0.0, 1.0, 0.0};
     engine.world.moon.intensity = 0.0;
-    engine.settings.set_shadow_enabled(true);
+    engine.settings.shadow_enabled = true;
     engine.world.sky.exposure = std::max(0.0, 1.0);
-    engine.settings.set_taa_enabled(true);
-    engine.settings.set_taa_blend(0.2);
-    engine.settings.set_taa_clamp_enabled(true);
-    engine.settings.set_gi_enabled(false);
-    engine.settings.set_gi_strength(0.0);
+    engine.settings.taa.enabled = true;
+    engine.settings.taa.blend = 0.2;
+    engine.settings.taa.clamp_enabled = true;
+    engine.settings.gi.enabled = false;
+    engine.settings.gi.strength = 0.0;
 }
 
 static bool mat4_near(const Mat4& a, const Mat4& b, const double eps)
@@ -573,11 +576,11 @@ constexpr int kCubeFaceNormal[6][3] = {
 };
 
 constexpr int kCubeFaceVertices[6][4] = {
-    {3, 2, 6, 7},
+    {3, 7, 6, 2},
     {0, 1, 5, 4},
-    {0, 3, 7, 4},
+    {0, 4, 7, 3},
     {1, 2, 6, 5},
-    {0, 1, 2, 3},
+    {0, 3, 2, 1},
     {4, 5, 6, 7}
 };
 
@@ -1002,7 +1005,7 @@ TEST_CASE("RenderEngine update clears framebuffer and draws geometry")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
     engine.world.sun.direction = {0.0, 0.0, -1.0};
     engine.world.sun.intensity = 1.0;
     const size_t width = 120;
@@ -1043,7 +1046,7 @@ TEST_CASE("RenderEngine update handles tiny even-sized buffers")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
     engine.world.sun.direction = {0.0, 0.0, 1.0};
     engine.world.sun.intensity = 1.0;
     const size_t width = 2;
@@ -1072,7 +1075,7 @@ TEST_CASE("pause stops sun orbit but keeps rendering active")
 
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
     for (int i = 0; i < 4; ++i)
     {
         engine.update(framebuffer.data(), width, height);
@@ -1080,13 +1083,13 @@ TEST_CASE("pause stops sun orbit but keeps rendering active")
     const double moved_angle = engine.world.sun.orbit_angle;
     REQUIRE(std::abs(moved_angle - 0.5) > 1e-4);
 
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     const double paused_angle = engine.world.sun.orbit_angle;
     for (int i = 0; i < 4; ++i)
     {
         engine.update(framebuffer.data(), width, height);
     }
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     REQUIRE(engine.world.sun.orbit_angle == Catch::Approx(paused_angle));
 }
@@ -1098,11 +1101,11 @@ TEST_CASE("temporal accumulation reduces frame-to-frame noise")
     engine.world.sun.orbit_enabled = false;
     engine.world.sun.intensity = 1.0;
     engine.world.moon.intensity = 0.0;
-    engine.settings.set_shadow_enabled(true);
+    engine.settings.shadow_enabled = true;
     engine.world.sky.sky_light_scale = 0.0;
-    engine.settings.set_ambient_occlusion_enabled(false);
+    engine.settings.ambient_occlusion_enabled = false;
     engine.world.sky.exposure = std::max(0.0, 1.0);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     const size_t width = 200;
     const size_t height = 160;
@@ -1158,7 +1161,7 @@ TEST_CASE("temporal accumulation reduces frame-to-frame noise")
         engine.camera.set_rotation(cfg.camera_rot);
         engine.world.sun.direction = cfg.light_dir;
 
-        engine.settings.set_taa_enabled(false);
+        engine.settings.taa.enabled = false;
         engine.update(frame0.data(), width, height);
         engine.update(frame1.data(), width, height);
 
@@ -1176,8 +1179,8 @@ TEST_CASE("temporal accumulation reduces frame-to-frame noise")
         return;
     }
 
-    engine.settings.set_taa_enabled(true);
-    engine.settings.set_taa_blend(0.2);
+    engine.settings.taa.enabled = true;
+    engine.settings.taa.blend = 0.2;
 
     std::vector<uint32_t> scratch(width * height, 0u);
     engine.update(scratch.data(), width, height);
@@ -1196,10 +1199,10 @@ TEST_CASE("RenderEngine update stabilizes jittered pixels when camera is static"
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
-    engine.settings.set_taa_enabled(true);
-    engine.settings.set_taa_blend(0.1);
-    engine.settings.set_taa_clamp_enabled(true);
+    engine.settings.paused = true;
+    engine.settings.taa.enabled = true;
+    engine.settings.taa.blend = 0.1;
+    engine.settings.taa.clamp_enabled = true;
 
     const size_t width = 160;
     const size_t height = 120;
@@ -1279,17 +1282,17 @@ TEST_CASE("RenderEngine update stabilizes jittered pixels when camera is static"
     REQUIRE(average_delta < 2.0);
     REQUIRE(max_delta < 64.0);
 
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 }
 
 TEST_CASE("taa sharpening stays disabled when camera is static")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
-    engine.settings.set_taa_enabled(true);
-    engine.settings.set_taa_blend(0.1);
-    engine.settings.set_taa_clamp_enabled(true);
+    engine.settings.paused = true;
+    engine.settings.taa.enabled = true;
+    engine.settings.taa.blend = 0.1;
+    engine.settings.taa.clamp_enabled = true;
 
     const size_t width = 120;
     const size_t height = 90;
@@ -1301,17 +1304,17 @@ TEST_CASE("taa sharpening stays disabled when camera is static")
     const double strength = engine.post.sharpen_strength;
     REQUIRE(strength == Catch::Approx(0.0).margin(1e-6));
 
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 }
 
 TEST_CASE("taa sharpening ramps with camera motion")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
-    engine.settings.set_taa_enabled(true);
-    engine.settings.set_taa_blend(0.1);
-    engine.settings.set_taa_clamp_enabled(true);
+    engine.settings.paused = true;
+    engine.settings.taa.enabled = true;
+    engine.settings.taa.blend = 0.1;
+    engine.settings.taa.clamp_enabled = true;
 
     const size_t width = 120;
     const size_t height = 90;
@@ -1345,18 +1348,18 @@ TEST_CASE("taa sharpening ramps with camera motion")
     const double saturated_pct = engine.post.sharpen_percent();
     REQUIRE(saturated_pct > 95.0);
 
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 }
 
 TEST_CASE("temporal history clamping prevents ghosting after sudden color changes")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.camera.set_rotation({0.0, 1.2});
-    engine.settings.set_taa_enabled(true);
-    engine.settings.set_taa_blend(0.1);
-    engine.settings.set_taa_clamp_enabled(true);
+    engine.settings.taa.enabled = true;
+    engine.settings.taa.blend = 0.1;
+    engine.settings.taa.clamp_enabled = true;
 
     const size_t width = 96;
     const size_t height = 72;
@@ -1382,7 +1385,7 @@ TEST_CASE("temporal history clamping prevents ghosting after sudden color change
 
     engine.world.sky.day_zenith = ColorSrgb::from_hex(original_top).to_linear();
     engine.world.sky.day_horizon = ColorSrgb::from_hex(original_bottom).to_linear();
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 }
 
 TEST_CASE("RenderEngine update fills front face")
@@ -1396,9 +1399,9 @@ TEST_CASE("RenderEngine update fills front face")
 
     engine.world.sun.direction = {0.0, 0.0, 1.0};
     engine.world.sun.intensity = 1.0;
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.update(framebuffer.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
     const int chunk_size = 16;
     const double block_size = 2.0;
     const double start_x = -(chunk_size - 1) * block_size * 0.5;
@@ -1427,13 +1430,13 @@ TEST_CASE("RenderEngine update shows multiple terrain materials")
 
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.world.sun.direction = {0.0, 1.0, 1.0};
     engine.world.sun.intensity = 0.0;
     engine.world.sky.sky_light_scale = 1.0;
 
     engine.update(framebuffer.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     const uint32_t sky_top = 0xFF78C2FF;
     const uint32_t sky_bottom = 0xFF172433;
@@ -1464,7 +1467,7 @@ TEST_CASE("RenderEngine update applies lighting as multiple shades")
 
     std::vector<uint32_t> framebuffer(width * height, 0u);
 
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.world.sun.direction = {0.5, 1.0, 0.7};
     engine.world.sun.intensity = 1.0;
     engine.world.sky.sky_light_scale = 1.0;
@@ -1488,7 +1491,7 @@ TEST_CASE("RenderEngine update applies lighting as multiple shades")
         }
     }
 
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     REQUIRE(colors.size() >= 2);
 }
@@ -1498,13 +1501,13 @@ TEST_CASE("light direction magnitude does not affect lighting")
     RenderEngine engine;
     reset_camera(engine);
     engine.world.sun.orbit_enabled = false;
-    engine.settings.set_shadow_enabled(false);
-    engine.settings.set_taa_enabled(false);
-    engine.settings.set_gi_enabled(false);
-    engine.settings.set_gi_strength(0.0);
+    engine.settings.shadow_enabled = false;
+    engine.settings.taa.enabled = false;
+    engine.settings.gi.enabled = false;
+    engine.settings.gi.strength = 0.0;
     engine.world.sky.sky_light_scale = 0.0;
-    engine.settings.set_ambient_occlusion_enabled(false);
-    engine.settings.set_paused(true);
+    engine.settings.ambient_occlusion_enabled = false;
+    engine.settings.paused = true;
     engine.world.sun.intensity = 1.0;
 
     const size_t width = 120;
@@ -1554,34 +1557,34 @@ TEST_CASE("render state setters and getters")
     engine.world.sky.exposure = std::max(0.0, 1.4);
     REQUIRE(engine.world.sky.exposure == Catch::Approx(1.4));
 
-    engine.settings.set_taa_enabled(true);
-    REQUIRE(engine.settings.get_taa_enabled());
-    engine.settings.set_taa_enabled(false);
-    REQUIRE_FALSE(engine.settings.get_taa_enabled());
+    engine.settings.taa.enabled = true;
+    REQUIRE(engine.settings.taa.enabled);
+    engine.settings.taa.enabled = false;
+    REQUIRE_FALSE(engine.settings.taa.enabled);
 
-    engine.settings.set_taa_blend(0.25);
-    REQUIRE(engine.settings.get_taa_blend() == Catch::Approx(0.25));
+    engine.settings.taa.blend = 0.25;
+    REQUIRE(engine.settings.taa.blend == Catch::Approx(0.25));
 
-    engine.settings.set_gi_enabled(true);
-    REQUIRE(engine.settings.get_gi_enabled());
-    engine.settings.set_gi_enabled(false);
-    REQUIRE_FALSE(engine.settings.get_gi_enabled());
+    engine.settings.gi.enabled = true;
+    REQUIRE(engine.settings.gi.enabled);
+    engine.settings.gi.enabled = false;
+    REQUIRE_FALSE(engine.settings.gi.enabled);
 
-    engine.settings.set_gi_strength(0.6);
-    REQUIRE(engine.settings.get_gi_strength() == Catch::Approx(0.6));
+    engine.settings.gi.strength = 0.6;
+    REQUIRE(engine.settings.gi.strength == Catch::Approx(0.6));
 
-    engine.settings.set_gi_bounce_count(2);
-    REQUIRE(engine.settings.get_gi_bounce_count() == 2);
-    engine.settings.set_gi_bounce_count(0);
-    REQUIRE(engine.settings.get_gi_bounce_count() == 0);
-    engine.settings.set_gi_bounce_count(1);
+    engine.settings.gi.bounce_count = 2;
+    REQUIRE(engine.settings.gi.bounce_count == 2);
+    engine.settings.gi.bounce_count = 0;
+    REQUIRE(engine.settings.gi.bounce_count == 0);
+    engine.settings.gi.bounce_count = 1;
 
-    engine.settings.set_paused(false);
-    REQUIRE_FALSE(engine.settings.is_paused());
-    engine.settings.toggle_pause();
-    REQUIRE(engine.settings.is_paused());
-    engine.settings.toggle_pause();
-    REQUIRE_FALSE(engine.settings.is_paused());
+    engine.settings.paused = false;
+    REQUIRE_FALSE(engine.settings.paused);
+    engine.settings.paused = !engine.settings.paused;
+    REQUIRE(engine.settings.paused);
+    engine.settings.paused = !engine.settings.paused;
+    REQUIRE_FALSE(engine.settings.paused);
 
     engine.world.sun.direction = {0.0, 0.0, -1.0};
     engine.world.sun.intensity = 1.0;
@@ -1589,9 +1592,9 @@ TEST_CASE("render state setters and getters")
     engine.world.sky.day_horizon = ColorSrgb::from_hex(0xFF172433).to_linear();
     engine.world.sky.sky_light_scale = 0.0;
     engine.world.sky.exposure = std::max(0.0, 1.0);
-    engine.settings.set_taa_enabled(true);
-    engine.settings.set_taa_blend(0.2);
-    engine.settings.set_paused(false);
+    engine.settings.taa.enabled = true;
+    engine.settings.taa.blend = 0.2;
+    engine.settings.paused = false;
 }
 
 TEST_CASE("terrain mesh culls internal faces")
@@ -1650,7 +1653,7 @@ TEST_CASE("RenderEngine update renders sky gradient")
     reset_camera(engine);
     engine.camera.position = {0.0, -25.0, -10.0};
     engine.camera.set_rotation({0.0, 0.8});
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.world.sun.direction = {0.0, 0.0, 1.0};
     engine.world.sun.intensity = 0.0;
 
@@ -1664,7 +1667,7 @@ TEST_CASE("RenderEngine update renders sky gradient")
     const size_t height = 80;
     std::vector<uint32_t> framebuffer(width * height, 0u);
     engine.update(framebuffer.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     const uint32_t top_color = sky_row_color(0, height, sky_top, sky_bottom,
                                                  engine.world.sky.exposure);
@@ -1716,8 +1719,8 @@ TEST_CASE("sky gradient follows sun altitude when orbit enabled")
     engine.world.sky.dawn_horizon = ColorSrgb::from_hex(sunrise_bottom).to_linear();
 
     engine.world.sun.orbit_enabled = true;
-    engine.settings.set_paused(true);
-    engine.settings.set_taa_enabled(false);
+    engine.settings.paused = true;
+    engine.settings.taa.enabled = false;
 
     const size_t width = 120;
     const size_t height = 80;
@@ -1730,7 +1733,7 @@ TEST_CASE("sky gradient follows sun altitude when orbit enabled")
     engine.world.sun.orbit_angle = 1.5707963267948966;
     engine.update(noon_frame.data(), width, height);
 
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
     engine.world.sun.orbit_enabled = false;
 
     const uint32_t sunrise_top_row = sky_row_color(0, height, sunrise_top, sunrise_bottom,
@@ -1921,7 +1924,7 @@ TEST_CASE("sky light intensity follows sun altitude")
     engine.camera.set_rotation({0.0, 0.7});
     engine.world.sun.intensity = 0.0;
     engine.world.moon.intensity = 0.0;
-    engine.settings.set_shadow_enabled(false);
+    engine.settings.shadow_enabled = false;
 
     const uint32_t sunrise_top = 0xFFB55A1A;
     const uint32_t sunrise_bottom = 0xFF4A200A;
@@ -1934,7 +1937,7 @@ TEST_CASE("sky light intensity follows sun altitude")
     engine.world.sky.sky_light_scale = 1.0;
 
     engine.world.sun.orbit_enabled = true;
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
 
     const size_t width = 160;
     const size_t height = 120;
@@ -1947,7 +1950,7 @@ TEST_CASE("sky light intensity follows sun altitude")
     engine.world.sun.orbit_angle = 1.5707963267948966;
     engine.update(noon_frame.data(), width, height);
 
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
     engine.world.sun.orbit_enabled = false;
 
     double sum_sunrise = 0.0;
@@ -1978,13 +1981,13 @@ TEST_CASE("low sun altitude keeps ambient above black")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.world.sun.orbit_enabled = true;
     engine.world.sun.orbit_angle = 0.08;
     engine.world.sun.intensity = 0.0;
     engine.world.moon.intensity = 0.0;
-    engine.settings.set_shadow_enabled(false);
-    engine.settings.set_ambient_occlusion_enabled(false);
+    engine.settings.shadow_enabled = false;
+    engine.settings.ambient_occlusion_enabled = false;
 
     const uint32_t sky_color = 0xFFFFFFFF;
     engine.world.sky.day_zenith = ColorSrgb::from_hex(sky_color).to_linear();
@@ -2013,7 +2016,7 @@ TEST_CASE("low sun altitude keeps ambient above black")
     const size_t height = 160;
     std::vector<uint32_t> framebuffer(width * height, 0u);
     engine.update(framebuffer.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
     engine.world.sun.orbit_enabled = false;
 
     const Vec2 projected = project_point(engine.camera, {center_x, center_y + 1.0, center_z}, width, height);
@@ -2030,11 +2033,11 @@ TEST_CASE("sun light is warmer than moon light")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
-    engine.settings.set_taa_enabled(false);
+    engine.settings.paused = true;
+    engine.settings.taa.enabled = false;
     engine.world.sun.orbit_enabled = false;
-    engine.settings.set_shadow_enabled(false);
-    engine.settings.set_ambient_occlusion_enabled(false);
+    engine.settings.shadow_enabled = false;
+    engine.settings.ambient_occlusion_enabled = false;
     engine.world.sky.sky_light_scale = 0.0;
 
     const uint32_t sky_color = 0xFF010203;
@@ -2075,7 +2078,7 @@ TEST_CASE("sun light is warmer than moon light")
     engine.world.sun.intensity = 0.0;
     engine.world.moon.intensity = 1.0;
     engine.update(moon_frame.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     const Vec2 projected = project_point(engine.camera, sample_point, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
@@ -2103,7 +2106,7 @@ TEST_CASE("moonlight adds ambient when sun is below horizon")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.world.sun.orbit_enabled = true;
     engine.world.sun.night_length_ratio = 0.25;
     const double night_ratio = std::max(0.0, engine.world.sun.night_length_ratio);
@@ -2112,8 +2115,8 @@ TEST_CASE("moonlight adds ambient when sun is below horizon")
     const double night_fraction = night_ratio / total;
     engine.world.sun.orbit_angle = Celestial::kTau * (day_fraction + night_fraction * 0.5);
     engine.world.sun.intensity = 0.0;
-    engine.settings.set_shadow_enabled(false);
-    engine.settings.set_ambient_occlusion_enabled(false);
+    engine.settings.shadow_enabled = false;
+    engine.settings.ambient_occlusion_enabled = false;
     engine.world.sky.sky_light_scale = 1.0;
     engine.world.sky.day_zenith = ColorSrgb::from_hex(0xFFFFFFFF).to_linear();
     engine.world.sky.day_horizon = ColorSrgb::from_hex(0xFFFFFFFF).to_linear();
@@ -2145,7 +2148,7 @@ TEST_CASE("moonlight adds ambient when sun is below horizon")
     engine.update(moon_on.data(), width, height);
     engine.world.moon.intensity = 0.0;
     engine.update(moon_off.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
     engine.world.sun.orbit_enabled = false;
 
     const Vec2 projected = project_point(engine.camera, {center_x, center_y + 1.0, center_z}, width, height);
@@ -2165,7 +2168,7 @@ TEST_CASE("sky light increases ambient brightness")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.world.sun.direction = {0.0, 0.0, 1.0};
     engine.world.sun.intensity = 0.0;
 
@@ -2184,7 +2187,7 @@ TEST_CASE("sky light increases ambient brightness")
 
     engine.world.sky.sky_light_scale = 1.0;
     engine.update(with_sky_light.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     double sum_no = 0.0;
     double sum_with = 0.0;
@@ -2214,10 +2217,10 @@ TEST_CASE("ambient light applies without direct lighting")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
-    engine.settings.set_taa_enabled(false);
-    engine.settings.set_shadow_enabled(false);
-    engine.settings.set_ambient_occlusion_enabled(false);
+    engine.settings.paused = true;
+    engine.settings.taa.enabled = false;
+    engine.settings.shadow_enabled = false;
+    engine.settings.ambient_occlusion_enabled = false;
     engine.world.sun.orbit_enabled = false;
     engine.world.sun.intensity = 0.0;
     engine.world.moon.intensity = 0.0;
@@ -2250,11 +2253,11 @@ TEST_CASE("ambient light applies without direct lighting")
     std::vector<uint32_t> ambient_off(width * height, 0u);
     std::vector<uint32_t> ambient_on(width * height, 0u);
 
-    engine.settings.set_ambient_light(0.0);
+    engine.settings.ambient_light = 0.0;
     engine.update(ambient_off.data(), width, height);
-    engine.settings.set_ambient_light(0.35);
+    engine.settings.ambient_light = 0.35;
     engine.update(ambient_on.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     const Vec2 projected = project_point(engine.camera, {center_x, center_y + 1.0, center_z}, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
@@ -2286,18 +2289,16 @@ TEST_CASE("stars add variation to night sky")
     std::vector<uint32_t> with_stars(width * height, 0u);
     GiSettings gi{};
 
-    post.resolve_frame(no_stars.data(), buffers,
-                       sky, sky, skybox,
-                       false, false, 0.0f,
-                       false, gi, 0,
-                       0.0f, 0.0f,
-                       1.0f, 0.0f);
-    post.resolve_frame(with_stars.data(), buffers,
-                       sky, sky, skybox,
-                       false, false, 0.0f,
-                       false, gi, 0,
-                       0.0f, 0.0f,
-                       1.0f, 1.0f);
+    post.resolve_frame(no_stars.data(), buffers, PostFrame{
+        .sky_top = sky,
+        .sky_bottom = sky,
+        .star_visibility = 0.0f
+    }, skybox, gi);
+    post.resolve_frame(with_stars.data(), buffers, PostFrame{
+        .sky_top = sky,
+        .sky_bottom = sky,
+        .star_visibility = 1.0f
+    }, skybox, gi);
 
     size_t diff = 0;
     for (size_t i = 0; i < no_stars.size(); ++i)
@@ -2315,12 +2316,12 @@ TEST_CASE("gamma correction applies to midtone ambient")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.world.sun.orbit_enabled = false;
     engine.world.sun.intensity = 0.0;
     engine.world.moon.intensity = 0.0;
-    engine.settings.set_shadow_enabled(false);
-    engine.settings.set_ambient_occlusion_enabled(false);
+    engine.settings.shadow_enabled = false;
+    engine.settings.ambient_occlusion_enabled = false;
 
     const uint32_t sky_color = 0xFFFFFFFF;
     engine.world.sky.day_zenith = ColorSrgb::from_hex(sky_color).to_linear();
@@ -2363,7 +2364,7 @@ TEST_CASE("gamma correction applies to midtone ambient")
     const size_t height = 160;
     std::vector<uint32_t> framebuffer(width * height, 0u);
     engine.update(framebuffer.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     const Vec2 projected = project_point(engine.camera, {center_x, center_y + 1.0, center_z}, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
@@ -2401,12 +2402,12 @@ TEST_CASE("hemisphere lighting adds sun bounce to shadowed faces")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.world.sun.orbit_enabled = false;
     engine.world.sun.direction = {0.0, 1.0, 0.0};
     engine.world.moon.intensity = 0.0;
-    engine.settings.set_shadow_enabled(false);
-    engine.settings.set_ambient_occlusion_enabled(false);
+    engine.settings.shadow_enabled = false;
+    engine.settings.ambient_occlusion_enabled = false;
     engine.camera.position = {0.0, 10.0, -12.0};
     engine.camera.set_rotation({0.0, 0.6});
 
@@ -2473,7 +2474,7 @@ TEST_CASE("hemisphere lighting adds sun bounce to shadowed faces")
     engine.update(sun_on.data(), width, height);
     engine.world.sun.intensity = 0.0;
     engine.update(sun_off.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     const Vec2 projected = project_point(engine.camera, probe, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
@@ -2577,18 +2578,18 @@ TEST_CASE("one-bounce GI does not darken shadowed terrain")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.world.sun.orbit_enabled = false;
     engine.world.sun.intensity = 0.0;
     engine.world.moon.intensity = 1.0;
     const Vec3 light_dir = normalize_vec({0.6, 0.3, 0.8});
     engine.world.sun.direction = {-light_dir.x, -light_dir.y, -light_dir.z};
-    engine.settings.set_shadow_enabled(true);
+    engine.settings.shadow_enabled = true;
     engine.world.sky.sky_light_scale = 0.0;
-    engine.settings.set_ambient_occlusion_enabled(false);
-    engine.settings.set_taa_enabled(false);
-    engine.settings.set_gi_enabled(false);
-    engine.settings.set_gi_strength(0.0);
+    engine.settings.ambient_occlusion_enabled = false;
+    engine.settings.taa.enabled = false;
+    engine.settings.gi.enabled = false;
+    engine.settings.gi.strength = 0.0;
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -2631,15 +2632,15 @@ TEST_CASE("one-bounce GI does not darken shadowed terrain")
     double avg_off = 0.0;
     measure_avg(8, avg_off);
 
-    engine.settings.set_gi_enabled(true);
-    engine.settings.set_gi_strength(1.5);
+    engine.settings.gi.enabled = true;
+    engine.settings.gi.strength = 1.5;
 
     double avg_on = 0.0;
     measure_avg(8, avg_on);
 
-    engine.settings.set_gi_enabled(false);
-    engine.settings.set_gi_strength(0.0);
-    engine.settings.set_paused(false);
+    engine.settings.gi.enabled = false;
+    engine.settings.gi.strength = 0.0;
+    engine.settings.paused = false;
 
     REQUIRE(avg_on >= avg_off - 0.5);
 }
@@ -2648,18 +2649,18 @@ TEST_CASE("GI bounce count does not reduce indirect contribution")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.world.sun.orbit_enabled = false;
     engine.world.sun.intensity = 0.0;
     engine.world.moon.intensity = 1.0;
     const Vec3 light_dir = normalize_vec({0.6, 0.3, 0.8});
     engine.world.sun.direction = {-light_dir.x, -light_dir.y, -light_dir.z};
-    engine.settings.set_shadow_enabled(true);
+    engine.settings.shadow_enabled = true;
     engine.world.sky.sky_light_scale = 0.0;
-    engine.settings.set_ambient_occlusion_enabled(false);
-    engine.settings.set_taa_enabled(false);
-    engine.settings.set_gi_enabled(true);
-    engine.settings.set_gi_strength(2.0);
+    engine.settings.ambient_occlusion_enabled = false;
+    engine.settings.taa.enabled = false;
+    engine.settings.gi.enabled = true;
+    engine.settings.gi.strength = 2.0;
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -2687,7 +2688,7 @@ TEST_CASE("GI bounce count does not reduce indirect contribution")
     const uint32_t sky_bottom = pack_color(engine.world.sky.day_horizon.to_srgb());
 
     auto measure_luminance = [&](int bounces, double& out_avg) {
-        engine.settings.set_gi_bounce_count(bounces);
+        engine.settings.gi.bounce_count = bounces;
         engine.renderFrameIndex = 121;
         engine.update(framebuffer.data(), width, height);
         double avg = 0.0;
@@ -2701,10 +2702,10 @@ TEST_CASE("GI bounce count does not reduce indirect contribution")
     measure_luminance(1, avg_one);
     measure_luminance(2, avg_two);
 
-    engine.settings.set_gi_enabled(false);
-    engine.settings.set_gi_strength(0.0);
-    engine.settings.set_gi_bounce_count(1);
-    engine.settings.set_paused(false);
+    engine.settings.gi.enabled = false;
+    engine.settings.gi.strength = 0.0;
+    engine.settings.gi.bounce_count = 1;
+    engine.settings.paused = false;
 
     REQUIRE(avg_two >= avg_one - 0.1);
 }
@@ -2778,10 +2779,13 @@ TEST_CASE("stochastic DDA varies across frames near shadow boundaries")
 
         const BlueNoise::Shift shift_u = BlueNoise::shift(frame, settings.shadow.sun_salt);
         const BlueNoise::Shift shift_v = BlueNoise::shift(frame, settings.shadow.sun_salt + 1);
-        const Vec3 shadow_dir = lighting.jitter_shadow(dir,
-                                                       right_scaled, up_scaled,
-                                                       pixel_x, pixel_y,
-                                                       shift_u, shift_v);
+        const ShadowJitter jitter{
+            .right = right_scaled,
+            .up = up_scaled,
+            .shift_u = shift_u,
+            .shift_v = shift_v
+        };
+        const Vec3 shadow_dir = jitter.direction(dir, pixel_x, pixel_y);
 
         *out_factor = lighting.shadow_factor(terrain, shadow_dir, world_pos, normal_dir.normalize(),
                                              settings.shadow);
@@ -2852,13 +2856,13 @@ TEST_CASE("moon light contributes when sun is disabled")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.world.sun.orbit_enabled = false;
     engine.world.sun.direction = {0.4, -1.0, -0.3};
     engine.world.sun.intensity = 0.0;
     engine.world.moon.intensity = 0.8;
     engine.world.sky.sky_light_scale = 0.0;
-    engine.settings.set_shadow_enabled(false);
+    engine.settings.shadow_enabled = false;
 
     int cell_x = 0;
     int cell_z = 0;
@@ -2887,7 +2891,7 @@ TEST_CASE("moon light contributes when sun is disabled")
 
     engine.world.moon.intensity = 0.0;
     engine.update(moon_off.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     const Vec2 projected = project_point(engine.camera, {center_x, center_y + 1.0, center_z}, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
@@ -2908,11 +2912,11 @@ TEST_CASE("moon light is suppressed when sun is high")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
-    engine.settings.set_taa_enabled(false);
-    engine.settings.set_shadow_enabled(false);
-    engine.settings.set_ambient_occlusion_enabled(false);
-    engine.settings.set_ambient_light(0.0);
+    engine.settings.paused = true;
+    engine.settings.taa.enabled = false;
+    engine.settings.shadow_enabled = false;
+    engine.settings.ambient_occlusion_enabled = false;
+    engine.settings.ambient_light = 0.0;
     engine.world.sun.orbit_enabled = false;
     engine.world.sun.direction = {0.0, 1.0, 0.0};
     engine.world.sun.intensity = 0.0;
@@ -2927,7 +2931,7 @@ TEST_CASE("moon light is suppressed when sun is high")
     engine.update(moon_on.data(), width, height);
     engine.world.moon.intensity = 0.0;
     engine.update(moon_off.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     double sum_on = 0.0;
     double sum_off = 0.0;
@@ -2959,8 +2963,8 @@ TEST_CASE("phong shading varies within a terrain top face")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
-    engine.settings.set_taa_enabled(false);
+    engine.settings.paused = true;
+    engine.settings.taa.enabled = false;
     engine.world.sun.intensity = 0.0;
     engine.world.sky.sky_light_scale = 1.0;
 
@@ -3003,7 +3007,7 @@ TEST_CASE("phong shading varies within a terrain top face")
     const size_t height = 160;
     std::vector<uint32_t> framebuffer(width * height, 0u);
     engine.update(framebuffer.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     const Vec2 projected = project_point(engine.camera, {center_x, center_y + 1.0, center_z}, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
@@ -3061,10 +3065,10 @@ TEST_CASE("sky lighting is consistent across a terrain side face")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
     engine.world.sun.intensity = 0.0;
-    engine.settings.set_shadow_enabled(false);
-    engine.settings.set_ambient_occlusion_enabled(false);
+    engine.settings.shadow_enabled = false;
+    engine.settings.ambient_occlusion_enabled = false;
     engine.world.sky.sky_light_scale = 1.0;
 
     const uint32_t sky_top = 0xFFFFFFFF;
@@ -3100,7 +3104,7 @@ TEST_CASE("sky lighting is consistent across a terrain side face")
     const size_t height = 160;
     std::vector<uint32_t> framebuffer(width * height, 0u);
     engine.update(framebuffer.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     const double inset = half * 0.7;
     const Vec2 top_proj = project_point(engine.camera, {face_x, center_y + inset, center_z}, width, height);
@@ -3150,8 +3154,8 @@ TEST_CASE("sky visibility darkens terrain when enabled")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
-    engine.settings.set_taa_enabled(false);
+    engine.settings.paused = true;
+    engine.settings.taa.enabled = false;
     engine.world.sun.intensity = 0.0;
     engine.world.sky.sky_light_scale = 1.0;
     engine.world.sky.day_zenith = ColorSrgb::from_hex(0xFFBBD7FF).to_linear();
@@ -3185,11 +3189,11 @@ TEST_CASE("sky visibility darkens terrain when enabled")
     engine.camera.position = eye;
     engine.camera.set_rotation({yaw, pitch});
 
-    engine.settings.set_ambient_occlusion_enabled(false);
+    engine.settings.ambient_occlusion_enabled = false;
     engine.update(no_ao.data(), width, height);
-    engine.settings.set_ambient_occlusion_enabled(true);
+    engine.settings.ambient_occlusion_enabled = true;
     engine.update(with_ao.data(), width, height);
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 
     const Vec2 projected = project_point(engine.camera, sample_point, width, height);
     const int px = std::clamp(static_cast<int>(std::lround(projected.x)), 0, static_cast<int>(width) - 1);
@@ -3312,8 +3316,8 @@ TEST_CASE("flat terrain top faces match sky visibility raycast")
 
     auto top_face_corner_from_offsets = [](int sx, int sz) {
         if (sx > 0 && sz > 0) return 2;
-        if (sx > 0 && sz < 0) return 1;
-        if (sx < 0 && sz > 0) return 3;
+        if (sx > 0 && sz < 0) return 3;
+        if (sx < 0 && sz > 0) return 1;
         return 0;
     };
 
@@ -3513,7 +3517,7 @@ TEST_CASE("reprojection matrices stay stable without camera motion")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_taa_enabled(true);
+    engine.settings.taa.enabled = true;
     const size_t width = 96;
     const size_t height = 72;
     std::vector<uint32_t> framebuffer(width * height);
@@ -3570,7 +3574,7 @@ TEST_CASE("reprojection matrices change when camera moves")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_taa_enabled(true);
+    engine.settings.taa.enabled = true;
     const size_t width = 96;
     const size_t height = 72;
     std::vector<uint32_t> framebuffer(width * height);
@@ -3591,7 +3595,7 @@ TEST_CASE("camera movement ignores terrain collisions")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
+    engine.settings.paused = true;
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
@@ -3625,7 +3629,7 @@ TEST_CASE("camera movement ignores terrain collisions")
     engine.camera.position = engine.camera.position + Vec3{-0.3, 0.0, 0.0};
     pos = engine.camera.position;
     REQUIRE(pos.x == Catch::Approx(start.x - 0.3));
-    engine.settings.set_paused(false);
+    engine.settings.paused = false;
 }
 
 TEST_CASE("camera forward movement follows pitch")
@@ -3713,8 +3717,8 @@ TEST_CASE("reprojection alignment maps scene points back to previous screen coor
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_taa_enabled(true);
-    engine.settings.set_taa_clamp_enabled(false);
+    engine.settings.taa.enabled = true;
+    engine.settings.taa.clamp_enabled = false;
     engine.camera.position = {0.0, 0.0, -4.0};
     engine.camera.set_rotation({0.0, 0.0});
 
@@ -3752,17 +3756,17 @@ TEST_CASE("reprojection alignment maps scene points back to previous screen coor
     REQUIRE(prev.x == Catch::Approx(p1.x).margin(1e-4));
     REQUIRE(prev.y == Catch::Approx(p1.y).margin(1e-4));
 
-    engine.settings.set_taa_clamp_enabled(true);
+    engine.settings.taa.clamp_enabled = true;
 }
 
 TEST_CASE("temporal accumulation rejects history for pixels reprojected outside the frame")
 {
     RenderEngine engine;
     reset_camera(engine);
-    engine.settings.set_paused(true);
-    engine.settings.set_taa_enabled(true);
-    engine.settings.set_taa_blend(0.1);
-    engine.settings.set_taa_clamp_enabled(false);
+    engine.settings.paused = true;
+    engine.settings.taa.enabled = true;
+    engine.settings.taa.blend = 0.1;
+    engine.settings.taa.clamp_enabled = false;
 
     const size_t width = 160;
     const size_t height = 120;
@@ -3923,8 +3927,8 @@ TEST_CASE("temporal accumulation rejects history for pixels reprojected outside 
     INFO("Output delta: " << output_delta);
     REQUIRE(output_delta <= 2);
 
-    engine.settings.set_paused(false);
-    engine.settings.set_taa_clamp_enabled(true);
+    engine.settings.paused = false;
+    engine.settings.taa.clamp_enabled = true;
 }
 
 TEST_CASE("history bilinear sampling blends across top row midpoint")

@@ -14,8 +14,7 @@ export struct TerminalSize
 
 export struct RenderInput
 {
-    Vec3 move_world{0.0, 0.0, 0.0};
-    Vec3 move_local{0.0, 0.0, 0.0};
+    Vec3 move{0.0, 0.0, 0.0};
     Vec2 rotate{0.0, 0.0};
     bool toggle_pause = false;
     bool toggle_gi = false;
@@ -24,22 +23,16 @@ export struct RenderInput
 
 export struct RenderInputMailbox
 {
-    auto push_move_world(const Vec3& delta) -> void
+    auto push_move(const Vec3& intent) -> void
     {
         std::scoped_lock lock(mutex);
-        pending.move_world = pending.move_world + delta;
-    }
-
-    auto push_move_local(const Vec3& delta) -> void
-    {
-        std::scoped_lock lock(mutex);
-        pending.move_local = pending.move_local + delta;
+        pending.move = pending.move + intent;
     }
 
     auto push_rotate(const Vec2& delta) -> void
     {
         std::scoped_lock lock(mutex);
-        pending.rotate = {pending.rotate.x + delta.x, pending.rotate.y + delta.y};
+        pending.rotate = pending.rotate + delta;
     }
 
     auto push_toggle_pause() -> void
@@ -63,9 +56,7 @@ export struct RenderInputMailbox
     auto drain() -> RenderInput
     {
         std::scoped_lock lock(mutex);
-        RenderInput out = pending;
-        pending = {};
-        return out;
+        return std::exchange(pending, {});
     }
 
 private:
@@ -77,17 +68,17 @@ export struct TerminalRender
 {
     static void init();
     static void shutdown();
-    static void update_size(int sig);
+    static void update_size();
     static void submit_frame(RenderEngine& engine, RenderInputMailbox& mailbox);
     static void output_loop(std::stop_token token);
-    static auto size() -> TerminalSize; 
+    static auto size() -> TerminalSize;
 };
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr std::string_view kRenderChar = "\u2580";
+constexpr std::string_view kRenderChar = "▀";
 constexpr std::string_view kEnterAlt = "\033[?1049h\033[?25l\033[?1003h\033[?1006h";
 constexpr std::string_view kLeaveAlt = "\033[?1003l\033[?1006l\033[?25h\033[?1049l";
 
@@ -142,22 +133,40 @@ struct StdoutMode {
     }
 };
 
+auto write_all_blocking(const std::string_view text) -> void {
+    size_t offset = 0;
+    while (offset < text.size()) {
+        const ssize_t n = ::write(STDOUT_FILENO, text.data() + offset, text.size() - offset);
+        if (n > 0) {
+            offset += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            return;
+        }
+        pollfd pfd{STDOUT_FILENO, POLLOUT, 0};
+        ::poll(&pfd, 1, 100);
+    }
+}
+
 struct OutputWriter {
     std::string pending;
     size_t offset = 0;
 
     bool has_pending() const { return !pending.empty(); }
 
-    void set(std::string text) {
+    std::string exchange(std::string text) {
+        std::string recycled = std::move(pending);
         pending = std::move(text);
         offset = 0;
+        recycled.clear();
+        return recycled;
     }
 
     bool flush() {
         if (pending.empty()) return true;
         const size_t remaining = pending.size() - offset;
         if (remaining == 0) {
-            pending.clear();
             offset = 0;
             return true;
         }
@@ -165,12 +174,7 @@ struct OutputWriter {
         const ssize_t n = ::write(STDOUT_FILENO, pending.data() + offset, remaining);
         if (n > 0) {
             offset += static_cast<size_t>(n);
-            if (offset >= pending.size()) {
-                pending.clear();
-                offset = 0;
-                return true;
-            }
-            return false;
+            return offset >= pending.size();
         }
         return false;
     }
@@ -235,17 +239,17 @@ FrameQueue frame_queue;
 FpsCounter render_fps_counter;
 FpsCounter output_fps_counter;
 
-std::string render_format_frame(const RenderFrame& frame, const RenderFrame* prev) {
+void render_format_frame(std::string& frame_buffer,
+                         const RenderFrame& frame, const RenderFrame* prev) {
     const size_t width = frame.width;
     const size_t height = frame.height;
     const size_t display_rows = height / 2;
     const size_t term_height = display_rows + 1;
 
-    std::string frame_buffer;
     frame_buffer.reserve(width * display_rows * 20);
 
     frame_buffer += "\033[0m\033[H\033[7m";
-    const double rad_to_deg = 180.0 / 3.14159265358979323846;
+    const double rad_to_deg = 180.0 / std::numbers::pi_v<double>;
     const double yaw_deg = frame.cam_rot.x * rad_to_deg;
     const double pitch_deg = frame.cam_rot.y * rad_to_deg;
     const double out_fps = output_fps.load(std::memory_order_relaxed);
@@ -301,43 +305,40 @@ std::string render_format_frame(const RenderFrame& frame, const RenderFrame* pre
         frame_buffer += "H";
     };
 
+    auto append_run = [&](size_t y, size_t run_start, size_t run_end) {
+        append_cursor(y / 2 + 2, run_start + 1);
+        last_fg = 0xFFFFFFFF;
+        last_bg = 0xFFFFFFFF;
+        for (size_t x = run_start; x < run_end; ++x) {
+            const size_t idx = y * width + x;
+            const uint32_t top = frame.pixels[idx];
+            const uint32_t bot = frame.pixels[idx + width];
+            if (last_fg != top || last_bg != bot) {
+                append_ansi_rgb(true, top);
+                append_ansi_rgb(false, bot);
+                last_fg = top;
+                last_bg = bot;
+            }
+            frame_buffer += kRenderChar;
+        }
+    };
+
     if (!have_prev) {
         for (size_t y = 0; y < height; y += 2) {
-            append_cursor(y / 2 + 2, 1);
-            last_fg = 0xFFFFFFFF;
-            last_bg = 0xFFFFFFFF;
-
-            for (size_t x = 0; x < width; ++x) {
-                const uint32_t top = frame.pixels[y * width + x];
-                const uint32_t bot = frame.pixels[(y + 1) * width + x];
-
-                if (top != last_fg) {
-                    append_ansi_rgb(true, top);
-                    last_fg = top;
-                }
-                if (bot != last_bg) {
-                    append_ansi_rgb(false, bot);
-                    last_bg = bot;
-                }
-                frame_buffer += kRenderChar;
-            }
-            frame_buffer += "\033[0m";
+            append_run(y, 0, width);
         }
-        return frame_buffer;
+        frame_buffer += "\033[0m";
+        return;
     }
 
     for (size_t y = 0; y < height; y += 2) {
-        const size_t row = y / 2 + 2;
         size_t run_start = 0;
         bool in_run = false;
 
         for (size_t x = 0; x < width; ++x) {
             const size_t idx = y * width + x;
-            const uint32_t top = frame.pixels[idx];
-            const uint32_t bot = frame.pixels[idx + width];
-            const uint32_t prev_top = prev->pixels[idx];
-            const uint32_t prev_bot = prev->pixels[idx + width];
-            const bool changed = top != prev_top || bot != prev_bot;
+            const bool changed = frame.pixels[idx] != prev->pixels[idx] ||
+                                 frame.pixels[idx + width] != prev->pixels[idx + width];
 
             if (changed) {
                 if (!in_run) {
@@ -345,54 +346,25 @@ std::string render_format_frame(const RenderFrame& frame, const RenderFrame* pre
                     run_start = x;
                 }
             } else if (in_run) {
-                append_cursor(row, run_start + 1);
-                last_fg = 0xFFFFFFFF;
-                last_bg = 0xFFFFFFFF;
-                for (size_t rx = run_start; rx < x; ++rx) {
-                    const size_t ridx = y * width + rx;
-                    const uint32_t rtop = frame.pixels[ridx];
-                    const uint32_t rbot = frame.pixels[ridx + width];
-                    if (last_fg != rtop || last_bg != rbot) {
-                        append_ansi_rgb(true, rtop);
-                        append_ansi_rgb(false, rbot);
-                        last_fg = rtop;
-                        last_bg = rbot;
-                    }
-                    frame_buffer += kRenderChar;
-                }
+                append_run(y, run_start, x);
                 in_run = false;
             }
         }
 
         if (in_run) {
-            append_cursor(row, run_start + 1);
-            last_fg = 0xFFFFFFFF;
-            last_bg = 0xFFFFFFFF;
-            for (size_t rx = run_start; rx < width; ++rx) {
-                const size_t ridx = y * width + rx;
-                const uint32_t rtop = frame.pixels[ridx];
-                const uint32_t rbot = frame.pixels[ridx + width];
-                if (last_fg != rtop || last_bg != rbot) {
-                    append_ansi_rgb(true, rtop);
-                    append_ansi_rgb(false, rbot);
-                    last_fg = rtop;
-                    last_bg = rbot;
-                }
-                frame_buffer += kRenderChar;
-            }
+            append_run(y, run_start, width);
         }
     }
     frame_buffer += "\033[0m";
-    return frame_buffer;
 }
 
-} // namespace
+}
 
 void TerminalRender::init() {
     setvbuf(stdout, stdout_buffer.data(), _IOFBF, stdout_buffer.size());
-    update_size(0);
+    update_size();
+    write_all_blocking(kEnterAlt);
     stdout_mode.enable_nonblock();
-    (void)::write(STDOUT_FILENO, kEnterAlt.data(), kEnterAlt.size());
 }
 
 void TerminalRender::submit_frame(RenderEngine& engine, RenderInputMailbox& mailbox) {
@@ -409,33 +381,27 @@ void TerminalRender::submit_frame(RenderEngine& engine, RenderInputMailbox& mail
     const RenderInput input = mailbox.drain();
     if (input.toggle_pause)
     {
-        engine.settings.toggle_pause();
+        engine.settings.paused = !engine.settings.paused;
     }
     if (input.toggle_gi)
     {
-        const bool enabled = engine.settings.get_gi_enabled();
-        engine.settings.set_gi_enabled(!enabled);
-        if (!enabled && engine.settings.get_gi_strength() <= 0.0)
+        engine.settings.gi.enabled = !engine.settings.gi.enabled;
+        if (engine.settings.gi.enabled && engine.settings.gi.strength <= 0.0)
         {
-            engine.settings.set_gi_strength(1.0);
+            engine.settings.gi.strength = 1.0;
         }
     }
     if (input.toggle_ao)
     {
-        const bool enabled = engine.settings.get_ambient_occlusion_enabled();
-        engine.settings.set_ambient_occlusion_enabled(!enabled);
-    }
-    if (input.move_world.x != 0.0 || input.move_world.y != 0.0 || input.move_world.z != 0.0)
-    {
-        engine.camera.position = engine.camera.position + input.move_world;
-    }
-    if (input.move_local.x != 0.0 || input.move_local.y != 0.0 || input.move_local.z != 0.0)
-    {
-        engine.camera.move_local(input.move_local);
+        engine.settings.ambient_occlusion_enabled = !engine.settings.ambient_occlusion_enabled;
     }
     if (input.rotate.x != 0.0 || input.rotate.y != 0.0)
     {
         engine.camera.rotate(input.rotate);
+    }
+    if (input.move.x != 0.0 || input.move.y != 0.0 || input.move.z != 0.0)
+    {
+        engine.camera.move(input.move);
     }
 
     std::vector<uint32_t> framebuffer = frame_queue.take_recycled();
@@ -455,8 +421,8 @@ void TerminalRender::submit_frame(RenderEngine& engine, RenderInputMailbox& mail
 }
 
 void TerminalRender::shutdown() {
-    (void)::write(STDOUT_FILENO, kLeaveAlt.data(), kLeaveAlt.size());
     stdout_mode.restore();
+    write_all_blocking(kLeaveAlt);
 }
 
 auto TerminalRender::size() -> TerminalSize {
@@ -466,7 +432,7 @@ auto TerminalRender::size() -> TerminalSize {
     };
 }
 
-void TerminalRender::update_size(int sig) {
+void TerminalRender::update_size() {
     winsize w{};
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) != 0 || w.ws_col == 0 || w.ws_row == 0) {
         if (raw_width.load(std::memory_order_relaxed) == 0 || raw_height.load(std::memory_order_relaxed) == 0) {
@@ -483,11 +449,13 @@ void TerminalRender::output_loop(std::stop_token token) {
     std::stop_callback stop_cb(token, [] { frame_queue.request_stop(); });
     RenderFrame frame;
     RenderFrame last_frame;
+    std::string format_buffer;
     bool have_last = false;
     while (true) {
         const bool had_pending = output_writer.has_pending();
         if (!output_writer.flush()) {
-            std::this_thread::sleep_for(std::chrono::microseconds(1000));
+            pollfd pfd{STDOUT_FILENO, POLLOUT, 0};
+            ::poll(&pfd, 1, 10);
             continue;
         }
         if (had_pending) {
@@ -496,7 +464,8 @@ void TerminalRender::output_loop(std::stop_token token) {
         if (!frame_queue.wait(frame)) {
             break;
         }
-        output_writer.set(render_format_frame(frame, have_last ? &last_frame : nullptr));
+        render_format_frame(format_buffer, frame, have_last ? &last_frame : nullptr);
+        format_buffer = output_writer.exchange(std::move(format_buffer));
         if (have_last) {
             std::vector<uint32_t> recycle = std::move(last_frame.pixels);
             last_frame = std::move(frame);

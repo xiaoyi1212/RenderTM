@@ -4,67 +4,35 @@ module;
 
 export module math;
 
-export template<bool IsLinear>
-struct ColorBase {
+export struct ColorSrgb;
+
+export struct LinearColor
+{
     float r, g, b;
 
-    using Color = ColorBase;
-    using OtherColor = ColorBase<!IsLinear>;
+    [[nodiscard]]
+    constexpr auto to_srgb() const -> ColorSrgb;
 
     [[nodiscard]]
-    constexpr auto to_srgb() const -> OtherColor
-    requires (IsLinear) {
-        auto convert = [](float c) -> float {
-            c = std::clamp(c, 0.0f, 1.0f);
-            float res = (c <= 0.0031308f)
-                ? (c * 12.92f)
-                : (1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f);
-            return res * 255.0f;
-        };
-        return { convert(r), convert(g), convert(b) };
-    }
-
-    [[nodiscard]]
-    constexpr auto to_linear() const -> OtherColor
-    requires (!IsLinear) {
-        auto convert = [](float c) -> float {
-            c /= 255.0f;
-            if (c <= 0.04045f) return c / 12.92f;
-            return std::pow((c + 0.055f) / 1.055f, 2.4f);
-        };
-        return { convert(r), convert(g), convert(b) };
-    }
-
-    [[nodiscard]]
-    constexpr auto operator+(const Color& rhs) const -> Color
+    constexpr auto operator+(const LinearColor& rhs) const -> LinearColor
     {
         return {r + rhs.r, g + rhs.g, b + rhs.b};
     }
 
     [[nodiscard]]
-    constexpr auto operator*(const Color& rhs) const -> Color
+    constexpr auto operator*(const LinearColor& rhs) const -> LinearColor
     {
         return {r * rhs.r, g * rhs.g, b * rhs.b};
     }
 
     [[nodiscard]]
-    constexpr auto operator*(const float scale) const -> Color
+    constexpr auto operator*(const float scale) const -> LinearColor
     {
         return {r * scale, g * scale, b * scale};
     }
 
     [[nodiscard]]
-    static constexpr auto from_hex(uint32_t hex) -> Color
-    requires (!IsLinear) {
-        return {
-            static_cast<float>((hex >> 16) & 0xFF),
-            static_cast<float>((hex >> 8) & 0xFF),
-            static_cast<float>(hex & 0xFF)
-        };
-    }
-
-    [[nodiscard]]
-    static constexpr auto lerp(const Color& a, const Color& b, const float t) -> Color
+    static constexpr auto lerp(const LinearColor& a, const LinearColor& b, const float t) -> LinearColor
     {
         return {
             a.r + (b.r - a.r) * t,
@@ -74,8 +42,44 @@ struct ColorBase {
     }
 };
 
-export using LinearColor = ColorBase<true>;
-export using ColorSrgb   = ColorBase<false>;
+export struct ColorSrgb
+{
+    float r, g, b;
+
+    [[nodiscard]]
+    constexpr auto to_linear() const -> LinearColor
+    {
+        auto convert = [](float c) -> float {
+            c /= 255.0f;
+            if (c <= 0.04045f) return c / 12.92f;
+            return std::pow((c + 0.055f) / 1.055f, 2.4f);
+        };
+        return {convert(r), convert(g), convert(b)};
+    }
+
+    [[nodiscard]]
+    static constexpr auto from_hex(uint32_t hex) -> ColorSrgb
+    {
+        return {
+            static_cast<float>((hex >> 16) & 0xFF),
+            static_cast<float>((hex >> 8) & 0xFF),
+            static_cast<float>(hex & 0xFF)
+        };
+    }
+};
+
+[[nodiscard]]
+constexpr auto LinearColor::to_srgb() const -> ColorSrgb
+{
+    auto convert = [](float c) -> float {
+        c = std::clamp(c, 0.0f, 1.0f);
+        const float res = (c <= 0.0031308f)
+            ? (c * 12.92f)
+            : (1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f);
+        return res * 255.0f;
+    };
+    return {convert(r), convert(g), convert(b)};
+}
 
 export struct Scalar
 {
@@ -100,6 +104,12 @@ export struct Vec2
     {
         return {0.0, 0.0};
     }
+
+    [[nodiscard]]
+    constexpr auto operator+(const Vec2& rhs) const -> Vec2
+    {
+        return {x + rhs.x, y + rhs.y};
+    }
 };
 
 export struct Vec3
@@ -116,6 +126,12 @@ export struct Vec3
     constexpr auto operator+(const Vec3& rhs) const -> Vec3
     {
         return {x + rhs.x, y + rhs.y, z + rhs.z};
+    }
+
+    [[nodiscard]]
+    constexpr auto operator-() const -> Vec3
+    {
+        return {-x, -y, -z};
     }
 
     [[nodiscard]]
@@ -179,9 +195,35 @@ export struct Vec3
     }
 };
 
-export struct Mat4
+export struct YawPitch
 {
-    std::array<std::array<double, 4>, 4> m{};
+    double cy, sy, cp, sp;
+
+    [[nodiscard]]
+    static auto from_angles(const double yaw, const double pitch) -> YawPitch
+    {
+        return {std::cos(yaw), std::sin(yaw), std::cos(pitch), std::sin(pitch)};
+    }
+
+    [[nodiscard]]
+    constexpr auto apply(const Vec3& v) const -> Vec3
+    {
+        const double y1 = v.y * cp - v.z * sp;
+        const double z1 = v.y * sp + v.z * cp;
+        return {v.x * cy + z1 * sy, y1, -v.x * sy + z1 * cy};
+    }
+
+    [[nodiscard]]
+    constexpr auto apply_inverse(const Vec3& v) const -> Vec3
+    {
+        const double x1 = v.x * cy - v.z * sy;
+        const double z1 = v.x * sy + v.z * cy;
+        return {x1, v.y * cp + z1 * sp, -v.y * sp + z1 * cp};
+    }
+};
+
+export struct Mat4
+{    std::array<std::array<double, 4>, 4> m{};
 
     [[nodiscard]]
     static constexpr auto identity() -> Mat4
