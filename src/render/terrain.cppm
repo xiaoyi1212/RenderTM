@@ -72,10 +72,14 @@ export struct TerrainConfig
     double surface_freq = 0.4;
 
     std::vector<Material> palette{
-        {.color = 0xFF7A7A7A},  // stone
-        {.color = 0xFF7D4714},  // dirt
-        {.color = 0xFF3B8A38},  // grass
-        {.color = 0xFF2B5FA8},  // water
+        {.color = 0xFF7A7A7A, .ambient = 0.22, .diffuse = 0.90,
+         .specular = 0.06, .shininess = 32.0},  // stone
+        {.color = 0xFF7D4714, .ambient = 0.24, .diffuse = 0.95,
+         .specular = 0.02, .shininess = 8.0},   // dirt
+        {.color = 0xFF3B8A38, .ambient = 0.28, .diffuse = 1.00,
+         .specular = 0.025, .shininess = 12.0}, // grass
+        {.color = 0xFF2B5FA8, .ambient = 0.18, .diffuse = 0.70,
+         .specular = 0.08, .shininess = 96.0},  // water
     };
     uint8_t stone = 0;
     uint8_t dirt = 1;

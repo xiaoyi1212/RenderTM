@@ -37,8 +37,6 @@ struct FrameState
     bool direct_on = false;
     bool gi_active = false;
     int gi_bounces = 0;
-
-    std::array<ShadowJitter, 2> shadow_jitter{};
 };
 
 export struct RenderEngine
@@ -57,13 +55,16 @@ export struct RenderEngine
     {
         const FrameState frame = begin_frame(width, height);
         rasterize_scene(frame);
-        lighting.resolve_direct(DirectFrame{
-            .width = frame.width,
-            .height = frame.height,
-            .samples = frame.samples,
+
+        const auto& lights = frame.lighting.lights;
+        const DirectFrame direct_frame{
             .depth_max = frame.depth_max,
-            .shadows_on = settings.shadow_enabled
-        }, buffers, settings.shadow);
+            .frame_index = frame.frame_index,
+            .shadows_on = settings.shadow_enabled && frame.direct_on,
+            .lights = lights
+        };
+        lighting.resolve_direct(direct_frame, buffers, terrain, settings.shadow);
+
         if (frame.gi_active)
         {
             lighting.gi_pass(GiFrame{
@@ -83,8 +84,7 @@ export struct RenderEngine
             }, buffers, terrain, settings.gi);
         }
         post.resolve_frame(framebuffer, buffers, PostFrame{
-            .sky_top = frame.lighting.sky_zenith,
-            .sky_bottom = frame.lighting.sky_horizon,
+            .lighting = frame.lighting,
             .taa_on = settings.taa.enabled,
             .clamp_history = settings.taa.clamp_enabled,
             .taa_factor = static_cast<float>(std::clamp(settings.taa.blend, 0.0, 1.0)),
@@ -93,7 +93,6 @@ export struct RenderEngine
             .jitter_x = frame.jitter_x,
             .jitter_y = frame.jitter_y,
             .exposure = static_cast<float>(std::max(0.0, world.sky.exposure)),
-            .star_visibility = frame.lighting.star_visibility,
             .camera_pos = frame.camera_pos
         }, world.sky, settings.gi);
     }
@@ -143,12 +142,8 @@ private:
 
         frame.lighting = world.evaluate_lighting(settings.lighting.sun_intensity_boost);
         const auto& lights = frame.lighting.lights;
-        frame.shadow_jitter = {
-            ShadowJitter::for_light(lights[0], frame.frame_index, settings.shadow.sun_salt),
-            ShadowJitter::for_light(lights[1], frame.frame_index, settings.shadow.moon_salt)
-        };
-
-        frame.direct_on = (lights[0].intensity > 0.0) || (lights[1].intensity > 0.0);
+        const auto is_active = [](const auto& light) { return light.intensity > 0.0; };
+        frame.direct_on = std::any_of(lights.begin(), lights.end(), is_active);
         frame.hemi_ground = lighting.hemi_ground(frame.lighting.ambient_horizon,
                                                  lights, settings.lighting);
 
@@ -180,7 +175,6 @@ private:
                 terrain.config.palette[i],
                 frame.direct_on,
                 settings.ambient_occlusion_enabled,
-                settings.shadow_enabled,
                 frame.lighting.lights
             });
         }
@@ -190,8 +184,6 @@ private:
             .sample_colors = buffers.sample_colors.data(),
             .sample_direct_sun = buffers.sample_direct_sun.data(),
             .sample_direct_moon = buffers.sample_direct_moon.data(),
-            .shadow_mask_sun = buffers.shadow_mask_sun.data(),
-            .shadow_mask_moon = buffers.shadow_mask_moon.data(),
             .sample_normals = buffers.sample_normals.data(),
             .sample_albedo = buffers.sample_albedo.data(),
             .sample_ao = buffers.sample_ao.data(),
@@ -205,13 +197,9 @@ private:
         for (const auto& quad : terrain.mesh)
         {
             const RasterInputs inputs{
-                .terrain = terrain,
-                .lighting = lighting,
-                .shadow_settings = settings.shadow,
                 .ctx = contexts[quad.material],
                 .jitter_x = frame.jitter_x,
-                .jitter_y = frame.jitter_y,
-                .shadow_jitter = frame.shadow_jitter
+                .jitter_y = frame.jitter_y
             };
             const RasterQuadInput quad_input{
                 .quad = quad,

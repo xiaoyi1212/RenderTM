@@ -1458,6 +1458,25 @@ TEST_CASE("RenderEngine update shows multiple terrain materials")
     REQUIRE(colors.size() >= 3);
 }
 
+TEST_CASE("default terrain palette differentiates material response")
+{
+    const TerrainConfig config;
+    REQUIRE(config.palette.size() > std::max({config.stone, config.dirt,
+                                              config.grass, config.water}));
+
+    const Material& stone = config.palette[config.stone];
+    const Material& dirt = config.palette[config.dirt];
+    const Material& grass = config.palette[config.grass];
+    const Material& water = config.palette[config.water];
+
+    REQUIRE(water.shininess > stone.shininess);
+    REQUIRE(stone.shininess > grass.shininess);
+    REQUIRE(water.specular > stone.specular);
+    REQUIRE(stone.specular > grass.specular);
+    REQUIRE(grass.specular > dirt.specular);
+    REQUIRE(grass.diffuse > water.diffuse);
+}
+
 TEST_CASE("RenderEngine update applies lighting as multiple shades")
 {
     RenderEngine engine;
@@ -2288,16 +2307,18 @@ TEST_CASE("stars add variation to night sky")
     std::vector<uint32_t> no_stars(width * height, 0u);
     std::vector<uint32_t> with_stars(width * height, 0u);
     GiSettings gi{};
+    FrameLighting no_star_lighting{
+        .sky_zenith = sky,
+        .sky_horizon = sky
+    };
+    FrameLighting star_lighting = no_star_lighting;
+    star_lighting.star_visibility = 1.0f;
 
     post.resolve_frame(no_stars.data(), buffers, PostFrame{
-        .sky_top = sky,
-        .sky_bottom = sky,
-        .star_visibility = 0.0f
+        .lighting = no_star_lighting
     }, skybox, gi);
     post.resolve_frame(with_stars.data(), buffers, PostFrame{
-        .sky_top = sky,
-        .sky_bottom = sky,
-        .star_visibility = 1.0f
+        .lighting = star_lighting
     }, skybox, gi);
 
     size_t diff = 0;
@@ -2310,6 +2331,91 @@ TEST_CASE("stars add variation to night sky")
     }
     const size_t min_diff = (width * height) / 400;
     REQUIRE(diff > min_diff);
+}
+
+TEST_CASE("celestial disks include an analytic glow")
+{
+    RenderBuffers buffers;
+    PostProcessor post;
+    constexpr size_t width = 128;
+    constexpr size_t height = 96;
+    buffers.resize(width, height, std::numeric_limits<float>::max());
+    post.resize_buffers(width * height);
+
+    Camera camera;
+    camera.position = {0.0, 0.0, 0.0};
+    camera.set_rotation({0.0, 0.0});
+    const double proj_scale = static_cast<double>(height) * Camera::fov_scale;
+    const Mat4 vp = Camera::projection(width, height, proj_scale, proj_scale)
+                    * camera.view_matrix();
+    post.inverseCurrentVP = vp.invert().value_or(Mat4::identity());
+
+    const LinearColor sky = ColorSrgb::from_hex(0xFF080C18).to_linear();
+    FrameLighting base_lighting{
+        .sky_zenith = sky,
+        .sky_horizon = sky
+    };
+    FrameLighting disk_lighting = base_lighting;
+    disk_lighting.lights[0] = {
+        .dir = {0.0, 0.0, 1.0},
+        .color = {1.0f, 0.8f, 0.55f},
+        .disk = {.radius = 0.05, .radiance = 4.0}
+    };
+
+    Skybox skybox;
+    GiSettings gi;
+    std::vector<uint32_t> base(width * height);
+    std::vector<uint32_t> with_disk(width * height);
+    post.resolve_frame(base.data(), buffers, PostFrame{
+        .lighting = base_lighting,
+        .camera_pos = camera.position
+    }, skybox, gi);
+    post.resolve_frame(with_disk.data(), buffers, PostFrame{
+        .lighting = disk_lighting,
+        .camera_pos = camera.position
+    }, skybox, gi);
+
+    constexpr size_t center_x = width / 2;
+    constexpr size_t center_y = height / 2;
+    constexpr size_t glow_x = center_x + 12;
+    constexpr size_t far_x = center_x + 40;
+    const size_t center = center_y * width + center_x;
+    const size_t glow = center_y * width + glow_x;
+    const size_t far = center_y * width + far_x;
+
+    REQUIRE(luminance(with_disk[center]) > luminance(with_disk[glow]));
+    REQUIRE(luminance(with_disk[glow]) > luminance(base[glow]));
+    REQUIRE(with_disk[far] == base[far]);
+}
+
+TEST_CASE("celestial disk color follows sun altitude and keeps the moon cool")
+{
+    World world;
+    world.sun.orbit_enabled = false;
+
+    world.sun.direction = {0.0, 0.05, 1.0};
+    const FrameLighting low_sun = world.evaluate_lighting(1.0);
+    const LinearColor warm = low_sun.lights[0].disk.color;
+    REQUIRE(warm.r > warm.g);
+    REQUIRE(warm.g > warm.b);
+
+    world.sun.direction = {0.0, 1.0, 0.0};
+    const FrameLighting day = world.evaluate_lighting(1.0);
+    REQUIRE(day.lights[0].disk.radiance > 0.0);
+    REQUIRE(day.lights[1].disk.radiance == Catch::Approx(0.0));
+    const LinearColor noon = day.lights[0].disk.color;
+    REQUIRE(noon.r == Catch::Approx(1.0f));
+    REQUIRE(noon.g == Catch::Approx(1.0f));
+    REQUIRE(noon.b == Catch::Approx(1.0f));
+
+    world.sun.direction = {0.0, -1.0, 0.0};
+    const FrameLighting night = world.evaluate_lighting(1.0);
+    REQUIRE(night.lights[0].disk.radiance == Catch::Approx(0.0));
+    REQUIRE(night.lights[1].disk.radiance > 0.0);
+    const LinearColor moon = night.lights[1].disk.color;
+    REQUIRE(moon.b > moon.g);
+    REQUIRE(moon.g > moon.r);
+    REQUIRE(moon.b - moon.r < 0.2f);
 }
 
 TEST_CASE("gamma correction applies to midtone ambient")
@@ -2489,89 +2595,48 @@ TEST_CASE("hemisphere lighting adds sun bounce to shadowed faces")
     REQUIRE(avg_on > avg_off + 3.0);
 }
 
-TEST_CASE("directional shadowing darkens terrain")
+TEST_CASE("deferred shadow pass traces the final G-buffer samples")
 {
     Terrain terrain;
+    terrain.generate();
     LightingEngine lighting;
     RenderSettings settings;
-    World world_state;
-    world_state.sun.orbit_enabled = false;
-    world_state.sun.direction = {0.6, 0.3, 0.8};
-    world_state.sun.intensity = 1.0;
-    const bool shadows_enabled = true;
+    settings.shadow.filter_enabled = false;
+    const Vec3 light_dir = normalize_vec({0.6, 0.3, 0.8});
 
     std::vector<int> heights;
     std::vector<uint32_t> top_colors;
     build_heightmap(heights, top_colors);
 
-    const int chunk_size = 16;
-    const double block_size = 2.0;
-    const double start_x = -(chunk_size - 1) * block_size * 0.5;
-    const double start_z = 4.0;
-    const double base_y = 2.0;
+    Vec3 shadowed{};
+    Vec3 lit{};
+    REQUIRE(find_shadow_sample(heights, light_dir, {0.0, 1.0, 0.0}, true, &shadowed));
+    REQUIRE(find_shadow_sample(heights, light_dir, {0.0, 1.0, 0.0}, false, &lit));
 
-    auto index = [chunk_size](int x, int z) {
-        return static_cast<size_t>(z * chunk_size + x);
+    const float depth_max = std::numeric_limits<float>::max();
+    RenderBuffers buffers;
+    buffers.resize(2, 1, depth_max);
+    buffers.zbuffer = {1.0f, 1.0f};
+    buffers.world_positions = {shadowed, lit};
+    buffers.sample_normals = {{0.0, 1.0, 0.0}, {0.0, 1.0, 0.0}};
+    buffers.sample_direct_sun = {{1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}};
+
+    const DirectionalLight sun{
+        .dir = light_dir,
+        .intensity = 1.0,
+        .color = {1.0f, 1.0f, 1.0f}
     };
+    lighting.resolve_direct(DirectFrame{
+        .depth_max = depth_max,
+        .frame_index = 0,
+        .shadows_on = true,
+        .lights = {sun, {}}
+    }, buffers, terrain, settings.shadow);
 
-    auto shadow_factor = [&](const Vec3 world_pos, const Vec3 normal, float* out_factor) -> bool {
-        if (!out_factor)
-        {
-            return false;
-        }
-        if (terrain.blocks.empty())
-        {
-            terrain.generate();
-        }
-        if (!shadows_enabled)
-        {
-            *out_factor = 1.0f;
-            return true;
-        }
-        const bool sun_orbit = world_state.sun.orbit_enabled;
-        const double base_intensity = world_state.sun.intensity;
-        Vec3 light_dir = world_state.sun.direction.normalize();
-        double sun_intensity = base_intensity;
-        if (sun_orbit)
-        {
-            light_dir = world_state.sun.direction_at(world_state.sun.orbit_angle);
-            const double visibility = world_state.sun.height_factor(light_dir);
-            sun_intensity = base_intensity * visibility;
-        }
-        sun_intensity *= settings.lighting.sun_intensity_boost;
-        if (sun_intensity <= 0.0)
-        {
-            *out_factor = 1.0f;
-            return true;
-        }
-
-        *out_factor = lighting.shadow_factor(terrain, light_dir, world_pos, normal.normalize(),
-                                             settings.shadow);
-        return true;
-    };
-
-    bool found_shadow = false;
-    for (int z = 0; z < chunk_size && !found_shadow; ++z)
-    {
-        for (int x = 0; x < chunk_size && !found_shadow; ++x)
-        {
-            const int height = heights[index(x, z)];
-            const double center_y = base_y + (height - 1) * block_size;
-            const double top_y = center_y + block_size * 0.5;
-            const Vec3 world_pos{
-                start_x + x * block_size,
-                top_y,
-                start_z + z * block_size
-            };
-            float factor = 1.0f;
-            if (shadow_factor(world_pos, {0.0, 1.0, 0.0}, &factor) && factor < 0.98f)
-            {
-                found_shadow = true;
-            }
-        }
-    }
-
-    REQUIRE(found_shadow);
+    REQUIRE(buffers.shadow_mask_sun[0] == Catch::Approx(0.0f));
+    REQUIRE(buffers.shadow_mask_sun[1] == Catch::Approx(1.0f));
+    REQUIRE(buffers.sample_direct[0].r == Catch::Approx(0.0f));
+    REQUIRE(buffers.sample_direct[1].r == Catch::Approx(1.0f));
 }
 
 TEST_CASE("one-bounce GI does not darken shadowed terrain")

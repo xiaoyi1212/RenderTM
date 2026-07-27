@@ -6,9 +6,7 @@ export module rasterizer;
 
 import math;
 import camera;
-import noise;
 import terrain;
-import settings;
 import lighting;
 
 export struct ClipVertex
@@ -29,8 +27,6 @@ export struct RasterTarget
     LinearColor* sample_colors;
     LinearColor* sample_direct_sun;
     LinearColor* sample_direct_moon;
-    float* shadow_mask_sun;
-    float* shadow_mask_moon;
     Vec3* sample_normals;
     LinearColor* sample_albedo;
     float* sample_ao;
@@ -43,13 +39,9 @@ export struct RasterTarget
 
 export struct RasterInputs
 {
-    const Terrain& terrain;
-    const LightingEngine& lighting;
-    const ShadowSettings& shadow_settings;
     const ShadingContext& ctx;
     float jitter_x;
     float jitter_y;
-    std::array<ShadowJitter, 2> shadow_jitter;
 };
 
 export struct RasterQuadInput
@@ -341,29 +333,17 @@ private:
 
                 LinearColor direct_sun{0.0f, 0.0f, 0.0f};
                 LinearColor direct_moon{0.0f, 0.0f, 0.0f};
-                float shadow_sun = 1.0f;
-                float shadow_moon = 1.0f;
                 if (ctx.direct_lighting_enabled)
                 {
                     const auto& material = ctx.material;
                     const double f0 = std::clamp(material.specular, 0.0, 1.0);
                     const Vec3 view_dir = (ctx.camera_pos - world).normalize();
 
-                    auto eval_light = [&](const size_t light_idx,
-                                          LinearColor& out_direct, float& out_shadow) {
+                    auto eval_light = [&](const size_t light_idx, LinearColor& out_direct) {
                         if (!light_terms[light_idx].active) return;
 
                         const auto& light = ctx.lights[light_idx];
                         const double ndotl = light_terms[light_idx].ndotl;
-
-                        if (ctx.shadows_enabled)
-                        {
-                            const Vec3 shadow_dir = inputs.shadow_jitter[light_idx]
-                                                        .direction(light.dir, x, y);
-                            out_shadow = inputs.lighting.shadow_factor(
-                                inputs.terrain, shadow_dir, world, normal,
-                                inputs.shadow_settings);
-                        }
 
                         const Vec3 half_vec = (light.dir + view_dir).normalize();
                         const double vdoth = std::max(0.0, view_dir.dot(half_vec));
@@ -385,15 +365,13 @@ private:
                         out_direct = light_color;
                     };
 
-                    eval_light(0, direct_sun, shadow_sun);
-                    eval_light(1, direct_moon, shadow_moon);
+                    eval_light(0, direct_sun);
+                    eval_light(1, direct_moon);
                 }
 
                 target.sample_colors[idx] = ambient_base * ao_vis;
                 target.sample_direct_sun[idx] = direct_sun;
                 target.sample_direct_moon[idx] = direct_moon;
-                target.shadow_mask_sun[idx] = shadow_sun;
-                target.shadow_mask_moon[idx] = shadow_moon;
                 target.sample_normals[idx] = normal;
                 target.sample_albedo[idx] = albedo;
                 target.sample_ao[idx] = ao_vis;

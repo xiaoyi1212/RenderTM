@@ -12,8 +12,7 @@ import camera;
 
 export struct PostFrame
 {
-    LinearColor sky_top{};
-    LinearColor sky_bottom{};
+    const FrameLighting& lighting;
     bool taa_on = false;
     bool clamp_history = false;
     float taa_factor = 0.0f;
@@ -22,7 +21,6 @@ export struct PostFrame
     float jitter_x = 0.0f;
     float jitter_y = 0.0f;
     float exposure = 1.0f;
-    float star_visibility = 0.0f;
     Vec3 camera_pos{0.0, 0.0, 0.0};
 };
 
@@ -181,6 +179,7 @@ export struct PostProcessor
         const double jitter_y_d = static_cast<double>(frame.jitter_y);
         const Mat4& inv_vp = inverseCurrentVP;
         const Mat4& prev_vp = previousVP;
+        const FrameLighting& lighting = frame.lighting;
 
         const float dither_strength = 2.0f;
         const float dither_scale = dither_strength / 16.0f;
@@ -193,25 +192,29 @@ export struct PostProcessor
         LinearColor* history_write_ptr = taa_history[write_idx].data();
         const std::span<const LinearColor> history_read_span(history_read_ptr, sample_count);
 
-        const float star_strength = std::clamp(frame.star_visibility, 0.0f, 1.0f);
+        const bool shade_sky = lighting.star_visibility > 0.0f ||
+            std::any_of(lighting.lights.begin(), lighting.lights.end(),
+                        [](const DirectionalLight& light) {
+                            return light.disk.radius > 0.0 && light.disk.radiance > 0.0;
+                        });
 
         for (size_t y = 0; y < height; ++y)
         {
             const float sky_t = height > 1 ? static_cast<float>(y) / static_cast<float>(height - 1) : 0.0f;
-            const LinearColor sky_row = LinearColor::lerp(frame.sky_top, frame.sky_bottom, sky_t);
+            const LinearColor sky_row = LinearColor::lerp(lighting.sky_zenith, lighting.sky_horizon, sky_t);
             for (size_t x = 0; x < width; ++x)
             {
                 const size_t idx = y * width + x;
                 if (buffers.zbuffer[idx] >= depth_max)
                 {
                     LinearColor sky = sky_row;
-                    if (star_strength > 0.0f)
+                    if (shade_sky)
                     {
                         const Vec3 point = Camera::screen_to_world(
                             static_cast<double>(x) + 0.5, static_cast<double>(y) + 0.5,
                             1.0, inv_vp, width_d, height_d);
                         const Vec3 view_dir = (point - frame.camera_pos).normalize();
-                        sky = skybox.apply_stars(sky, view_dir, star_strength);
+                        sky = skybox.shade(sky, view_dir, lighting);
                     }
                     current_linear_buffer[idx] = sky;
                     continue;

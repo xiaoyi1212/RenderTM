@@ -7,12 +7,20 @@ export module world;
 import math;
 import noise;
 
+export struct CelestialDisk
+{
+    double radius = 0.0;
+    double radiance = 0.0;
+    LinearColor color{1.0f, 1.0f, 1.0f};
+};
+
 export struct DirectionalLight
 {
     Vec3 dir{0.0, 1.0, 0.0};
     double intensity = 0.0;
     LinearColor color{1.0f, 1.0f, 1.0f};
     double angular_radius = 0.0;
+    CelestialDisk disk{};
 };
 
 export struct FrameLighting
@@ -32,6 +40,8 @@ export struct Celestial
     LinearColor color{1.0f, 1.0f, 1.0f};
     double intensity = 0.0;
     double angular_radius = 0.0;
+    CelestialDisk disk{};
+    LinearColor disk_zenith_color{1.0f, 1.0f, 1.0f};
     bool orbit_enabled = false;
     double orbit_angle = 0.0;
     double orbit_speed = 0.0;
@@ -94,6 +104,24 @@ export struct Celestial
         const double az = phase - kPi * 0.5;
         const double cos_alt = std::cos(alt);
         return Vec3{cos_alt * std::sin(az), std::sin(alt), cos_alt * std::cos(az)}.normalize();
+    }
+
+    [[nodiscard]]
+    auto visible_disk(const Vec3& dir) const -> CelestialDisk
+    {
+        if (intensity <= 0.0 || disk.radius <= 0.0 || disk.radiance <= 0.0)
+        {
+            return {};
+        }
+        const float height = static_cast<float>(dir.y);
+        const float radius = static_cast<float>(disk.radius);
+        const float visibility = Scalar::smoothstep(-radius, radius, height);
+        const float altitude = Scalar::smoothstep(0.0f, 1.0f, height);
+        return {
+            .radius = disk.radius,
+            .radiance = disk.radiance * visibility,
+            .color = LinearColor::lerp(disk.color, disk_zenith_color, altitude)
+        };
     }
 
 private:
@@ -181,6 +209,8 @@ export struct Skybox
     double star_tint_r = 0.95;
     double star_tint_g = 0.98;
     double star_tint_b = 1.05;
+    double celestial_glow_extent = 5.0;
+    double celestial_glow_strength = 0.12;
 
     [[nodiscard]]
     auto sample(const float sun_height) const -> std::pair<LinearColor, LinearColor>
@@ -313,24 +343,50 @@ export struct Skybox
     }
 
     [[nodiscard]]
-    auto apply_stars(const LinearColor& sky, const Vec3& view_dir,
-                     const float visibility) const -> LinearColor
+    auto shade(const LinearColor& base, const Vec3& view_dir,
+               const FrameLighting& lighting) const -> LinearColor
     {
-        if (visibility <= 0.0f)
+        LinearColor sky = base;
+        const float star_visibility = std::clamp(lighting.star_visibility, 0.0f, 1.0f);
+        if (star_visibility > 0.0f)
         {
-            return sky;
+            const float star = star_intensity(view_dir) * star_visibility
+                               * static_cast<float>(star_glow_scale);
+            sky = sky + LinearColor{
+                star * static_cast<float>(star_tint_r),
+                star * static_cast<float>(star_tint_g),
+                star * static_cast<float>(star_tint_b)
+            };
         }
-        const float star = star_intensity(view_dir);
-        if (star <= 0.0f)
+
+        const double glow_extent = std::max(1.0, celestial_glow_extent);
+        const double glow_extent_sq = glow_extent * glow_extent;
+        const float glow_strength = static_cast<float>(std::max(0.0, celestial_glow_strength));
+        for (const DirectionalLight& light : lighting.lights)
         {
-            return sky;
+            if (light.disk.radius <= 0.0 || light.disk.radiance <= 0.0)
+            {
+                continue;
+            }
+            const double radius_sq = light.disk.radius * light.disk.radius;
+            const double separation_sq =
+                2.0 * (1.0 - std::clamp(view_dir.dot(light.dir), -1.0, 1.0));
+            const double glow_radius_sq = radius_sq * glow_extent_sq;
+            if (separation_sq > glow_radius_sq)
+            {
+                continue;
+            }
+
+            float glow = 1.0f - Scalar::smoothstep(
+                static_cast<float>(radius_sq), static_cast<float>(glow_radius_sq),
+                static_cast<float>(separation_sq));
+            glow *= glow;
+            const float disk = separation_sq <= radius_sq ? 1.0f : 0.0f;
+            const float radiance = static_cast<float>(light.disk.radiance)
+                                   * (disk + glow * glow_strength);
+            sky = sky + light.disk.color * radiance;
         }
-        const float glow = star * visibility * static_cast<float>(star_glow_scale);
-        return {
-            sky.r + glow * static_cast<float>(star_tint_r),
-            sky.g + glow * static_cast<float>(star_tint_g),
-            sky.b + glow * static_cast<float>(star_tint_b)
-        };
+        return sky;
     }
 
     [[nodiscard]]
@@ -367,6 +423,12 @@ export struct World
         .color = {1.0f, 0.94f, 0.88f},
         .intensity = 1.1,
         .angular_radius = 0.03,
+        .disk = {
+            .radius = 0.03,
+            .radiance = 8.0,
+            .color = ColorSrgb::from_hex(0xFFFFA83D).to_linear()
+        },
+        .disk_zenith_color = {1.0f, 1.0f, 1.0f},
         .orbit_enabled = true,
         .orbit_angle = Celestial::kPi * 0.5,
         .orbit_speed = 0.00075,
@@ -378,6 +440,12 @@ export struct World
         .color = {1.0f, 1.0f, 1.0f},
         .intensity = 0.006,
         .angular_radius = 0.0,
+        .disk = {
+            .radius = 0.025,
+            .radiance = 1.5,
+            .color = ColorSrgb::from_hex(0xFFDCE4EE).to_linear()
+        },
+        .disk_zenith_color = ColorSrgb::from_hex(0xFFDCE4EE).to_linear(),
         .orbit_enabled = false,
         .orbit_angle = 0.0,
         .orbit_speed = 0.0,
@@ -416,9 +484,23 @@ export struct World
         const auto ambient = sky.ambient_gradient(sky_height);
         moon_intensity *= static_cast<double>(sky.moon_weight(sun_height));
 
+        const auto sun_light = DirectionalLight{
+            .dir = sun_dir,
+            .intensity = sun_intensity,
+            .color = sun.color,
+            .angular_radius = sun.angular_radius,
+            .disk = sun.visible_disk(sun_dir)
+        };
+        const auto moon_light = DirectionalLight{
+            .dir = moon_dir,
+            .intensity = moon_intensity,
+            .color = moon.color,
+            .angular_radius = moon.angular_radius,
+            .disk = moon.visible_disk(moon_dir)
+        };
+
         return {
-            .lights = {DirectionalLight{sun_dir, sun_intensity, sun.color, sun.angular_radius},
-                       DirectionalLight{moon_dir, moon_intensity, moon.color, moon.angular_radius}},
+            .lights = {sun_light, moon_light},
             .sky_zenith = state.zenith,
             .sky_horizon = state.horizon,
             .ambient_zenith = ambient.zenith,

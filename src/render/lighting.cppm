@@ -23,7 +23,6 @@ export struct ShadingContext
     Material material;
     bool direct_lighting_enabled;
     bool ambient_occlusion_enabled;
-    bool shadows_enabled;
     std::array<DirectionalLight, 2> lights;
 };
 
@@ -96,11 +95,10 @@ export struct ShadowJitter
 
 export struct DirectFrame
 {
-    size_t width = 0;
-    size_t height = 0;
-    size_t samples = 0;
     float depth_max = 0.0f;
+    uint32_t frame_index = 0;
     bool shadows_on = false;
+    std::array<DirectionalLight, 2> lights{};
 };
 
 export struct GiFrame
@@ -263,38 +261,24 @@ export struct LightingEngine
 
     auto resolve_direct(const DirectFrame& frame,
                         RenderBuffers& buffers,
+                        const Terrain& terrain,
                         const ShadowSettings& shadow) const -> void
     {
-        if (frame.shadows_on)
+        const size_t samples = buffers.zbuffer.size();
+        if (!frame.shadows_on)
         {
-            const float* shadow_sun = buffers.shadow_mask_sun.data();
-            const float* shadow_moon = buffers.shadow_mask_moon.data();
-            if (shadow.filter_enabled)
-            {
-                filter_shadows({buffers.shadow_mask_sun.data(), frame.samples},
-                               {buffers.shadow_mask_moon.data(), frame.samples},
-                               {buffers.shadow_mask_filtered_sun.data(), frame.samples},
-                               {buffers.shadow_mask_filtered_moon.data(), frame.samples},
-                               {buffers.zbuffer.data(), frame.samples},
-                               {buffers.sample_normals.data(), frame.samples},
-                               frame.width, frame.height, frame.depth_max,
-                               shadow);
-                shadow_sun = buffers.shadow_mask_filtered_sun.data();
-                shadow_moon = buffers.shadow_mask_filtered_moon.data();
-            }
-            for (size_t i = 0; i < frame.samples; ++i)
-            {
-                const LinearColor sun = buffers.sample_direct_sun[i] * shadow_sun[i];
-                const LinearColor moon = buffers.sample_direct_moon[i] * shadow_moon[i];
-                buffers.sample_direct[i] = sun + moon;
-            }
-        }
-        else
-        {
-            for (size_t i = 0; i < frame.samples; ++i)
+            for (size_t i = 0; i < samples; ++i)
             {
                 buffers.sample_direct[i] = buffers.sample_direct_sun[i] + buffers.sample_direct_moon[i];
             }
+            return;
+        }
+
+        const auto masks = resolve_shadow_masks(frame, buffers, terrain, shadow);
+        for (size_t i = 0; i < samples; ++i)
+        {
+            buffers.sample_direct[i] = buffers.sample_direct_sun[i] * masks[0][i]
+                                       + buffers.sample_direct_moon[i] * masks[1][i];
         }
     }
 
@@ -405,6 +389,67 @@ export struct LightingEngine
 
 private:
     static constexpr double kPi = std::numbers::pi_v<double>;
+
+    auto resolve_shadow_masks(const DirectFrame& frame,
+                              RenderBuffers& buffers,
+                              const Terrain& terrain,
+                              const ShadowSettings& shadow) const
+        -> std::array<const float*, 2>
+    {
+        trace_shadows(frame, buffers, terrain, shadow);
+        if (!shadow.filter_enabled)
+        {
+            return {buffers.shadow_mask_sun.data(), buffers.shadow_mask_moon.data()};
+        }
+
+        const size_t samples = buffers.zbuffer.size();
+        filter_shadows({buffers.shadow_mask_sun.data(), samples},
+                       {buffers.shadow_mask_moon.data(), samples},
+                       {buffers.shadow_mask_filtered_sun.data(), samples},
+                       {buffers.shadow_mask_filtered_moon.data(), samples},
+                       {buffers.zbuffer.data(), samples},
+                       {buffers.sample_normals.data(), samples},
+                       buffers.width, buffers.height, frame.depth_max, shadow);
+        return {buffers.shadow_mask_filtered_sun.data(),
+                buffers.shadow_mask_filtered_moon.data()};
+    }
+
+    auto trace_shadows(const DirectFrame& frame,
+                       RenderBuffers& buffers,
+                       const Terrain& terrain,
+                       const ShadowSettings& shadow) const -> void
+    {
+        const std::array masks{
+            buffers.shadow_mask_sun.data(), buffers.shadow_mask_moon.data()
+        };
+        const std::array direct{
+            buffers.sample_direct_sun.data(), buffers.sample_direct_moon.data()
+        };
+        const std::array jitter{
+            ShadowJitter::for_light(frame.lights[0], frame.frame_index, shadow.sun_salt),
+            ShadowJitter::for_light(frame.lights[1], frame.frame_index, shadow.moon_salt)
+        };
+
+        const auto sample = [&](const size_t light, const size_t pixel,
+                                const int x, const int y) -> float {
+            const LinearColor& value = direct[light][pixel];
+            if (value.r <= 0.0f && value.g <= 0.0f && value.b <= 0.0f) return 1.0f;
+            const Vec3 direction = jitter[light].direction(frame.lights[light].dir, x, y);
+            return shadow_factor(terrain, direction, buffers.world_positions[pixel],
+                                 buffers.sample_normals[pixel], shadow);
+        };
+
+        for (size_t y = 0; y < buffers.height; ++y)
+        {
+            for (size_t x = 0; x < buffers.width; ++x)
+            {
+                const size_t pixel = y * buffers.width + x;
+                if (buffers.zbuffer[pixel] >= frame.depth_max) continue;
+                masks[0][pixel] = sample(0, pixel, static_cast<int>(x), static_cast<int>(y));
+                masks[1][pixel] = sample(1, pixel, static_cast<int>(x), static_cast<int>(y));
+            }
+        }
+    }
 
     static auto sincos_double(const double angle, double* out_sin, double* out_cos) -> void
     {
